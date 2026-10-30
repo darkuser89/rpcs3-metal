@@ -29,7 +29,7 @@
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>LSMinimumSystemVersion</key>
-	<string>15.0</string>
+	<string>${CMAKE_OSX_DEPLOYMENT_TARGET}</string>
 	<key>NSCameraUsageDescription</key>
 	<string>The camera will be used for PlayStation Eye emulation</string>
 	<key>NSMicrophoneUsageDescription</key>

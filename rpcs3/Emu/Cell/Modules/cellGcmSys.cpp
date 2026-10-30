@@ -300,7 +300,7 @@ error_code cellGcmBindTile(u8 index)
 		return CELL_GCM_ERROR_INVALID_VALUE;
 	}
 
-	rsx::get_current_renderer()->tiles[index].bound = true;
+	rsx::get_current_renderer()->update_tile(index, [](GcmTileInfo& tile) { tile.bound = true; });
 
 	return CELL_OK;
 }
@@ -676,16 +676,19 @@ error_code cellGcmSetTileInfo(u8 index, u8 location, u32 offset, u32 size, u32 p
 
 	const auto render = rsx::get_current_renderer();
 
-	auto& tile = render->tiles[index];
-	tile.location = location;
-	tile.offset = offset;
-	tile.size = size;
-	tile.pitch = pitch;
-	tile.comp = comp;
-	tile.base = base;
-	tile.bank = bank;
-
-	vm::_ptr<CellGcmTileInfo>(gcm_cfg.tiles_addr)[index] = tile.pack();
+	CellGcmTileInfo packed;
+	render->update_tile(index, [&](GcmTileInfo& tile)
+	{
+		tile.location = location;
+		tile.offset = offset;
+		tile.size = size;
+		tile.pitch = pitch;
+		tile.comp = comp;
+		tile.base = base;
+		tile.bank = bank;
+		packed = tile.pack();
+	});
+	vm::_ptr<CellGcmTileInfo>(gcm_cfg.tiles_addr)[index] = packed;
 	return CELL_OK;
 }
 
@@ -790,7 +793,7 @@ error_code cellGcmUnbindTile(u8 index)
 		return CELL_GCM_ERROR_INVALID_VALUE;
 	}
 
-	rsx::get_current_renderer()->tiles[index].bound = false;
+	rsx::get_current_renderer()->update_tile(index, [](GcmTileInfo& tile) { tile.bound = false; });
 
 	return CELL_OK;
 }
@@ -1365,17 +1368,20 @@ error_code cellGcmSetTile(u8 index, u8 location, u32 offset, u32 size, u32 pitch
 
 	const auto render = rsx::get_current_renderer();
 
-	auto& tile = render->tiles[index];
-	tile.location = location;
-	tile.offset = offset;
-	tile.size = size;
-	tile.pitch = pitch;
-	tile.comp = comp;
-	tile.base = base;
-	tile.bank = bank;
-	tile.bound = (pitch > 0);
-
-	vm::_ptr<CellGcmTileInfo>(gcm_cfg.tiles_addr)[index] = tile.pack();
+	CellGcmTileInfo packed;
+	render->update_tile(index, [&](GcmTileInfo& tile)
+	{
+		tile.location = location;
+		tile.offset = offset;
+		tile.size = size;
+		tile.pitch = pitch;
+		tile.comp = comp;
+		tile.base = base;
+		tile.bank = bank;
+		tile.bound = (pitch > 0);
+		packed = tile.pack();
+	});
+	vm::_ptr<CellGcmTileInfo>(gcm_cfg.tiles_addr)[index] = packed;
 	return CELL_OK;
 }
 

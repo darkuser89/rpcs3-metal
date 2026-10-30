@@ -14,6 +14,10 @@ namespace rsx
 		static void write_gcm_label(context* ctx, u32 type, u32 address, u32 data)
 		{
 			const bool is_flip_sema = (address == (RSX(ctx)->label_addr + 0x10) || address == (RSX(ctx)->device_addr + 0x30));
+			if (is_flip_sema && RSX(ctx)->release_GCM_flip_label(address, data))
+			{
+				return;
+			}
 			if (!is_flip_sema)
 			{
 				// First, queue the GPU work. If it flushes the queue for us, the following routines will be faster.

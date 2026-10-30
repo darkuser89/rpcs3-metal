@@ -1,7 +1,7 @@
 # Define GNU standard installation directories
 include(GNUInstallDirs)
 
-# Generate git-version.h at build time.
+# Generate git-version.h in the build directory.
 include(${CMAKE_CURRENT_SOURCE_DIR}/git-version.cmake)
 
 # Check for a sufficient compiler and set build options
@@ -38,11 +38,17 @@ if (NOT ANDROID)
     add_subdirectory(rpcs3qt)
 endif()
 
-gen_git_version(${CMAKE_CURRENT_SOURCE_DIR})
+gen_git_version(${CMAKE_CURRENT_BINARY_DIR})
+if(TARGET rpcs3_ui)
+    target_include_directories(rpcs3_ui PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+endif()
 
 if (NOT ANDROID)
     # Build rpcs3_lib
     add_library(rpcs3_lib STATIC)
+    # Link the native renderer object directly into consumers so its concrete
+    # dependencies are checked before the application factory is installed.
+    target_sources(rpcs3_lib INTERFACE $<TARGET_OBJECTS:rpcs3-metal4-gs>)
 
     if(WIN32)
         target_compile_definitions(rpcs3_lib PRIVATE UNICODE _UNICODE)
@@ -127,11 +133,18 @@ if (NOT ANDROID)
     # Copy icons to executable directory
     if(APPLE)
         qt_finalize_target(rpcs3)
+        set(RPCS3_MACDEPLOYQT_LIBRARY_PATHS)
+        foreach(RPCS3_QT_PREFIX IN LISTS CMAKE_PREFIX_PATH)
+            if(IS_DIRECTORY "${RPCS3_QT_PREFIX}/lib")
+                list(APPEND RPCS3_MACDEPLOYQT_LIBRARY_PATHS "-libpath=${RPCS3_QT_PREFIX}/lib")
+            endif()
+        endforeach()
         add_custom_command(TARGET rpcs3 POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_SOURCE_DIR}/rpcs3.icns $<TARGET_FILE_DIR:rpcs3>/../Resources/rpcs3.icns
             COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/bin/Icons $<TARGET_FILE_DIR:rpcs3>/../Resources/Icons
             COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/bin/GuiConfigs $<TARGET_FILE_DIR:rpcs3>/../Resources/GuiConfigs
-            COMMAND "${MACDEPLOYQT_EXECUTABLE}" "${PROJECT_BINARY_DIR}/bin/rpcs3.app" "$<$<CONFIG:Debug,RelWithDebInfo>:-no-strip>")
+            COMMAND "${MACDEPLOYQT_EXECUTABLE}" "${PROJECT_BINARY_DIR}/bin/rpcs3.app" "$<$<CONFIG:Debug,RelWithDebInfo>:-no-strip>" ${RPCS3_MACDEPLOYQT_LIBRARY_PATHS}
+            VERBATIM)
     elseif(UNIX)
         add_custom_command(TARGET rpcs3 POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/bin/Icons $<TARGET_FILE_DIR:rpcs3>/Icons

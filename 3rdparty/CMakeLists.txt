@@ -156,30 +156,7 @@ endif()
 set(VULKAN_TARGET 3rdparty_dummy_lib)
 if(USE_VULKAN)
 	if(APPLE)
-		if(USE_SYSTEM_MVK)
-			message(STATUS "RPCS3: Using system MoltenVK")
-		else()
-			message(STATUS "RPCS3: MoltenVK submodule")
-
-			execute_process(COMMAND "${CMAKE_COMMAND}" -G "${CMAKE_GENERATOR}" .
-				WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/MoltenVK"
-			)
-			execute_process(COMMAND "${CMAKE_COMMAND}" --build .
-				WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/MoltenVK"
-			)
-
-			add_library(moltenvk_lib SHARED IMPORTED)
-			add_dependencies(moltenvk_lib moltenvk)
-			set_target_properties(moltenvk_lib
-				PROPERTIES IMPORTED_LOCATION "{Vulkan_LIBRARY}"
-			)
-
-			set(VULKAN_SDK "${CMAKE_CURRENT_SOURCE_DIR}/MoltenVK/MoltenVK/MoltenVK")
-			set(VK_ICD_FILENAMES "${CMAKE_CURRENT_SOURCE_DIR}/MoltenVK/MoltenVK/MoltenVK/icd/MoltenVK_icd.json")
-			set(Vulkan_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/MoltenVK/MoltenVK/MoltenVK/include")
-			set(Vulkan_LIBRARY "${CMAKE_CURRENT_SOURCE_DIR}/MoltenVK/MoltenVK/Build/Products/Release/dynamic/libMoltenVK.dylib")
-			set(Vulkan_TOOLS "${CMAKE_CURRENT_SOURCE_DIR}/MoltenVK/MoltenVK/Build/Products/Release")
-		endif()
+		message(FATAL_ERROR "Native Metal 4 excludes Vulkan and MoltenVK on Apple Silicon")
 	endif()
 
 	find_package(Vulkan)

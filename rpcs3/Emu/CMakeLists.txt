@@ -60,6 +60,13 @@ target_include_directories(rpcs3_emu
         ${CMAKE_CURRENT_SOURCE_DIR}/../../3rdparty
 )
 
+if(NOT USE_SYSTEM_PROTOBUF)
+    # Broad system include roots may also contain a different Protobuf.
+    # Keep the selected bundled headers before those transitive system roots.
+    target_include_directories(rpcs3_emu SYSTEM BEFORE PUBLIC
+        "$<TARGET_PROPERTY:3rdparty::protobuf,INTERFACE_INCLUDE_DIRECTORIES>")
+endif()
+
 # Utilities
 target_sources(rpcs3_emu PRIVATE
     ../util/atomic.cpp
@@ -584,6 +591,22 @@ target_sources(rpcs3_emu PRIVATE
     RSX/rsx_vertex_data.cpp
     RSX/Utils/rsx_utils.cpp
 )
+
+if(APPLE)
+    # Native fault handoff and writer-capture pumping can propagate a failure.
+    # Their admission/activation guards must unwind before crossing this file.
+    set_source_files_properties(RSX/RSXOffload.cpp PROPERTIES COMPILE_OPTIONS "-fexceptions")
+    add_subdirectory(RSX/Metal4)
+    add_library(rpcs3-metal4-gs OBJECT RSX/Metal4/M4GSRender.mm)
+    target_link_libraries(rpcs3-metal4-gs PRIVATE rpcs3_emu)
+    target_compile_options(rpcs3-metal4-gs PRIVATE -fobjc-arc -fexceptions)
+    set_target_properties(rpcs3-metal4-gs PROPERTIES
+        OBJCXX_STANDARD 23 OBJCXX_STANDARD_REQUIRED YES OSX_ARCHITECTURES arm64)
+    set_target_properties(rpcs3_emu PROPERTIES OBJCXX_STANDARD 23 OBJCXX_STANDARD_REQUIRED YES)
+    # ARC belongs to native Metal sources; other emulator Objective-C++ files
+    # retain their existing ownership policy. Export the core's link closure.
+    target_link_libraries(rpcs3_emu PUBLIC "$<LINK_ONLY:rpcs3-metal4-core>")
+endif()
 
 if(NOT ANDROID AND NOT APPLE)
     target_sources(rpcs3_emu PRIVATE

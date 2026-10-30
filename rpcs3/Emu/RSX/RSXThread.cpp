@@ -3148,6 +3148,7 @@ namespace rsx
 
 	void thread::on_notify_memory_mapped(u32 address, u32 size)
 	{
+		if (defer_memory_map_notification(address, size)) return;
 		// In the case where an unmap is followed shortly after by a remap of the same address space
 		// we must block until RSX has invalidated the memory
 		// or lock m_mtx_task and do it ourselves
@@ -3173,6 +3174,7 @@ namespace rsx
 	{
 		// Always flush MM if memory mapping is going to change.
 		rsx::mm_flush();
+		const bool deferred = defer_memory_unmap_notification(address, size);
 
 		if (rsx_thread_running && address < rsx::constants::local_mem_base)
 		{
@@ -3188,6 +3190,7 @@ namespace rsx
 					unmap_status[io / 64] |= 1ull << (io & 63);
 					iomap_table.io[ea].release(-1);
 					iomap_table.ea[io].release(-1);
+					on_io_mapping_changed(io << 20, 0x100000);
 				}
 			}
 
@@ -3236,6 +3239,8 @@ namespace rsx
 			{
 				hle_lock->unlock();
 			}
+
+			if (deferred) return;
 
 			// Pause RSX thread momentarily to handle unmapping
 			eng_lock elock(this);

@@ -148,6 +148,10 @@ namespace rsx
 			void write(vm::addr_t sink, u64 timestamp, u32 type, u32 value);
 			void write(queued_report_write* writer, u64 timestamp, u32 value);
 
+			// Backend storage boundary after report scaling and MM ordering.
+			// Default keeps the existing VM/reservation store.
+			virtual void store_report(vm::addr_t sink, u64 timestamp, u32 value);
+
 			// Retire operation
 			void retire(class ::rsx::thread* ptimer, queued_report_write* writer, u32 result);
 

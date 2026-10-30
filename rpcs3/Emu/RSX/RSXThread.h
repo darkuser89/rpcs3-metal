@@ -5,6 +5,9 @@
 
 #include "RSXFIFO.h"
 #include "RSXOffload.h"
+#if defined(__APPLE__) && defined(__aarch64__)
+#include "Metal4/M4HostWriteIntent.h"
+#endif
 #include "RSXZCULL.h"
 #include "Common/bitfield.hpp"
 #include "Common/profiling_timer.hpp"
@@ -366,6 +369,9 @@ namespace rsx
 		virtual bool on_access_violation(u32 /*address*/, bool /*is_writing*/) { return false; }
 		virtual void on_invalidate_memory_range(const address_range32 & /*range*/, rsx::invalidation_cause) {}
 		virtual void notify_tile_unbound(u32 /*tile*/) {}
+		// Mutation is CPU-only: guest pack stores and VM validation stay outside.
+		virtual void update_tile(u32 index, const std::function<void(GcmTileInfo&)>& mutation) { mutation(tiles[index]); }
+		virtual bool is_tile_bound(u32 index) const { return tiles[index].bound; }
 
 		// control
 		virtual void renderctl(u32 request_code, void* args);
@@ -415,6 +421,24 @@ namespace rsx
 		 * If there is a notify_memory_unmapped request on this range yet to be handled,
 		 * handles it immediately.
 		 */
+		// Paired around VM map/unmap and logical page-protection mutation,under VM
+		// exclusion. Separate from RSX-compatible notifications/tile invalidation;
+		// backend must not lock,wait or enter a VM provider here.
+		virtual void on_mapping_change_begin(u32 /*address*/, u32 /*size*/) noexcept {}
+		virtual void on_mapping_change_end(u32 /*address*/, u32 /*size*/) noexcept {}
+#if defined(__APPLE__) && defined(__aarch64__)
+		// A native backend reserves before the actual DMA store and commits
+		// after it,under the same offloader/immediate host-writer ticket.
+		virtual std::optional<metal4::host_write_intent> on_native_host_write(void* /*destination*/, const void* /*source*/, u64 /*bytes*/) { return {}; }
+#endif
+		// IO producers hold VM exclusion too;callbacks must not lock or wait.
+		virtual void on_io_mapping_changed(u32 /*offset*/, u32 /*size*/) noexcept {}
+		// Native backends publish fixed-storage notifications under VM exclusion
+		// and service them on their owner AFTER VM/task/engine locks are released.
+		// True bypasses the legacy synchronous task-lock invalidation path only;
+		// common MM protection flushing and IO-unmap event bookkeeping still run.
+		virtual bool defer_memory_map_notification(u32 /*address*/, u32 /*size*/) noexcept { return false; }
+		virtual bool defer_memory_unmap_notification(u32 /*address*/, u32 /*size*/) noexcept { return false; }
 		void on_notify_memory_mapped(u32 address_base, u32 size);
 
 		/**
@@ -439,6 +463,14 @@ namespace rsx
 		 * Load an image from memory with optional scaling and rotation.
 		 * Returns false to tell the HW decoder to perform the operation on the CPU as a fallback when the operation cannot be safely accelerated.
 		 */
+		// Native memory transfers manage their own short CPU epochs and GPU waits.
+		// Dispatch before the decoder takes its legacy reservation lock.
+		virtual bool requires_native_scaled_image() const { return false; }
+		// Flip labels preserve the shared CPU-only release policy.
+		virtual bool release_GCM_flip_label(u32 /*address*/, u32 /*value*/) { return false; }
+		virtual bool requires_native_buffer_transfer() const { return false; }
+		virtual bool buffer_transfer(u32 /*notify*/) { return false; }
+
 		virtual bool scaled_image_from_memory(const blit_src_info& /*src_info*/, const blit_dst_info& /*dst_info*/, bool /*interpolate*/) { return false; }
 
 

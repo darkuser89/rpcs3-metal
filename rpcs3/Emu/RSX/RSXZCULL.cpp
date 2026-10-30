@@ -367,6 +367,11 @@ namespace rsx
 				break;
 			}
 
+			store_report(sink, timestamp, value);
+		}
+
+		void ZCULL_control::store_report(vm::addr_t sink, u64 timestamp, u32 value)
+		{
 			rsx::reservation_lock<true> lock(sink, 16);
 			auto report = vm::get_super_ptr<atomic_t<CellGcmReportData>>(sink);
 			report->store({timestamp, value, 0});

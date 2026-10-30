@@ -582,6 +582,14 @@ namespace rsx
 			const u16 out_w = REGS(ctx)->blit_engine_output_width();
 			const u16 out_h = REGS(ctx)->blit_engine_output_height();
 
+			if (RSX(ctx)->requires_native_scaled_image())
+			{
+				// Required native dispatch also covers host-only/force-CPU settings.
+				// Its own CPU capture must not run under our reservation lock.
+				ensure(RSX(ctx)->scaled_image_from_memory(src, dst, in_inter == blit_engine::transfer_interpolator::foh));
+				return;
+			}
+
 			// Lock here. RSX cannot execute any locking operations from this point, including ZCULL read barriers
 			const u32 read_length = src.pitch * src.height;
 			const u32 write_length = dst.pitch * dst.clip_height;

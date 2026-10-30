@@ -533,6 +533,7 @@ error_code sys_rsx_context_iomap(cpu_thread& cpu, u32 context_id, u64 io, u64 ea
 		if (prev_ea + 1) table.io[prev_ea >> 20].release(-1); // Clear previous mapping if exists
 		table.io[ea + i].release(static_cast<u32>(io + i) << 20);
 	}
+	render->on_io_mapping_changed(static_cast<u32>(io << 20), static_cast<u32>(size << 20));
 
 	return CELL_OK;
 }
@@ -578,6 +579,7 @@ error_code sys_rsx_context_iounmap(cpu_thread& cpu, u32 context_id, u64 io, u64 
 		table.ea[io++].release(-1);
 		if (ea_entry + 1) table.io[ea_entry >> 20].release(-1);
 	}
+	render->on_io_mapping_changed(static_cast<u32>((io - size) << 20), static_cast<u32>(size << 20));
 
 	return CELL_OK;
 }
@@ -794,8 +796,6 @@ error_code sys_rsx_context_attribute(u32 context_id, u32 package_id, u64 a3, u64
 			sys_rsx.warning("sys_rsx_context_attribute(): RSX is not idle while setting tile");
 		}
 
-		auto& tile = render->tiles[a3];
-
 		const u32 location = ((a4 >> 32) & 0x3) - 1;
 		const u32 offset = ((((a4 >> 32) & 0x7FFFFFFF) >> 16) * 0x10000);
 		const u32 size = ((((a4 & 0x7FFFFFFF) >> 16) + 1) * 0x10000) - offset;
@@ -836,7 +836,7 @@ error_code sys_rsx_context_attribute(u32 context_id, u32 package_id, u64 a3, u64
 
 		// When tile is going to be unbound, we can use it as a hint that the address will no longer be used as a surface and can be removed/invalidated
 		// Todo: There may be more checks such as format/size/width can could be done
-		if (tile.bound && !bound)
+		if (render->is_tile_bound(static_cast<u32>(a3)) && !bound)
 			render->notify_tile_unbound(static_cast<u32>(a3));
 
 		if (location == CELL_GCM_LOCATION_MAIN && bound)
@@ -852,14 +852,17 @@ error_code sys_rsx_context_attribute(u32 context_id, u32 package_id, u64 a3, u64
 			}
 		}
 
-		tile.location = location;
-		tile.offset = offset;
-		tile.size = size;
-		tile.pitch = pitch;
-		tile.comp = comp;
-		tile.base = base;
-		tile.bank = base;
-		tile.bound = bound;
+		render->update_tile(static_cast<u32>(a3), [&](GcmTileInfo& tile)
+		{
+			tile.location = location;
+			tile.offset = offset;
+			tile.size = size;
+			tile.pitch = pitch;
+			tile.comp = comp;
+			tile.base = base;
+			tile.bank = base;
+			tile.bound = bound;
+		});
 		break;
 	}
 	case 0x301: // Depth-buffer (Z-cull)

@@ -39,6 +39,36 @@ namespace vm
 	static constexpr u64 g_exec_addr_seg_offset = 0x2'0000'0000ULL;
 
 	struct writer_lock;
+	// Native host instruction only. Uses the existing global VM writer bit,
+	// but never waits while a host-writer ticket or RSX reservation is active.
+	// Release before fault handoff;reacquire and revalidate before retry. This
+	// excludes mapping producers,not guest CPU stores or reservation changes.
+	class host_mapping_guard final
+	{
+		bool owned = false;
+		explicit host_mapping_guard(bool owned) noexcept : owned(owned) {}
+	public:
+		host_mapping_guard(host_mapping_guard&& other) noexcept;
+		host_mapping_guard(const host_mapping_guard&) = delete;
+		host_mapping_guard& operator=(const host_mapping_guard&) = delete;
+		~host_mapping_guard() noexcept;
+		[[nodiscard]] explicit operator bool() const noexcept { return owned; }
+		[[nodiscard]] static host_mapping_guard try_acquire() noexcept;
+	};
+
+	struct backing_segment
+	{
+		u32 address, size;
+		u64 offset;
+		std::shared_ptr<utils::shm> memory;
+	};
+	// CPU-only under an already held global VM writer lock;no allocation or throw.
+	// Returns the first physical allocation slice,or empty on invalid input. Loop
+	// over remaining bytes;map independent owners and drop handles before unlock.
+	backing_segment get_backing_segment(u32 addr, u32 size, const writer_lock& lock) noexcept;
+	// Metadata-only variant may require page_allocated instead of readable.
+	// It never grants byte access or changes protection on the guest mapping.
+	backing_segment get_backing_segment(u32 addr, u32 size, const writer_lock& lock, u8 required_flags) noexcept;
 
 	enum memory_location_t : uint
 	{
@@ -161,6 +191,10 @@ namespace vm
 		// Unmap block
 		bool unmap(std::vector<std::pair<u64, u64>>* unmapped = nullptr);
 		friend bool _unmap_block(const std::shared_ptr<block_t>&, std::vector<std::pair<u64, u64>>* unmapped);
+		friend backing_segment get_backing_segment(u32 addr, u32 size, const writer_lock& lock) noexcept;
+		friend backing_segment get_backing_segment(u32 addr, u32 size, const writer_lock& lock, u8 required_flags) noexcept;
+		friend class mapping_change_view;
+		backing_segment backing(u32 addr, u32 size, u8 required_flags) const noexcept;
 
 	public:
 		block_t(u32 addr, u32 size, u64 flags);
@@ -229,7 +263,8 @@ namespace vm
 	// Super memory is allowed as well
 	inline std::pair<vm::addr_t, bool> try_get_addr(const void* real_ptr)
 	{
-		const std::make_unsigned_t<std::ptrdiff_t> diff = static_cast<const u8*>(real_ptr) - g_base_addr;
+		// Host pointers may name unrelated allocations;use unsigned address-domain arithmetic.
+		const uptr diff = reinterpret_cast<uptr>(real_ptr) - reinterpret_cast<uptr>(g_base_addr);
 
 		if (diff <= u64{u32{umax}} * 2 + 1)
 		{

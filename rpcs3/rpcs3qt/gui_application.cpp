@@ -29,6 +29,7 @@
 #include "Emu/Io/Null/null_camera_handler.h"
 #include "Emu/Io/Null/null_music_handler.h"
 #include "Emu/emu_callbacks.h"
+#include "Emu/system_config.h"
 #include "Emu/vfs_config.h"
 #include "util/init_mutex.hpp"
 #include "util/console.h"

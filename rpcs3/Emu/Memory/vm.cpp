@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "vm_locking.h"
+#include "vm_mapping_observer.h"
 #include "vm_ptr.h"
 #include "vm_reservation.h"
 
@@ -7,6 +8,7 @@
 #include "Utilities/address_range.h"
 #include "Emu/CPU/CPUThread.h"
 #include "Emu/RSX/RSXThread.h"
+#include "Emu/RSX/Core/RSXMappingChange.h"
 #include "Emu/Cell/SPURecompiler.h"
 #include "Emu/perf_meter.hpp"
 #include <deque>
@@ -26,6 +28,52 @@ extern bool is_memory_compatible_for_copy_from_executable_optimization(u32 addr,
 
 namespace vm
 {
+	// Every access is under the process VM writer lock. Capture the sink once
+	// for both callbacks; removal cannot outlive a mapping mutation in flight.
+	static mapping_change_observer* g_mapping_observer = nullptr;
+	bool attach_mapping_observer(mapping_change_observer& observer, const writer_lock&) noexcept
+	{
+		if (g_mapping_observer) return false;
+		g_mapping_observer = &observer;
+		return true;
+	}
+	bool detach_mapping_observer(mapping_change_observer& observer, const writer_lock&) noexcept
+	{
+		if (g_mapping_observer != &observer) return false;
+		g_mapping_observer = nullptr;
+		return true;
+	}
+	class native_mapping_delivery final
+	{
+		// Whole-block removal encloses its page unmaps. Deliver one native
+		// pair for that outer transaction while retaining legacy page events.
+		inline static thread_local u32 s_depth = 0;
+		mapping_change_observer* const m_observer;
+		const mapping_change_view m_view;
+		const u32 m_address, m_size;
+	  public:
+		native_mapping_delivery(u32 address, u32 size, const block_t* block = nullptr) noexcept
+			: m_observer(s_depth++ ? nullptr : g_mapping_observer), m_view(block), m_address(address), m_size(size)
+		{
+			if (m_observer) m_observer->on_mapping_change_begin_locked(m_view, m_address, m_size);
+		}
+		~native_mapping_delivery()
+		{
+			if (m_observer) m_observer->on_mapping_change_end_locked(m_view, m_address, m_size);
+			--s_depth;
+		}
+		native_mapping_delivery(const native_mapping_delivery&) = delete;
+		native_mapping_delivery& operator=(const native_mapping_delivery&) = delete;
+	};
+	class mapping_change_delivery final
+	{
+		rsx::mapping_change_scope<rsx::thread> m_renderer;
+		native_mapping_delivery m_native;
+	  public:
+		mapping_change_delivery(u32 address, u32 size, const block_t* block = nullptr) noexcept
+			: m_renderer(g_fxo->try_get<rsx::thread>(), address, size), m_native(address, size, block) {}
+	};
+
 	static u8* memory_reserve_4GiB(void* _addr, u64 size = 0x100000000, bool is_memory_mapping = false)
 	{
 		for (u64 addr = reinterpret_cast<u64>(_addr) + 0x100000000; addr < 0x8000'0000'0000; addr += 0x100000000)
@@ -442,6 +490,24 @@ namespace vm
 		}
 	}
 
+	host_mapping_guard::host_mapping_guard(host_mapping_guard&& other) noexcept
+		: owned(std::exchange(other.owned, false))
+	{
+	}
+
+	host_mapping_guard::~host_mapping_guard() noexcept
+	{
+		if (owned) get_range_lock_bits(true).release(0);
+	}
+
+	host_mapping_guard host_mapping_guard::try_acquire() noexcept
+	{
+		// A CPU producer must have dropped passive registration before owner
+		// preparation. No blocking,allocation,page fault or CPU-state work here.
+		if (g_tls_locked) return host_mapping_guard{false};
+		return host_mapping_guard{get_range_lock_bits(true).compare_and_swap_test(0, u64{umax})};
+	}
+
 	writer_lock::writer_lock() noexcept
 		: writer_lock(0, nullptr, 1)
 	{
@@ -749,6 +815,9 @@ namespace vm
 		// Lock range being mapped
 		auto range_lock = _lock_main_range_lock(range_allocation, addr, size);
 
+		// The caller's delivery scope also encloses allocation-table publication,
+		// which follows this page-map operation under the same VM writer lock.
+
 		if (shm && shm->flags() != 0 && shm->info++)
 		{
 			// Check ref counter (using unused member info for it)
@@ -945,6 +1014,7 @@ namespace vm
 
 					// Protect range locks from observing changes in memory protection
 					auto range_lock = _lock_main_range_lock(safe_bits, start * 4096, page_size);
+					mapping_change_delivery mapping_change(start * 4096, page_size);
 
 					for (u32 j = start; j < i; j++)
 					{
@@ -1011,6 +1081,11 @@ namespace vm
 
 		// Protect range locks from actual memory protection changes
 		auto range_lock = _lock_main_range_lock(range_allocation, addr, size);
+
+		// Keep asynchronous identity observers busy through the actual backing
+		// mutation,including exception unwinding. The VM writer lock outlives
+		// both notifications;neither callback may lock,wait or enter a provider.
+		mapping_change_delivery mapping_change(addr, size);
 
 		if (shm && shm->flags() != 0 && g_shmem[addr >> 16])
 		{
@@ -1225,6 +1300,10 @@ namespace vm
 			flags |= page_1m_size;
 		}
 
+		// End only after the backing allocation is present in block_map. Page
+		// flags alone must not expose an idle native epoch before its identity.
+		mapping_change_delivery mapping_change(page_addr, page_size, this);
+
 		if (this->flags & stack_guarded)
 		{
 			// Mark overflow/underflow guard pages as allocated
@@ -1361,6 +1440,10 @@ namespace vm
 	bool block_t::unmap(std::vector<std::pair<u64, u64>>* unmapped)
 	{
 		auto& m_map = (m.*block_map)();
+		if (!is_valid()) return false;
+		// Also covers VM close and blocks not discoverable in g_locations.
+		// The outer vm::unmap scope,when present,coalesces this nested pair.
+		native_mapping_delivery mapping_change(addr, size, this);
 
 		if (m_id.exchange(0))
 		{
@@ -2124,6 +2207,9 @@ namespace vm
 					return result;
 				}
 
+				// Keep the old block discoverable for the begin callback, and the
+				// native epoch busy until both location and allocation tables retire.
+				native_mapping_delivery mapping_change((*it)->addr, (*it)->size);
 				result.first = std::move(*it);
 				g_locations.erase(it);
 				ensure(_unmap_block(result.first, &unmap_notifications.unmap_data));
@@ -2133,6 +2219,46 @@ namespace vm
 		}
 
 		return {};
+	}
+
+	backing_segment get_backing_segment(u32 addr, u32 size, const writer_lock& lock) noexcept
+	{
+		return get_backing_segment(addr, size, lock, page_readable);
+	}
+
+	backing_segment get_backing_segment(u32 addr, u32 size, const writer_lock& lock, u8 required_flags) noexcept
+	{
+		if (lock.range_lock) return {};
+		const auto block = _get_map(any, addr);
+		return block ? block->backing(addr, size, required_flags) : backing_segment{};
+	}
+
+	backing_segment mapping_change_view::lookup(u32 addr, u32 size, u8 required_flags) const noexcept
+	{
+		// A restored block may still be under construction and not yet appear
+		// in g_locations. Its callback carries the live block explicitly.
+		if (m_block && addr >= m_block->addr && u64{addr} < u64{m_block->addr} + m_block->size)
+			return m_block->backing(addr, size, required_flags);
+		const auto block = _get_map(any, addr);
+		return block ? block->backing(addr, size, required_flags) : backing_segment{};
+	}
+
+	backing_segment block_t::backing(u32 addr, u32 size, u8 required_flags) const noexcept
+	{
+		// This translation unit is built without C++ exception unwinding.
+		// Only copy existing shared owners;do not allocate or throw here.
+		if (!size || u64{addr} + size > 0x1'0000'0000ull || !check_addr(addr, required_flags, size) || !is_valid()) return {};
+		const auto& entries = (m.*block_map)();
+		const auto upper = entries.upper_bound(addr);
+		if (upper == entries.begin()) return {};
+		const auto found = std::prev(upper);
+		const u64 allocation_end = u64{found->first} + found->second.first;
+		if (addr >= allocation_end) return {};
+		const auto memory = m_common ? m_common : found->second.second;
+		const u64 offset = addr - (m_common ? this->addr : found->first);
+		const u32 bytes = static_cast<u32>(std::min(u64{addr} + size, allocation_end) - addr);
+		if (!memory || offset > memory->size() || bytes > memory->size() - offset) return {};
+		return {addr, bytes, offset, memory};
 	}
 
 	std::shared_ptr<block_t> get(memory_location_t location, u32 addr)

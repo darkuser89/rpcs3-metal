@@ -84,6 +84,13 @@ namespace rsx
 			rsx_log.trace("NV0039_BUFFER_NOTIFY: pitch(in=0x%x, out=0x%x), line(len=0x%x, cnt=0x%x), fmt(in=0x%x, out=0x%x), notify=0x%x",
 				in_pitch, out_pitch, line_length, line_count, in_format, out_format, notify);
 
+			// Native backends own CPU capture and GPU waits;enter before reservation_lock.
+			if (RSX(ctx)->requires_native_buffer_transfer())
+			{
+				ensure(RSX(ctx)->buffer_transfer(arg));
+				return;
+			}
+
 			u32 src_offset = REGS(ctx)->nv0039_input_offset();
 			u32 src_dma = REGS(ctx)->nv0039_input_location();
 
