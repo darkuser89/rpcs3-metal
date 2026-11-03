@@ -1,4 +1,5 @@
 #include "M4RSXScaledImage.h"
+#include "M4RectangleCoverage.h"
 #include <iostream>
 #include <limits>
 
@@ -23,11 +24,36 @@ void refused(F&& f)
 	}
 	require(fail);
 }
+void rectangle_coverage_cases()
+{
+    using metal4::clear_rectangle;using metal4::rectangles_cover;
+    require(rectangles_cover(std::array{clear_rectangle{0,0,2,4},clear_rectangle{2,0,2,4}},4,4));
+    require(!rectangles_cover(std::array{clear_rectangle{0,0,2,4},clear_rectangle{0,0,2,4}},4,4));
+    require(!rectangles_cover(std::array{clear_rectangle{0,0,4,1},clear_rectangle{0,2,4,2}},4,4));
+    const auto maximum=std::numeric_limits<std::size_t>::max();
+    require(rectangles_cover(std::array{clear_rectangle{0,0,maximum/2,maximum},clear_rectangle{maximum/2,0,maximum-maximum/2,maximum}},maximum,maximum));
+    refused([&]{(void)rectangles_cover(std::array{clear_rectangle{maximum,0,1,1}},maximum,1);});
+    refused([&]{(void)rectangles_cover({},0,1);});
+    require(!rectangles_cover(std::vector<clear_rectangle>(metal4::rectangle_coverage_limit+1),1,1));
+    std::uint32_t state=0x3a71c4d2;const auto next=[&]{state=state*1664525u+1013904223u;return state;};
+    for(unsigned profile=0;profile<20000;++profile)
+    {
+        const unsigned width=1+next()%8,height=1+next()%8,count=next()%25;
+        std::vector<clear_rectangle> rectangles;std::array<bool,64> pixels{};
+        for(unsigned i=0;i<count;++i){const auto x=next()%(width+1),y=next()%(height+1);rectangles.push_back({x,y,next()%(width-x+1),next()%(height-y+1)});}
+        if(profile%5==0){rectangles.push_back({0,0,width/2,height});rectangles.push_back({width/2,0,width-width/2,height});}
+        for(const auto& r:rectangles)for(unsigned y=r.y;y<r.y+r.height;++y)for(unsigned x=r.x;x<r.x+r.width;++x)pixels[y*width+x]=true;
+        const bool expected=std::all_of(pixels.begin(),pixels.begin()+width*height,[](bool value){return value;});
+        require(rectangles_cover(rectangles,width,height)==expected);std::reverse(rectangles.begin(),rectangles.end());if(!rectangles.empty())rectangles.push_back(rectangles.front());require(rectangles_cover(rectangles,width,height)==expected);
+    }
+    std::cout<<"Exact rectangle union:20000 independent grid-oracle profiles,overlaps/duplicates/order/holes,area-sum false positives,size_t maximum edges/overflow refusal andbounded metadata fallback passed\n";
+}
 } // namespace
 int main()
 {
 	try
 	{
+        rectangle_coverage_cases();
 		rsx::blit_src_info source{};
 		source.format = rsx::blit_engine::transfer_source_format::a8r8g8b8;
 		source.origin = rsx::blit_engine::transfer_origin::center;

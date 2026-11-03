@@ -3,6 +3,7 @@
 #include "M4PhysicalSurface.h"
 #include "M4ExclusiveGuestMemory.h"
 #include "M4ScaledImageNativePlan.h"
+#include "M4RectangleCoverage.h"
 
 #include <algorithm>
 #include <list>
@@ -1233,6 +1234,12 @@ struct surface_cache::impl
 				full = true;
 			}
 		}
+		if(!full&&surface->deferred.size()<=rectangle_coverage_limit)
+		{
+			std::vector<clear_rectangle> rectangles;
+			for(const auto& section:surface->deferred)if(section.plane==texture_plane::all)rectangles.push_back(section.destination);
+			full=rectangles_cover(rectangles,surface->description.allocation.width,surface->description.allocation.height);
+		}
 		const bool native_background = surface->dirty || surface->revision == surface->deferred_revision;
 		const auto spill = !full && native_background ? surface->spill : raw_surface_snapshot{};
 		const auto background = !full && native_background && surface->initialized && !spill.buffer ? surface->lease : surface_lease{};
@@ -1388,6 +1395,12 @@ struct surface_cache::impl
 				first = i;
 				full = true;
 			}
+		}
+		if(!full&&surface->deferred.size()<=rectangle_coverage_limit)
+		{
+			std::vector<clear_rectangle> rectangles;
+			for(const auto& section:surface->deferred)if(section.plane==texture_plane::all)rectangles.push_back(section.destination);
+			full=rectangles_cover(rectangles,surface->description.allocation.width,surface->description.allocation.height);
 		}
 		std::vector<std::uint64_t> revision;
 		if (full)
@@ -1960,6 +1973,8 @@ std::optional<surface_cache::scaled_image_endpoints> surface_cache::prepare_scal
 	if(!m_impl->capture)return {};
 	prepare_texture_boundary(true);m_impl->synchronize(timeout);
 	scaled_image_endpoints result;
+	std::array<std::optional<cached_surface_description>,2> create;
+	const auto native_limit=max_2d_texture_dimension(m_impl->ctx.device());
 	bool complete=true;
 	m_impl->cpu([&]
 	{
@@ -1978,10 +1993,28 @@ std::optional<surface_cache::scaled_image_endpoints> surface_cache::prepare_scal
 			{
 				if(dirty&&!surface->dirty&&surface->deferred.empty())continue;
 				m_impl->check_mapping(surface);
-				if(!surface->initialized||surface->faulted||!surface->deferred.empty()||(!surface->lease&&!surface->spill.buffer))continue;
-				if(m_impl->current(surface)!=surface->revision)
+				const bool deferred=!surface->deferred.empty();
+				if(surface->faulted||(!deferred&&(!surface->initialized||(!surface->lease&&!surface->spill.buffer))))continue;
+				if(deferred)
 				{
-					if(surface->dirty)throw surface_conflict_error(surface->storage.parts.front().coverage.range);
+					// Resolving a queued owner is GPU-only except for a genuine
+					// missing background. Other dirty aliases require separate
+					// authority assembly;do not flush them as a side effect.
+					const auto aliases=m_impl->plan_aliases(surface);
+					bool competing=std::any_of(aliases.begin(),aliases.end(),[](const auto& s){return s->dirty||!s->deferred.empty();});
+					// Retained physical owners need not still share a current VA.
+					if(!competing&&surface->physical)for(const auto& other:m_impl->surfaces)
+					{
+						if(other==surface||(!other->dirty&&other->deferred.empty()))continue;
+						if(!other->physical){competing=true;break;}
+						for(const auto& a:*surface->physical)for(const auto& b:*other->physical)if(a->overlaps(*b))competing=true;
+						if(competing)break;
+					}
+					if(competing)continue;
+				}
+				if(m_impl->current(surface)!=(deferred?surface->deferred_revision:surface->revision))
+				{
+					if(surface->dirty||deferred)throw surface_conflict_error(surface->storage.parts.front().coverage.range);
 					continue;
 				}
 				if(surface->description.allocation.format!=surface_format{expected})continue;
@@ -1997,10 +2030,47 @@ std::optional<surface_cache::scaled_image_endpoints> surface_cache::prepare_scal
 				if(result.surfaces[side]&&result.surfaces[side]->native_write_epoch>=surface->native_write_epoch)continue;
 				result.surfaces[side]=surface;result.regions[side]=*region;
 			}
-			complete=bool(result.surfaces[side]);
+			const auto& tile=side?plan.destination_tile:plan.source_tile;
+			const auto& segments=side?plan.destination_segments:plan.source_segments;
+			if(!result.surfaces[side]&&!dirty&&image.width<=native_limit&&image.height<=native_limit&&
+				((!tile&&segments.empty())||image.range.size<=m_impl->snapshot_limit))
+			{
+				// Missing input captures only its requested raster through the
+				// ordinary coherent guest upload. Missing output needs no VM
+				// pixels:its entire active raster will be overwritten on GPU.
+				// Pitch/Morton/tile exterior stays in guest storage.
+				auto address=image.range.address;
+				if(tile)
+				{
+					if(segments.empty())address=tile->address+tile->offset;
+					else
+					{
+						const auto* part=texture_assembly_segment(segments,tile->offset);
+						if(!part)throw std::logic_error("Native scaled-image storage lacks its pixel segment");
+						address=static_cast<std::uint32_t>(std::uint64_t(part->address)+tile->offset-part->offset);
+					}
+				}
+				create[side]=cached_surface_description{address,{image.width,image.height,1,expected,false},
+					image.morton?0:image.row_pitch,image.morton,tile,segments};
+			}
+			complete=bool(result.surfaces[side])||create[side].has_value();
 		}
 	});
-	return complete?std::optional{std::move(result)}:std::nullopt;
+	if(!complete)return {};
+	// Metadata admission must not retire either selected endpoint while its
+	// missing peer is registered. Handles remain cold until draw preparation.
+	surface_list_guard pins(m_impl->pinned,result.surfaces);
+	for(unsigned side=0;side<2;++side)if(create[side])
+	{
+		result.surfaces[side]=acquire(*create[side]);
+		if(result.surfaces[side]->dirty||!result.surfaces[side]->deferred.empty())
+			throw std::logic_error("Native scaled-image cold endpoint already owns output");
+		m_impl->pinned.push_back(result.surfaces[side]);
+		const auto& image=side?plan.destination:plan.source;
+		result.regions[side]={0,0,image.width,image.height};
+		if(side==1)result.overwrite_destination=true;
+	}
+	return result;
 }
 void surface_cache::draw_scaled_image(const scaled_image_endpoints& endpoints,
 	const std::function<void(context&,std::span<const id<MTLTexture>>)>& encode,
@@ -2010,11 +2080,12 @@ void surface_cache::draw_scaled_image(const scaled_image_endpoints& endpoints,
 	const auto previous=m_impl->timeout;
 	struct restore_timeout{impl& state;std::chrono::milliseconds value;~restore_timeout(){state.timeout=value;}} restore{*m_impl,previous};
 	m_impl->timeout=timeout;
+	surface_list_guard pins(m_impl->pinned,endpoints.surfaces);
 	const std::array uses{cached_surface_use{endpoints.surfaces[0],false},cached_surface_use{endpoints.surfaces[1],true}};
-	draw_impl(uses,encode,true,nullptr,nullptr,std::move(publication_check));
+	draw_impl(uses,encode,true,nullptr,nullptr,std::move(publication_check),endpoints.overwrite_destination?endpoints.surfaces[1]:cached_surface_ref{});
 }
 void surface_cache::draw_impl(std::span<const cached_surface_use> uses, const std::function<void(context&, std::span<const id<MTLTexture>>)>& encode, bool feedback,
-							  const surface_allocation_description* transient, surface_lease* reservation,std::function<void()> publication_check)
+							  const surface_allocation_description* transient, surface_lease* reservation,std::function<void()> publication_check,const cached_surface_ref& overwrite)
 {
 	if(publication_check)m_impl->cpu(publication_check);
 	// Sixteen fragment inputs, four vertex inputs, four color targets and depth.
@@ -2028,6 +2099,9 @@ void surface_cache::draw_impl(std::span<const cached_surface_use> uses, const st
 			if ((feedback ? uses[i].write && uses[j].write : uses[i].write || uses[j].write) && memory_storage_overlap(*m_impl->memory, uses[i].surface->storage, uses[j].surface->storage))
 				throw std::invalid_argument("Native cache draw write targets overlap guest storage");
 	}
+	if(overwrite&&(uses.size()!=2||uses[0].write||!uses[1].write||uses[1].surface!=overwrite||overwrite->dirty||!overwrite->deferred.empty()))
+		throw std::logic_error("Native full-overwrite draw requires one cold output and one input");
+	std::vector<std::uint64_t> overwrite_revision;
 	if (std::any_of(uses.begin(), uses.end(), [](const auto& use) { return !use.write; }))
 		m_impl->synchronize(m_impl->timeout);
 	for (const auto& use : uses)
@@ -2081,9 +2155,19 @@ void surface_cache::draw_impl(std::span<const cached_surface_use> uses, const st
 								} },
 							[] {}, {}, std::move(captured));
 		}
-		for (const auto& use : uses)
-			if (use.write)
-				m_impl->prepare(use.surface, surface_initialization::guest);
+		for(const auto& use:uses)if(use.write)
+		{
+			if(use.surface==overwrite)
+			{
+				// No clear/upload may become a valid dirty authority before
+				// the real writer succeeds. Capture watches,allocate only;
+				// native_output rollback preserves the former cold state.
+				m_impl->flush_aliases(overwrite);
+				overwrite_revision=m_impl->current(overwrite);
+				m_impl->allocate(overwrite);
+			}
+			else m_impl->prepare(use.surface,surface_initialization::guest);
+		}
 		if (transient)
 			*reservation = m_impl->allocate_transient(*transient);
 	}
@@ -2117,11 +2201,16 @@ void surface_cache::draw_impl(std::span<const cached_surface_use> uses, const st
 								textures.push_back(uses[i].surface->lease->render_texture(m_impl->ctx));
 						}
 						encode(m_impl->ctx, textures); },
-					[this, written, aliases, native_epoch,check=std::move(publication_check)]
+					[this, written, aliases, native_epoch,check=std::move(publication_check),overwrite,overwrite_revision]
 					{
 						if(check)check();
 						for (const auto& surface : written)
 						{
+							if(surface==overwrite)
+							{
+								surface->revision=overwrite_revision;surface->initialized=true;
+								surface->faulted=false;surface->spill={};
+							}
 							surface->dirty = true;
 							surface->native_write_epoch = native_epoch;
 							++surface->generation;
@@ -2131,9 +2220,9 @@ void surface_cache::draw_impl(std::span<const cached_surface_use> uses, const st
 					written, [&]
 					{
 						std::vector<surface_validation> values;
-						for (const auto& use : uses) values.push_back({use.surface, use.surface->revision});
+						for (const auto& use : uses) values.push_back({use.surface,use.surface==overwrite?overwrite_revision:use.surface->revision});
 						return values;
-					}(), aliases, false, !written.empty(), true, batchable);
+					}(), aliases, false, !written.empty(), !overwrite, batchable);
 }
 void surface_cache::copy(const cached_surface_ref& source, clear_rectangle rectangle, const cached_surface_ref& destination,
 						 std::size_t x, std::size_t y, texture_plane plane)

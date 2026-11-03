@@ -185,11 +185,12 @@ class surface_cache final
 	void draw_impl(std::span<const cached_surface_use> surfaces,
 				   const std::function<void(context&, std::span<const id<MTLTexture>>)>& encode, bool snapshot_feedback,
 				   const surface_allocation_description* transient = nullptr, surface_lease* reservation = nullptr,
-				   std::function<void()> publication_check = {});
+				   std::function<void()> publication_check = {}, const cached_surface_ref& overwrite = {});
 	struct scaled_image_endpoints
 	{
 		std::array<cached_surface_ref,2> surfaces;
 		std::array<clear_rectangle,2> regions;
+		bool overwrite_destination = false;
 	};
 	[[nodiscard]] std::optional<scaled_image_endpoints> prepare_scaled_image(const scaled_image_plan& plan,
 		std::chrono::milliseconds timeout);

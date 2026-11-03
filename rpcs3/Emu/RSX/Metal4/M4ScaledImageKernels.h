@@ -39,21 +39,25 @@ ulong rpcs3_pixel_offset(uint2 p,constant layout& l)
     uint relative=physical-l.tile_base;
     return relative<=l.tile_size-l.bytes?ulong(relative):~0ul;
 }
-float4 read_pixel(device const uchar* data,int2 p,constant layout& l)
+uint4 read_pixel(device const uchar* data,int2 p,constant layout& l)
 {
     p=clamp(p,int2(0),int2(l.width-1,l.height-1));
     ulong offset=rpcs3_pixel_offset(uint2(p),l);
-    if(offset==~0ul) return l.bytes==2?float4(0,0,0,1):float4(0);
-    if(l.bytes==4) return float4(data[offset+1],data[offset+2],data[offset+3],data[offset])/255.0f;
+    if(offset==~0ul) return l.bytes==2?uint4(0,0,0,1):uint4(0);
+    if(l.bytes==4) return uint4(data[offset+1],data[offset+2],data[offset+3],data[offset]);
     uint word=(uint(data[offset])<<8)|uint(data[offset+1]);
-    return float4(float((word>>11)&31)/31.0f,float((word>>5)&63)/63.0f,float(word&31)/31.0f,1.0f);
+    return uint4((word>>11)&31,(word>>5)&63,word&31,1);
 }
 kernel void rpcs3_scaled_image(device const uchar* source [[buffer(0)]],device uchar* destination [[buffer(1)]],
     constant parameters& p [[buffer(2)]],uint2 pixel [[thread_position_in_grid]])
 {
     if(pixel.x>=p.destination.width||pixel.y>=p.destination.height) return;
     uint2 output=pixel+uint2(p.clip_x,p.clip_y);
-    float4 color;
+    // Keep affine centers and bilinear weights rational. At half-channel
+    // boundaries,float coordinates can move a 565 channel to the wrong word.
+    // Dimensions <=65536 bound denominator products by 2^34 and each
+    // rescaled channel numerator below 2^50,including cross-format copies.
+    ulong4 channels;ulong divisor=1;
     if(!p.linear) {
         // Exact rational center mapping;flip BEFORE integer truncation.
         ulong nx=(ulong(output.x)*2+1)*p.input_w,dx=ulong(p.scaled_w)*2;
@@ -68,24 +72,36 @@ kernel void rpcs3_scaled_image(device const uchar* source [[buffer(0)]],device u
             for(uint i=0;i<p.source.bytes;++i) destination[to+i]=from==~0ul?0:source[from+i];
             return;
         }
-        color=read_pixel(source,selected,p.source);
+        channels=ulong4(read_pixel(source,selected,p.source));
     } else {
-        float2 coord=(float2(output)+0.5f)*float2(p.input_w,p.input_h)/float2(p.scaled_w,p.scaled_h);
-        if(p.flip_x) coord.x=float(p.input_w)-coord.x;
-        if(p.flip_y) coord.y=float(p.input_h)-coord.y;
-        coord-=0.5f;
-        int2 a=int2(floor(coord));float2 weight=coord-float2(a);
-        color=mix(mix(read_pixel(source,a,p.source),read_pixel(source,a+int2(1,0),p.source),weight.x),
-                  mix(read_pixel(source,a+int2(0,1),p.source),read_pixel(source,a+int2(1,1),p.source),weight.x),weight.y);
+        long dx=long(p.scaled_w)*2,dy=long(p.scaled_h)*2;
+        long nx=(long(output.x)*2+1)*p.input_w,ny=(long(output.y)*2+1)*p.input_h;
+        if(p.flip_x) nx=long(p.input_w)*dx-nx;
+        if(p.flip_y) ny=long(p.input_h)*dy-ny;
+        nx-=p.scaled_w;ny-=p.scaled_h;
+        // Signed integer division truncates toward zero; sampling needs floor.
+        long ax=nx/dx-(nx<0&&nx%dx!=0),ay=ny/dy-(ny<0&&ny%dy!=0);
+        ulong wx=ulong(nx-ax*dx),wy=ulong(ny-ay*dy);
+        int2 a=int2(ax,ay);
+        channels=ulong4(read_pixel(source,a,p.source))*((ulong(dx)-wx)*(ulong(dy)-wy))+
+            ulong4(read_pixel(source,a+int2(1,0),p.source))*(wx*(ulong(dy)-wy))+
+            ulong4(read_pixel(source,a+int2(0,1),p.source))*((ulong(dx)-wx)*wy)+
+            ulong4(read_pixel(source,a+int2(1,1),p.source))*(wx*wy);
+        divisor=ulong(dx)*ulong(dy);
     }
     ulong to=rpcs3_pixel_offset(pixel,p.destination);
     if(to==~0ul) return;
-    color=clamp(color,0.0f,1.0f);
+    uint4 source_max=p.source.bytes==2?uint4(31,63,31,1):uint4(255);
+    uint4 destination_max=p.destination.bytes==2?uint4(31,63,31,1):uint4(255);
+    uint4 v;
+    for(uint c=0;c<4;++c) {
+        ulong denominator=divisor*source_max[c];
+        v[c]=uint((channels[c]*destination_max[c]+denominator/2)/denominator);
+    }
     if(p.destination.bytes==4) {
-        uint4 v=uint4(round(color*255.0f));
         destination[to]=uchar(v.w);destination[to+1]=uchar(v.x);destination[to+2]=uchar(v.y);destination[to+3]=uchar(v.z);
     } else {
-        uint3 v=uint3(round(color.xyz*float3(31,63,31)));uint word=(v.x<<11)|(v.y<<5)|v.z;
+        uint word=(v.x<<11)|(v.y<<5)|v.z;
         destination[to]=uchar(word>>8);destination[to+1]=uchar(word);
     }
 }

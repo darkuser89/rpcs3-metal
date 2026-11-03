@@ -19,10 +19,20 @@ class scaled_image_compute final
 	// Writes active destination pixels;all padding/Morton exterior survives.
 	void encode(context& ctx, const scaled_image_plan& plan, id<MTLBuffer> source, id<MTLBuffer> destination) const;
 };
-// Synchronous render-owner transfer with recoverable pending GPU work. Capture
-// both snapshots in one CPU epoch;GPU scale/format/filter/swizzle runs outside
-// exclusion. Publish destination active bytes with revision CAS in a new CPU
-// epoch. Banked allocations use conservative whole-allocation CAS coverage.
+// Render-owner transfer with recoverable pending GPU work. Suitable native
+// RGB565/ARGB8 authorities stay GPU-resident:private guest-word snapshots feed
+// the exact scale/filter kernel and native versions publish in the cache CPU
+// epoch. Overlapping reads use immutable feedback snapshots;1/2/4 samples keep
+// their individual expanded pixels. Missing native destinations are registered
+// as exact active output rasters,without uploading VM background. A full-write
+// transaction publishes their first authority only on success;pitch/Morton/tile
+// exterior stays in guest storage until an actual observation/writeback.
+// Missing RAM inputs use a coherent guest upload into an exact native source
+// raster;the result stays dirty on GPU. Deferred endpoints materialize their
+// captured native sections before use;full rectangular unions need no guest
+// background. Partial copies preserve native/spilled or coherent RAM background.
+// Competing dirty aliases still require separate assembly. Unsupported combinations
+// retain the coherent VM snapshot/CAS route. Banked VM coverage is conservative.
 // No retained guest pointers,no CPU image processing or legacy backend.
 class scaled_image_transfer final
 {
@@ -46,7 +56,11 @@ class scaled_image_transfer final
 						  std::shared_ptr<guest_surface_memory> memory, cpu_capture_dispatch capture, std::size_t byte_limit);
 	~scaled_image_transfer();
 	// Optional dependencies encode native prerequisites only;never VM/CPU/UI
-	// work. A timeout retains the transaction for synchronize()/teardown.
+	// work. A timeout after output submission retains its transaction for
+	// synchronize()/teardown. Earlier source/target preparation is SurfaceCache-
+	// owned:finish that prefix before explicitly retrying execute(). Prior queued
+	// copies may materialize;the current scaled output is never published by
+	// preparation alone.
 	// Copy the plan before callbacks. An owned metadata validator runs in both
 	// CPU epochs and before potentially flushing cache preparation. It is held
 	// across timeout until publication or teardown.
