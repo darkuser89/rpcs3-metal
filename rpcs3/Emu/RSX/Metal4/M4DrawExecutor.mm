@@ -135,7 +135,7 @@ versioned_draw_texture_job draw_executor::enqueue_versioned_textures(const verte
 		{
 			state->fragment_indices[unit] = words.size(); words.push_back(fragment.at(unit));
 		}
-	m_surfaces.prepare_texture_boundary(!words.empty() || (needs_null_textures(vertex, fragment) && !m_textures.null_images_ready()));
+	m_surfaces.prepare_texture_boundary(needs_null_textures(vertex, fragment) && !m_textures.null_images_ready());
 	std::exception_ptr failure;
 	@autoreleasepool
 	{

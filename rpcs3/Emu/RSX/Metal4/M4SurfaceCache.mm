@@ -2,6 +2,7 @@
 #include "M4GuestMemoryOverlap.h"
 #include "M4PhysicalSurface.h"
 #include "M4ExclusiveGuestMemory.h"
+#include "M4ScaledImageNativePlan.h"
 
 #include <algorithm>
 #include <list>
@@ -289,6 +290,9 @@ struct surface_cache::impl
 	std::vector<cached_surface_ref> resolving;
 	std::uint64_t clock = 0;
 	std::uint64_t native_clock = 0;
+	// Deferred/cancelled ownership can change a former VM hole without leaving
+	// a materialized native source for a later ready-image lookup to discover.
+	std::uint64_t texture_topology_epoch = 0;
 	[[nodiscard]] std::uint64_t reserve_native_epoch()
 	{
 		if (native_clock == std::numeric_limits<std::uint64_t>::max())
@@ -1947,9 +1951,72 @@ void surface_cache::draw_depth_bounds(std::span<const cached_surface_use> uses, 
 				  encode(ctx, textures, prepared);
 				  prepared.end(); }, feedback, &mirror_description, &mirror);
 }
-void surface_cache::draw_impl(std::span<const cached_surface_use> uses, const std::function<void(context&, std::span<const id<MTLTexture>>)>& encode, bool feedback,
-							  const surface_allocation_description* transient, surface_lease* reservation)
+std::optional<surface_cache::scaled_image_endpoints> surface_cache::prepare_scaled_image(const scaled_image_plan& plan,
+	std::chrono::milliseconds timeout)
 {
+	m_impl->outside_epoch();
+	// The closed native route publishes metadata under the cache's producer
+	// exclusion. Legacy callers without that exclusion retain the VM route.
+	if(!m_impl->capture)return {};
+	prepare_texture_boundary(true);m_impl->synchronize(timeout);
+	scaled_image_endpoints result;
+	bool complete=true;
+	m_impl->cpu([&]
+	{
+		for(unsigned side=0;side<2&&complete;++side)
+		{
+			const auto& image=side?plan.destination:plan.source;
+			const auto requested=scaled_image_storage(image,side?plan.destination_tile:plan.source_tile,
+				side?plan.destination_segments:plan.source_segments);
+			const auto projected=project_display_storage_source(requested);
+			std::vector<guest_surface_layout> coverage;for(const auto& part:projected)coverage.push_back(part.coverage);
+			const auto candidates=m_impl->cpu_aliases(coverage,true);
+			const auto dirty=std::count_if(candidates.begin(),candidates.end(),[](const auto& s){return s->dirty||!s->deferred.empty();});
+			if(dirty>1){complete=false;break;}
+			const auto expected=(side?plan.destination_format:plan.source_format)==scaled_image_format::rgb565?surface_color::rgb565:surface_color::argb8;
+			for(const auto& surface:candidates)
+			{
+				if(dirty&&!surface->dirty&&surface->deferred.empty())continue;
+				m_impl->check_mapping(surface);
+				if(!surface->initialized||surface->faulted||!surface->deferred.empty()||(!surface->lease&&!surface->spill.buffer))continue;
+				if(m_impl->current(surface)!=surface->revision)
+				{
+					if(surface->dirty)throw surface_conflict_error(surface->storage.parts.front().coverage.range);
+					continue;
+				}
+				if(surface->description.allocation.format!=surface_format{expected})continue;
+				const auto& description=surface->description;
+				const auto size=description.allocation.samples==1?std::array{description.allocation.width,description.allocation.height}:
+					sample_expanded_size(description.allocation.width,description.allocation.height,description.allocation.samples);
+				auto geometry=plan_guest_surface(description.tile?description.tile->address:description.address,size[0],size[1],image.pixel_bytes,
+					description.morton?0:description.row_pitch,description.morton);
+				if(description.tile)geometry.range={description.tile->address,description.tile->size};
+				const auto storage=scaled_image_storage(geometry,description.tile,description.segments);
+				const auto region=plan_native_scaled_image_region(*m_impl->memory,storage,requested);
+				if(!region)continue;
+				if(result.surfaces[side]&&result.surfaces[side]->native_write_epoch>=surface->native_write_epoch)continue;
+				result.surfaces[side]=surface;result.regions[side]=*region;
+			}
+			complete=bool(result.surfaces[side]);
+		}
+	});
+	return complete?std::optional{std::move(result)}:std::nullopt;
+}
+void surface_cache::draw_scaled_image(const scaled_image_endpoints& endpoints,
+	const std::function<void(context&,std::span<const id<MTLTexture>>)>& encode,
+	std::function<void()> publication_check,std::chrono::milliseconds timeout)
+{
+	m_impl->outside_epoch();
+	const auto previous=m_impl->timeout;
+	struct restore_timeout{impl& state;std::chrono::milliseconds value;~restore_timeout(){state.timeout=value;}} restore{*m_impl,previous};
+	m_impl->timeout=timeout;
+	const std::array uses{cached_surface_use{endpoints.surfaces[0],false},cached_surface_use{endpoints.surfaces[1],true}};
+	draw_impl(uses,encode,true,nullptr,nullptr,std::move(publication_check));
+}
+void surface_cache::draw_impl(std::span<const cached_surface_use> uses, const std::function<void(context&, std::span<const id<MTLTexture>>)>& encode, bool feedback,
+							  const surface_allocation_description* transient, surface_lease* reservation,std::function<void()> publication_check)
+{
+	if(publication_check)m_impl->cpu(publication_check);
 	// Sixteen fragment inputs, four vertex inputs, four color targets and depth.
 	if (uses.empty() || uses.size() > 25 || !encode || std::count_if(uses.begin(), uses.end(), [](const auto& use)
 																	 { return use.write; }) > 5)
@@ -2036,6 +2103,7 @@ void surface_cache::draw_impl(std::span<const cached_surface_use> uses, const st
 			aliases.insert(aliases.end(), affected.begin(), affected.end());
 		}
 	const auto native_epoch = written.empty() ? 0 : m_impl->reserve_native_epoch();
+	const bool batchable=!publication_check;
 	m_impl->execute([&]
 					{
 						std::vector<id<MTLTexture>> textures;
@@ -2049,8 +2117,9 @@ void surface_cache::draw_impl(std::span<const cached_surface_use> uses, const st
 								textures.push_back(uses[i].surface->lease->render_texture(m_impl->ctx));
 						}
 						encode(m_impl->ctx, textures); },
-					[this, written, aliases, native_epoch]
+					[this, written, aliases, native_epoch,check=std::move(publication_check)]
 					{
+						if(check)check();
 						for (const auto& surface : written)
 						{
 							surface->dirty = true;
@@ -2064,7 +2133,7 @@ void surface_cache::draw_impl(std::span<const cached_surface_use> uses, const st
 						std::vector<surface_validation> values;
 						for (const auto& use : uses) values.push_back({use.surface, use.surface->revision});
 						return values;
-					}(), aliases, false, !written.empty(), true, true);
+					}(), aliases, false, !written.empty(), true, batchable);
 }
 void surface_cache::copy(const cached_surface_ref& source, clear_rectangle rectangle, const cached_surface_ref& destination,
 						 std::size_t x, std::size_t y, texture_plane plane)
@@ -2180,7 +2249,7 @@ void surface_cache::defer_transfer(const cached_surface_ref& source, clear_recta
 	plans.push_back({source->lease, source->generation, rectangle, target, plane, flip, typeless});
 	// A new deferred owner can cover a former VM hole in an assembled image.
 	// Invalidate its source-set identity now,not only when materialized later.
-	(void)m_impl->reserve_native_epoch();
+	m_impl->texture_topology_epoch = m_impl->reserve_native_epoch();
 	destination->deferred = std::move(plans);
 	destination->deferred_revision = std::move(revision);
 	destination->backing = retained.front().owner;
@@ -2190,7 +2259,7 @@ void surface_cache::cancel_deferred_copies(const cached_surface_ref& surface)
 {
 	m_impl->check(surface);
 	m_impl->synchronize(m_impl->timeout);
-	if(!surface->deferred.empty())(void)m_impl->reserve_native_epoch();
+	if(!surface->deferred.empty())m_impl->texture_topology_epoch = m_impl->reserve_native_epoch();
 	surface->deferred.clear();
 	if (!surface->dirty) surface->reset_backing();
 	(void)m_impl->pool.trim();
@@ -2347,6 +2416,42 @@ void surface_cache::validate_texture_adapter(context& ctx, const guest_surface_m
 {
 	if (&ctx != &m_impl->ctx || &memory != m_impl->memory.get())
 		throw std::invalid_argument("Native texture/surface caches require the same context and VM adapter");
+}
+void surface_cache::prepare_texture_read_boundary(std::span<const guest_surface_layout> coverage)
+{
+	prepare_texture_boundary(false);
+	if (coverage.empty() || coverage.size() > (1u << 20))
+		throw std::invalid_argument("Native texture read coverage count is invalid");
+	for (const auto& part : coverage) { validate_guest_surface_range(part.range); (void)guest_surface_byte_cursor(part); }
+	bool hazard = false;
+	if (const auto batch = m_impl->recording_batch)
+		m_impl->cpu([&]
+		{
+			m_impl->memory->test_storage([&](bool direct, const guest_surface_memory::storage_lookup& lookup)
+			{
+				for (const auto& surface : batch->mutated)
+					for (const auto& part : coverage)
+						if (active_storage_overlap(direct, lookup, part, surface->storage)) hazard = true;
+				return false;
+			});
+			// A remapped VA need not identify the allocation retained by a draw.
+			// Unknown physical identity cannot justify skipping its boundary.
+			for (const auto& backing : batch->backings)
+				if (!hazard && backing.physical && std::find(batch->mutated.begin(), batch->mutated.end(), backing.surface) != batch->mutated.end())
+					for (const auto& ticket : *backing.physical)
+						for (const auto& part : coverage)
+						{
+							guest_surface_byte_cursor cursor(part);
+							while (const auto run = cursor.next())
+							{
+								const auto overlap = m_impl->memory->physical_surface_overlaps_current(*ticket, *run);
+								if (!overlap || *overlap) { hazard = true; break; }
+							}
+						}
+		});
+	// Already submitted transactions still publish through normal completion.
+	// An unrelated,unsubmitted draw recording remains owned by its batch.
+	m_impl->synchronize(m_impl->timeout, hazard);
 }
 struct prepared_surface_snapshot::state
 {
@@ -2588,9 +2693,13 @@ std::uint64_t surface_cache::texture_source_epoch() const
 {
 	m_impl->outside_epoch();return m_impl->native_clock;
 }
+std::uint64_t surface_cache::texture_source_topology_epoch() const
+{
+	m_impl->outside_epoch();return m_impl->texture_topology_epoch;
+}
 std::vector<cached_surface_ref> surface_cache::texture_sources(std::span<const guest_surface_layout> coverage)
 {
-	m_impl->outside_epoch(); m_impl->ctx.validate_begin(); m_impl->synchronize(m_impl->timeout);
+	prepare_texture_read_boundary(coverage);
 	std::vector<cached_surface_ref> result;
 	m_impl->cpu([&]
 	{
@@ -2644,7 +2753,7 @@ std::shared_ptr<prepared_surface_snapshot> surface_cache::prepare_texture_mappin
 	for (const auto& part : coverage) { validate_guest_surface_range(part.range); (void)guest_surface_byte_cursor(part); }
 	if (!region || !budget || budget->device() != m_impl->ctx.device())
 		throw std::invalid_argument("Native surface texture snapshot needs a validator and matching heap budget");
-	m_impl->synchronize(m_impl->timeout);
+	prepare_texture_read_boundary(coverage);
 	if (source_only) m_impl->check(source_only);
 	const auto candidates = source_only ? std::vector<cached_surface_ref>{source_only} : m_impl->cpu_aliases(coverage, true);
 	const auto map_region = [&](const cached_surface_ref& surface)

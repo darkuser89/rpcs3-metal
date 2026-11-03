@@ -141,6 +141,91 @@ std::vector<std::byte> reference(const scaled_image_plan& p, const std::vector<s
 		}
 	return target;
 }
+class native_access final : public exclusive_guest_memory,public exclusive_guest_memory::view,public std::enable_shared_from_this<native_access>
+{
+	std::mutex mutex;
+	std::vector<std::byte> bytes=std::vector<std::byte>(1u<<20,std::byte{0xcd});
+  public:
+	unsigned notifications=0;
+	void execute(const std::function<void(view&)>& work) override
+	{
+		if(auto* active=guest_memory_epoch::current(*this)){work(*active);return;}
+		std::lock_guard lock(mutex);guest_memory_epoch epoch(*this,*this);work(*this);
+	}
+	std::byte* map(guest_surface_range range,bool) override
+	{
+		const auto offset=range.address%bytes.size();if(range.address>=2*bytes.size()||range.size>bytes.size()-offset)throw std::out_of_range("Native scale fixture range");return bytes.data()+offset;
+	}
+	bool same_storage(guest_surface_range a,guest_surface_range b) override {return overlaps(guest_surface_range{a.address%unsigned(bytes.size()),a.size},guest_surface_range{b.address%unsigned(bytes.size()),b.size});}
+	std::optional<guest_surface_range> rebase_storage(guest_surface_range source,guest_surface_range request) override
+	{
+		const auto a=source.address%unsigned(bytes.size()),b=request.address%unsigned(bytes.size());if(b<a||request.size>source.size||b-a>source.size-request.size)return {};return guest_surface_range{source.address+b-a,request.size};
+	}
+	bool equivalent_storage(guest_surface_range a,guest_surface_range b) override {return a.address%bytes.size()==b.address%bytes.size()&&a.size==b.size;}
+	std::shared_ptr<void> retain_backing(std::span<const guest_surface_range>) override {return shared_from_this();}
+	void written(guest_surface_range) noexcept override {++notifications;}
+	std::vector<std::byte> copy() {std::lock_guard lock(mutex);return bytes;}
+};
+class native_memory final : public guest_surface_memory
+{
+  public:
+	std::shared_ptr<native_access> access=std::make_shared<native_access>();
+	std::shared_ptr<guarded_guest_memory> raw=std::make_shared<guarded_guest_memory>(access);
+	bool forbid_pixels=false;unsigned reads=0,writes=0;
+	guest_surface_layout watch_surface(const guest_surface_layout& coverage) override {return raw->watch_surface(coverage);}
+	guest_surface_snapshot read_surface(const guest_surface_layout& coverage) override {require(!forbid_pixels,"Native scale read VMpixels");++reads;return raw->read_surface(coverage);}
+	std::uint64_t surface_revision(const guest_surface_layout& coverage) override {return raw->surface_revision(coverage);}
+	std::optional<std::vector<storage_identity_span>> storage_identity(guest_surface_range r) override {return raw->storage_identity(r);}
+	std::shared_ptr<void> retain_backing(std::span<const guest_surface_range> ranges) override {return raw->retain_backing(ranges);}
+	bool test_storage(const storage_test& test) override {return raw->test_storage(test);}
+	bool test_rebase(const rebase_test& test) override {return raw->test_rebase(test);}
+	std::shared_ptr<const physical_surface> capture_physical_surface(const guest_surface_layout& c,std::uint64_t v) override {return raw->capture_physical_surface(c,v);}
+	bool physical_surface_current(const physical_surface& p) override {return raw->physical_surface_current(p);}
+	std::optional<bool> physical_surface_overlaps_current(const physical_surface& p,guest_surface_range r) override {return raw->physical_surface_overlaps_current(p,r);}
+	std::optional<bool> physical_identity_overlaps_current(const physical_identity& p,const guest_surface_layout& r) override {return raw->physical_identity_overlaps_current(p,r);}
+	std::optional<bool> physical_surface_virtual_current(const physical_surface& p,std::uint64_t v) override {return raw->physical_surface_virtual_current(p,v);}
+	std::optional<guest_surface_snapshot> read_physical_surface(const physical_surface& p) override {require(!forbid_pixels,"Native scale read physical VMpixels");++reads;return raw->read_physical_surface(p);}
+	std::optional<physical_surface_publication> compare_write_physical(std::span<const physical_surface_write> w,std::span<const std::uint64_t> v) override {require(!forbid_pixels,"Native scale wrote physical VMpixels");++writes;return raw->compare_write_physical(w,v);}
+	std::optional<std::uint64_t> compare_write(const guest_surface_layout& c,std::uint64_t v,std::span<const std::byte> b) override {require(!forbid_pixels,"Native scale wrote VMpixels");++writes;return raw->compare_write(c,v,b);}
+	std::optional<std::uint64_t> compare_write_many(std::span<const guest_surface_write> w) override {require(!forbid_pixels,"Native scale scattered VMpixels");++writes;return raw->compare_write_many(w);}
+	void write(guest_surface_range r,std::span<const std::byte> b) override {require(!forbid_pixels,"Native scale stored VMpixels");++writes;raw->write(r,b);}
+};
+void native_scaled_image_cases()
+{
+	context ctx(2);auto ledger=std::make_shared<heap_budget>(ctx,64u<<20);ctx.set_buffer_budget(ledger);surface_color_transfer colors(ctx);sample_transfer samples(ctx);unsigned profiles=0;std::size_t bytes_checked=0;
+	for(unsigned in:{2u,4u})for(unsigned out:{2u,4u})for(unsigned layout=0;layout<7;++layout)for(unsigned count:{1u,2u,4u})for(unsigned flags=0;flags<8;++flags)
+	{
+		@autoreleasepool
+		{
+			auto memory=std::make_shared<native_memory>();const cpu_capture_dispatch capture=[access=memory->access](const auto& work){access->execute([&](auto&){work();});};auto io=std::make_shared<io_mapping_epoch>();surface_cache surfaces(ctx,memory,16u<<20,ledger,capture);guest_texture_cache textures(ctx,memory,[](unsigned address,unsigned,std::size_t){return address;},1u<<20,ledger,64,{capture,io});scaled_image_transfer transfer(ctx,surfaces,textures,memory,capture,1u<<20);
+			const bool banked=layout>=4,sm=layout==1||layout==3||layout==6,dm=layout==2||layout==3||layout==6;const unsigned pitch=layout==5?768:256;
+			const auto ssw=sm?std::optional<swizzle_region>{{{16,16,1},{2,3,0},{8,8,1}}}:std::nullopt,dsw=dm?std::optional<swizzle_region>{{{16,16,1},{2,3,0},{8,8,1}}}:std::nullopt;
+			const auto st=banked?std::optional<banked_tile_layout>{{0x10000,0x40000,pitch,1,0x1203}}:std::nullopt,dt=banked?std::optional<banked_tile_layout>{{0x80000,0x40000,pitch,3,0x1405}}:std::nullopt;
+			const unsigned sa=banked?st->address+st->offset:0x1000,da=banked?dt->address+dt->offset:0x6000;const auto factors=count==1?sample_layout{1,1}:rsx_sample_layout(count);
+			const auto sf=in==2?surface_color::rgb565:surface_color::argb8,df=out==2?surface_color::rgb565:surface_color::argb8;
+			const auto source=surfaces.acquire({sa,{8/factors.x,8/factors.y,count,sf,false},sm?0:banked?pitch:8*in+1,ssw,st});const auto destination=surfaces.acquire({da,{8/factors.x,8/factors.y,count,df,false},dm?0:banked?pitch:8*out+1,dsw,dt});
+			std::vector<std::byte> input(64*in),background(64*out,std::byte{0xa5});for(unsigned i=0;i<input.size();++i)input[i]=std::byte((i*37+i/5+73)&255);
+			const auto seed=[&](const cached_surface_ref& surface,surface_color format,const std::vector<std::byte>& data)
+			{
+				surfaces.prepare(surface,surface_initialization::background);surfaces.draw(std::array{cached_surface_use{surface,true}},[&](context& commands,auto images)
+				{
+					id<MTLTexture> target=images[0];if(count>1){auto d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:images[0].pixelFormat width:8 height:8 mipmapped:NO];d.storageMode=MTLStorageModePrivate;d.usage=MTLTextureUsageShaderRead|MTLTextureUsageRenderTarget;target=make_texture(commands,d);}texture_region r;r.size=MTLSizeMake(8,8,1);colors.upload(commands,format,make_upload(commands,data),{},target,r);if(count>1)samples.import(commands,target,images[0]);
+				});
+			};seed(source,sf,input);seed(destination,df,background);
+			auto sg=plan_guest_surface(sa,3,2,in,sm?0:banked?pitch:8*in+1,sm?std::optional<swizzle_region>{{{16,16,1},{3,5,0},{3,2,1}}}:std::nullopt);
+			auto dg=plan_guest_surface(da,4,3,out,dm?0:banked?pitch:8*out+1,dm?std::optional<swizzle_region>{{{16,16,1},{4,4,0},{4,3,1}}}:std::nullopt);
+			auto sti=st,dti=dt;if(banked){if(!sm)sti->offset+=2*pitch+in;if(!dm)dti->offset+=pitch+2*out;sg.range.address=sti->address+sti->offset;dg.range.address=dti->address+dti->offset;sg=attach_banked_tile(sg,*sti);dg=attach_banked_tile(dg,*dti);}else{if(!sm)sg.range.address+=2*sg.row_pitch+in;if(!dm)dg.range.address+=dg.row_pitch+2*out;}
+			scaled_image_plan plan{sg,dg,in==2?scaled_image_format::rgb565:scaled_image_format::argb8,out==2?scaled_image_format::rgb565:scaled_image_format::argb8,5,4,7,5,1,1,bool(flags&1),bool(flags&2),bool(flags&4),sti,dti};
+			const auto packed_source=plan_guest_surface(0,3,2,in),packed_destination=plan_guest_surface(0,4,3,out);std::vector<std::byte> cropped(6*in),old(12*out);for(unsigned y=0;y<2;++y)for(unsigned x=0;x<3;++x)std::copy_n(input.begin()+((y+2)*8+x+1)*in,in,cropped.begin()+(y*3+x)*in);for(unsigned y=0;y<3;++y)for(unsigned x=0;x<4;++x)std::copy_n(background.begin()+((y+1)*8+x+2)*out,out,old.begin()+(y*4+x)*out);auto canonical=plan;canonical.source=packed_source;canonical.destination=packed_destination;canonical.source_tile.reset();canonical.destination_tile.reset();const auto patch=reference(canonical,cropped,old);auto expected=background;for(unsigned y=0;y<3;++y)for(unsigned x=0;x<4;++x)std::copy_n(patch.begin()+(y*4+x)*out,out,expected.begin()+((y+1)*8+x+2)*out);
+			const auto vm=memory->access->copy();const auto reads=memory->reads,writes=memory->writes,notifications=memory->access->notifications;const auto before=surfaces.transaction_statistics();memory->forbid_pixels=true;transfer.execute(plan);memory->forbid_pixels=false;require(transfer.native_completed()==1&&transfer.vm_completed()==0&&!transfer.has_pending(),"Suitable scaled image bypassed native route");require(memory->reads==reads&&memory->writes==writes&&memory->access->notifications==notifications&&memory->access->copy()==vm,"Native scale read/wrote guest allocation");require(surfaces.status(source).dirty&&surfaces.status(destination).dirty&&surfaces.transaction_statistics().submitted==before.submitted+1,"Native scale lost authority oraddedsource submissions");
+			const auto raw=make_buffer(ctx,expected.size(),buffer_storage::shared);surfaces.draw(std::array{cached_surface_use{destination,false}},[&](context& commands,auto images)
+			{
+				id<MTLTexture> image=images[0];if(count>1){auto d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:images[0].pixelFormat width:8 height:8 mipmapped:NO];d.storageMode=MTLStorageModePrivate;d.usage=MTLTextureUsageShaderRead|MTLTextureUsageRenderTarget;image=make_texture(commands,d);samples.expand(commands,images[0],image);}texture_region r;r.size=MTLSizeMake(8,8,1);colors.download(commands,df,image,r,raw,{});
+			});if(std::memcmp(raw.contents,expected.data(),expected.size()))throw std::runtime_error("Native scale bytes differ profile="+std::to_string(profiles)+" input="+std::to_string(in)+" output="+std::to_string(out)+" layout="+std::to_string(layout)+" samples="+std::to_string(count)+" flags="+std::to_string(flags));bytes_checked+=expected.size();++profiles;
+		}
+	}
+	std::cout<<"Native scaled images:"<<profiles<<" RGB565/ARGB8 format/layout/sample/flip/filter profiles,"<<bytes_checked<<" exactguest-word/native-background bytes;cropped oddpitch/Morton/banked256-768 storage,1/2/4 individual samples,one native write submission,zero VMpixel reads/writes/notifications andunchanged wholeVM passed\n";
+}
 } // namespace
 int main()
 {
@@ -148,6 +233,7 @@ int main()
 	{
 		try
 		{
+			native_scaled_image_cases();
 			context ctx{1};
 			auto provider = std::make_shared<fixture_access>();
 			auto memory = std::make_shared<guarded_guest_memory>(provider);

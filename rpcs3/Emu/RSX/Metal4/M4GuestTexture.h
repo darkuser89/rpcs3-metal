@@ -223,7 +223,7 @@ class guest_texture_resolver final
 		std::vector<std::shared_ptr<prepared_surface_snapshot>> native;
 		std::shared_ptr<const surface_texture_revision> receipt;
 		texture_cache_state metadata;
-		std::uint64_t native_epoch=0;
+		std::uint64_t native_epoch=0,topology_epoch=0;
 		std::size_t source_bytes=0;
 	};
 	void prepare_texture_assembly(texture_assembly_input& input);
@@ -416,7 +416,9 @@ class guest_texture_cache final
 	// Dependencies gate new uploads/casts; ready images need no new work.
 	// Cold native snapshot copies/expansions share the batch. Deferred/spilled
 	// source materialization and prior surface transactions may still wait first.
-	// Requires one installed buffer/texture ledger, outside VM/recording epochs.
+	// Requires one installed buffer/texture ledger,outside VM exclusion. Ready
+	// reads may preserve an unrelated SurfaceCache-owned recording;GPU misses
+	// and pending write aliases close it. Foreign recordings remain forbidden.
 	[[nodiscard]] std::vector<versioned_guest_texture> resolve_versioned_batch(std::span<const fragment_texture_registers> words,
 		surface_cache& surfaces, std::span<const guest_texture_upload_dependency> dependencies = {},
 		std::chrono::milliseconds timeout = std::chrono::seconds(30));

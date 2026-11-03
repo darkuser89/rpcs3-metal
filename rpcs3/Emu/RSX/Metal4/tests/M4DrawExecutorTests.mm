@@ -652,10 +652,27 @@ void verify_versioned_upload_batch()
 		const auto address = i * 1024 + (i < 4 ? b : (b / 16) * 256 + b % 16);
 		require(static_cast<const std::byte*>(output.contents)[address] == source[i][b ^ 3], "Productive upload batch changed a vertex/fragment captured word");
 	}
+	const auto unrelated = surfaces.acquire({0xc000,{4,4,1,surface_color::argb8,false},16,{}});
+	surfaces.clear(unrelated,0xf0,0xff112233,0,255,{0,0,4,4});
 	const auto after_reads = ram->reads; const auto after_encoders = ctx.encoding_statistics();
-	for (unsigned i = 0; i < 32; ++i) (void)executor.prepare_versioned_textures(vertex,fragment);
+	const auto before_ready = surfaces.transaction_statistics();
+	{
+		auto batch = surfaces.batch_draws(); std::optional<submission> recording;
+		for (unsigned i = 0; i < 32; ++i)
+		{
+			surfaces.clear(unrelated,0xf0,0xff204080,0,255,{0,0,4,4});
+			if (!recording) recording = ctx.recording_submission();
+			const auto current = executor.prepare_versioned_textures(vertex,fragment);
+			require(current.current(vertex,fragment) && recording->same_batch(ctx.recording_submission()) && !recording->ready(),
+				"Twenty-source ready epoch closed an unrelated draw batch");
+		}
+		batch.finish();
+	}
 	require(textures.statistics().uploads == 20 && textures.statistics().upload_batches == 1 && ram->reads == after_reads &&
-		ctx.encoding_statistics().compute_encoders == after_encoders.compute_encoders, "Ready twenty-source hits reread VM or submitted another upload batch");
+		ctx.encoding_statistics().compute_encoders == after_encoders.compute_encoders &&
+		surfaces.transaction_statistics().submitted == before_ready.submitted + 1 && surfaces.transaction_statistics().draw_batches == before_ready.draw_batches + 1,
+		"Ready twenty-source hits reread VM or submitted another upload/draw batch");
+	verify(ctx,surfaces,unrelated,{32,64,128,255});
 	for (unsigned i = 0; i < 20; ++i)
 	{
 		if (i) prepared = executor.prepare_versioned_textures(vertex,fragment);
@@ -802,7 +819,7 @@ void verify_owned_texture_boundary()
 		const auto gate = [ctx.device() newSharedEvent];
 		struct gate_scope { id<MTLSharedEvent> event; ~gate_scope() { event.signaledValue = 1; } } guard{gate};
 		auto upload = executor.enqueue_versioned_textures(vertex,fragment,std::array{guest_texture_upload_dependency{gate,1}});
-		require(prefix.ready() && !upload.ready() && surfaces.transaction_statistics().draw_batches == batches + 1 && textures.statistics().entries == 0,
+		require(!upload.ready() && surfaces.transaction_statistics().draw_batches == batches + 1 && textures.statistics().entries == 0,
 			"Enabled sampler did not submit its owned prefix before a new event-gated texture job");
 		batch.finish(); gate.signaledValue = 1; (void)upload.finish();
 		verify(ctx,surfaces,target,{119,136,153,255});
@@ -811,6 +828,108 @@ void verify_owned_texture_boundary()
 	try { (void)executor.enqueue_versioned_textures(empty_vertex,empty_fragment); } catch (const std::logic_error&) { foreign = true; }
 	require(foreign && caller.same_batch(ctx.recording_submission()) && !caller.ready(), "Texture boundary submitted a foreign caller recording"); ctx.cancel();
 	std::cout << "Owned texture boundary:32 empty/disabled draw epochs preserve one native recording/submission andexact pixels;invalid preflight andforeign caller recording untouched;cold nulls andevent-gated enabled upload close only the owned prefix without losing its pixels passed\n";
+}
+void verify_ready_texture_boundary()
+{
+	unsigned profiles=0,hits=0;std::size_t checked_bytes=0;
+	for(unsigned kind=0;kind<6;++kind)for(unsigned samples:{1u,4u})
+	{
+		if(!kind&&samples!=1)continue;
+		@autoreleasepool
+		{
+			context ctx(2);auto ledger=std::make_shared<heap_budget>(ctx,16u<<20);ctx.set_buffer_budget(ledger);
+			auto ram=std::make_shared<memory>();surface_cache surfaces(ctx,ram,16u<<20,ledger);
+			guest_texture_cache textures(ctx,ram,[](unsigned offset,unsigned,std::size_t){return offset*16;},1u<<20,ledger);draw_executor executor(ctx,surfaces,textures);
+			auto state=registers();texture_registers(state,0x100);const unsigned base=0x1a00/4;
+			if(kind==2){state.registers[base+1]=(state.registers[base+1]&~(255u<<8))|(0xa1u<<8);state.registers[base+6]=(16u<<16)|4;}
+			if(kind==3){state.registers[base+1]=(state.registers[base+1]&~(255u<<8))|(0xb2u<<8);state.registers[base+6]=(8u<<16)|4;}
+			if(kind==4)state.registers[base+1]=(state.registers[base+1]&65535u)|(2u<<16)|4;
+			if(kind==5){state.registers[base+1]=(2u<<16)|(0xb1u<<8)|(3u<<4)|8|2;state.registers[0x1840/4]=(2u<<20)|16;}
+			const auto vertex=vertex_texture_snapshot::capture(state.registers,0);const auto fragment=fragment_texture_snapshot::capture(state.registers,1);const auto words=fragment.at(0);const auto plan=plan_guest_texture(words);
+			std::vector<std::byte> bytes(plan.storage_bytes);for(unsigned i=0;i<bytes.size();++i)bytes[i]=std::byte(std::array{255u,20u,40u,60u}[i%4]);if(kind==5)for(unsigned i=0;i<bytes.size();++i)bytes[i]=std::byte(std::array{0x7eu,0u,0u,42u}[i%4]);ram->write({0x1000,bytes.size()},bytes);
+			cached_surface_ref source;
+			if(kind)
+			{
+				const unsigned side=samples==1?4:2;const surface_format format=kind==5?surface_format{surface_depth::z24s8_float}:surface_format{surface_color::argb8};source=surfaces.acquire({0x1000,{side,side,samples,format,false},16,{}});surfaces.prepare(source,surface_initialization::background);
+				surfaces.draw(std::array{cached_surface_use{source,true}},[&](context& commands,auto images)
+				{
+					auto pass=[MTL4RenderPassDescriptor new];if(kind==5){pass.depthAttachment.texture=images[0];pass.depthAttachment.loadAction=MTLLoadActionClear;pass.depthAttachment.storeAction=MTLStoreActionStore;pass.depthAttachment.clearDepth=.5;pass.stencilAttachment.texture=images[0];pass.stencilAttachment.loadAction=MTLLoadActionClear;pass.stencilAttachment.storeAction=MTLStoreActionStore;pass.stencilAttachment.clearStencil=53;}
+					else{pass.colorAttachments[0].texture=images[0];pass.colorAttachments[0].loadAction=MTLLoadActionClear;pass.colorAttachments[0].storeAction=MTLStoreActionStore;pass.colorAttachments[0].clearColor=MTLClearColorMake(20./255,40./255,60./255,1);}(void)commands.render(pass);
+				});
+			}
+			const auto initial=executor.prepare_versioned_textures(vertex,fragment);const auto image=initial.textures.fragment(0).texture;require(image!=nil,"Ready boundary lacks an initial image");
+			if(kind==1||kind==2||kind==3)surfaces.spill(source);
+			const auto target=surfaces.acquire({0xa000,{4,4,1,surface_color::argb8,false},16,{}});surfaces.clear(target,0xf0,0xff112233,0,255,{0,0,4,4});
+			const auto before=surfaces.transaction_statistics();const auto uploads=textures.statistics();const auto reads=ram->reads;
+			const auto gate=[ctx.device() newSharedEvent];struct release{id<MTLSharedEvent> event;~release(){event.signaledValue=1;}} unblock{gate};
+			{
+				auto batch=surfaces.batch_draws();std::optional<submission> recording;
+				for(unsigned i=0;i<32;++i)
+				{
+					surfaces.clear(target,0xf0,0xff204080,0,255,{0,0,4,4});if(!recording)recording=ctx.recording_submission();const auto allocated=ledger->statistics().created;const auto encoders=ctx.encoding_statistics();
+					auto job=executor.enqueue_versioned_textures(vertex,fragment,std::array{guest_texture_upload_dependency{gate,1}});require(job.ready(),"Ready texture began event-gated GPU work");const auto current=job.finish();
+					require(current.textures.fragment(0).texture==image&&current.current(vertex,fragment)&&recording->same_batch(ctx.recording_submission())&&!recording->ready()&&surfaces.transaction_statistics().submitted==before.submitted,"Ready texture closed unrelated recording orlost receipt/image");
+					require(ledger->statistics().created==allocated&&ctx.encoding_statistics().compute_encoders==encoders.compute_encoders&&ctx.encoding_statistics().render_encoders==encoders.render_encoders&&ram->reads==reads,"Ready texture allocated,encoded orrecaptured VM");++hits;
+				}
+				batch.finish();
+			}
+			require(surfaces.transaction_statistics().submitted==before.submitted+1&&surfaces.transaction_statistics().draw_batches==before.draw_batches+1&&textures.statistics().upload_batches==uploads.upload_batches,"Ready textures split one 32-draw batch");if(kind==1||kind==2||kind==3)require(surfaces.status(source).spilled,"Ready texture restored spilled source");verify(ctx,surfaces,target,{32,64,128,255});
+			const auto row=kind==2?16u:kind==3?16u:kind==5?32u:16u;const auto raw=make_buffer(ctx,256*4,buffer_storage::shared);texture_region area;area.size=MTLSizeMake(image.width,image.height,1);ctx.begin();texture_to_buffer(ctx,image,area,raw,0,256);ctx.submit().wait();
+			for(unsigned y=0;y<4;++y)for(unsigned x=0;x<row;++x)
+			{
+				unsigned wanted=kind==2?std::array{255u,20u,40u,60u}[x%4]:kind==3?std::array{20u,255u,60u,40u}[x%4]:std::array{60u,40u,20u,255u}[x%4];
+				if(kind==5){const unsigned bits=std::bit_cast<unsigned>(x%8<4?.5f:53.f);wanted=(bits>>((x%4)*8))&255;}
+				require(static_cast<const unsigned char*>(raw.contents)[y*256+x]==wanted,"Ready texture changed exact native bytes");++checked_bytes;
+			}
+			textures.clear();if(kind==1)surfaces.clear_snapshots();
+			{
+				auto batch=surfaces.batch_draws();surfaces.clear(target,0xf0,0xff335577,0,255,{0,0,4,4});const auto prefix=ctx.recording_submission();const auto count=surfaces.transaction_statistics().draw_batches;
+				const auto cold=textures.resolve_versioned(words,surfaces);require(cold.image.texture!=nil&&prefix.ready()&&surfaces.transaction_statistics().draw_batches==count+1,"Synchronous VM/cast/assembly miss didnotclose its native draw prefix");batch.finish();
+			}
+			verify(ctx,surfaces,target,{51,85,119,255});++profiles;
+		}
+	}
+	std::cout<<"Ready texture boundary:"<<profiles<<" VM/native1-4sample/R8-R16cast/cube-Depth3Dassembly profiles,"<<hits<<" active ready epochs preserve32-draw single batches despite unsignalled dependencies;zero new allocation/encoding/VMreads,spilled sources stay spilled,"<<checked_bytes<<" exact native bytes andtarget pixels;11synchronous cold misses closeprefix correctly passed\n";
+}
+void verify_ready_textured_draws()
+{
+	unsigned draws=0;
+	for(bool native:{false,true})
+	{
+		context ctx(2);auto ledger=std::make_shared<heap_budget>(ctx,16u<<20);ctx.set_buffer_budget(ledger);auto ram=std::make_shared<memory>();surface_cache surfaces(ctx,ram,16u<<20,ledger);guest_texture_cache textures(ctx,ram,[](unsigned offset,unsigned,std::size_t){return offset*16;},1u<<20,ledger);draw_executor executor(ctx,surfaces,textures);
+		std::array<std::byte,64> pixels;for(unsigned i=0;i<pixels.size();++i)pixels[i]=std::byte(std::array{255u,20u,40u,60u}[i%4]);ram->write({0x1000,64},pixels);
+		if(native){const auto source=surfaces.acquire({0x1000,{4,4,1,surface_color::argb8,false},16,{}});surfaces.clear(source,0xf0,0xff14283c,0,255,{0,0,4,4});}
+		auto source=registers();texture_registers(source,0x100);const auto draw=snapshot(source,true,1);const auto initial=executor.prepare_versioned_textures(draw.vertex_textures(),draw.textures());
+		draw_request request;const std::array<std::byte,12> indices{std::byte{0},std::byte{0},std::byte{0},std::byte{0},std::byte{0},std::byte{0},std::byte{0},std::byte{1},std::byte{0},std::byte{0},std::byte{0},std::byte{2}};const auto geometry=plan_indexed_geometry(guest_topology::triangles,indices,4,0,{}, {},provoking_vertex::last);request.geometry=geometry.geometry;request.fetch.attribute_mask=1;request.fetch.attributes[0]={16u|(3u<<8)|(2u<<24)|(4u<<27),(1u<<31)|(1u<<29)};
+		test::vertex_data_processor processor;processor.descriptors=request.fetch.attributes;for(float value:{-1.f,-1.f,.5f,1.f,3.f,-1.f,.5f,1.f,-1.f,3.f,.5f,1.f})for(unsigned shift:{24u,16u,8u,0u})processor.persistent.push_back(std::byte(std::bit_cast<unsigned>(value)>>shift));
+		const auto vertices=vertex_data_snapshot::capture(processor,0,test::vertex_data_metadata{1},test::vertex_data_state{},geometry.streams,{48,0},48);apply_vertex_data_snapshot(ctx,vertices,request);apply_draw_environment(draw_environment_snapshot::capture(test::environment_state{}),4,4,request);
+		draw_targets targets;targets.colors[0]=surfaces.acquire({0xa000,{4,4,1,surface_color::argb8,false},16,{}});surfaces.clear(targets.colors[0],0xf0,0xff112233,0,255,{0,0,4,4});executor.execute(draw,targets,request,initial.textures);
+		const auto before=surfaces.transaction_statistics();const auto uploads=textures.statistics().upload_batches;const auto reads=ram->reads;std::optional<submission> recording;
+		{
+			auto batch=surfaces.batch_draws();
+			for(unsigned i=0;i<32;++i)
+			{
+				auto job=executor.enqueue_versioned_textures(draw.vertex_textures(),draw.textures());require(job.ready(),"Warm textured draw started GPU preparation");const auto ready=job.finish();require(ready.current(draw.vertex_textures(),draw.textures()),"Warm textured draw lost source receipt");executor.execute(draw,targets,request,ready.textures);if(!recording)recording=ctx.recording_submission();require(recording->same_batch(ctx.recording_submission())&&!recording->ready()&&surfaces.transaction_statistics().submitted==before.submitted,"Ready texture split productive textured draw batch");++draws;
+			}batch.finish();
+		}
+		require(surfaces.transaction_statistics().submitted==before.submitted+1&&surfaces.transaction_statistics().draw_batches==before.draw_batches+1&&textures.statistics().upload_batches==uploads&&ram->reads==reads,"Textured draw batch uploaded orrecaptured source");verify(ctx,surfaces,targets.colors[0],{20,40,60,255});
+	}
+	std::cout<<"Ready productive textures:"<<draws<<" actual translated RSX draws acrossVM/native sources,two32-draw batches/two submissions,all16RGBA targetpixels exact,no newtextureupload/VMcapture passed\n";
+}
+void verify_texture_writer_boundary()
+{
+	unsigned guards=0;
+	for(bool physical:{false,true})
+	{
+		context ctx(2);auto ledger=std::make_shared<heap_budget>(ctx,16u<<20);ctx.set_buffer_budget(ledger);auto provider=std::make_shared<guarded_gpu_memory>();auto ram=std::make_shared<guarded_guest_memory>(provider);const cpu_capture_dispatch capture=[provider](const auto& work){provider->execute([&](auto&){work();});};auto io=std::make_shared<io_mapping_epoch>();surface_cache surfaces(ctx,ram,16u<<20,ledger,capture);guest_texture_cache textures(ctx,ram,[](unsigned offset,unsigned,std::size_t){return offset;},1u<<20,ledger,64,{capture,io});draw_executor executor(ctx,surfaces,textures);
+		auto source=registers();texture_registers(source,physical?0x101000:0x1000);const auto vertex=vertex_texture_snapshot::capture(source.registers,0);const auto fragment=fragment_texture_snapshot::capture(source.registers,1);std::array<std::byte,64> pixels;for(unsigned i=0;i<pixels.size();++i)pixels[i]=std::byte(std::array{255u,20u,40u,60u}[i%4]);ram->write({0x1000,64},pixels);
+		const auto old=executor.prepare_versioned_textures(vertex,fragment);const auto target=surfaces.acquire({0x1000,{4,4,1,surface_color::argb8,false},16,{}});surfaces.clear(target,0xf0,0xff112233,0,255,{0,0,4,4});const auto before=surfaces.transaction_statistics();
+		{
+			auto batch=surfaces.batch_draws();surfaces.clear(target,0xf0,0xff446688,0,255,{0,0,4,4});const auto prefix=ctx.recording_submission();auto next=executor.enqueue_versioned_textures(vertex,fragment);const auto fresh=next.finish();require(prefix.ready()&&surfaces.transaction_statistics().draw_batches==before.draw_batches+1&&fresh.textures.fragment(0).texture!=old.textures.fragment(0).texture,"Texture reused a stale image acrosspending logical/physical writer");batch.finish();
+			const auto raw=make_buffer(ctx,2048,buffer_storage::shared);ctx.begin();texture_region area;area.size=MTLSizeMake(4,4,1);texture_to_buffer(ctx,fresh.textures.fragment(0).texture,area,raw,0,256);texture_to_buffer(ctx,old.textures.fragment(0).texture,area,raw,1024,256);ctx.submit().wait();for(unsigned y=0;y<4;++y)for(unsigned x=0;x<16;++x)require(static_cast<const unsigned char*>(raw.contents)[y*256+x]==std::array{136u,102u,68u,255u}[x%4],"Texture missed pending logical/physical writer pixels");for(unsigned y=0;y<4;++y)for(unsigned x=0;x<16;++x)require(static_cast<const unsigned char*>(raw.contents)[1024+y*256+x]==std::array{60u,40u,20u,255u}[x%4],"Pending writer changed retained old immutable pixels");
+		}++guards;
+	}
+	std::cout<<"Texture writer boundaries:"<<guards<<" actual recorded logical/physical-alias writers closeprefix before readylookup,newexactpixels replaceoldimmutableimage passed\n";
 }
 void verify_pending_draw_capture()
 {
@@ -1663,6 +1782,9 @@ int main()
 		{
 			verify_versioned_upload_batch();
 			verify_owned_texture_boundary();
+			verify_ready_texture_boundary();
+			verify_ready_textured_draws();
+			verify_texture_writer_boundary();
 			verify_pending_draw_capture();
 			verify_versioned_job_boundaries();
 			verify_versioned_job_callback_ownership();

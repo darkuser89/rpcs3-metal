@@ -33,8 +33,13 @@ class scaled_image_transfer final
 	std::shared_ptr<guest_surface_memory> m_memory;
 	cpu_capture_dispatch m_capture;
 	scaled_image_compute m_compute;
+	surface_color_transfer m_colors;
+	sample_transfer m_samples;
 	std::size_t m_limit;
 	std::unique_ptr<pending> m_pending;
+	std::uint64_t m_native_completed=0,m_vm_completed=0;
+	void encode_native(const scaled_image_plan& plan,std::span<const clear_rectangle> regions,
+		context& ctx,std::span<const id<MTLTexture>> images);
 
   public:
 	scaled_image_transfer(context& ctx, surface_cache& surfaces, guest_texture_cache& textures,
@@ -50,5 +55,7 @@ class scaled_image_transfer final
 				 const std::function<void(context&)>& dependencies = {}, std::function<void()> validate_metadata = {});
 	void synchronize(std::chrono::milliseconds timeout = std::chrono::seconds(30));
 	[[nodiscard]] bool has_pending() const noexcept { return bool(m_pending); }
+	[[nodiscard]] std::uint64_t native_completed() const noexcept { return m_native_completed; }
+	[[nodiscard]] std::uint64_t vm_completed() const noexcept { return m_vm_completed; }
 };
 } // namespace metal4

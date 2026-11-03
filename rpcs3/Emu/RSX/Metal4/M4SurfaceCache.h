@@ -41,6 +41,7 @@ enum class surface_initialization
 };
 enum class surface_mapping_event { read, unmap };
 class cached_surface;
+struct scaled_image_plan;
 using cached_surface_ref = std::shared_ptr<cached_surface>;
 struct cached_surface_status
 {
@@ -160,11 +161,15 @@ class surface_cache final
 	friend class guest_texture_cache;
 	friend class display_resolver;
 	friend class draw_executor;
+	friend class scaled_image_transfer;
 	struct impl;
 	std::unique_ptr<impl> m_impl;
 	// Preserve our own recording for CPU-only epochs; close it before helpers
 	// that need new GPU work. Foreign caller recordings remain forbidden.
 	void prepare_texture_boundary(bool gpu_work);
+	// Preserve a recording for immutable reads of unrelated storage. Pending
+	// native writes,including retained physical aliases,must complete first.
+	void prepare_texture_read_boundary(std::span<const guest_surface_layout> coverage);
 	[[nodiscard]] std::shared_ptr<prepared_surface_snapshot> prepare_texture_mapping(std::span<const guest_surface_layout> coverage,
 		const std::function<std::optional<surface_texture_region>(const cached_surface_description&)>& region,
 		const std::shared_ptr<heap_budget>& budget, bool allow_guest_fallback,
@@ -172,13 +177,25 @@ class surface_cache final
 		bool defer_unsupported = false, const cached_surface_ref& source_only = {});
 	[[nodiscard]] std::vector<cached_surface_ref> texture_sources(std::span<const guest_surface_layout> coverage);
 	[[nodiscard]] std::uint64_t texture_source_epoch() const;
+	[[nodiscard]] std::uint64_t texture_source_topology_epoch() const;
 	void transfer(const cached_surface_ref& source, clear_rectangle source_rectangle, const cached_surface_ref& destination,
 				  clear_rectangle destination_rectangle, texture_plane plane, std::array<bool, 3> flip, bool typeless);
 	void defer_transfer(const cached_surface_ref& source, clear_rectangle source_rectangle, const cached_surface_ref& destination,
 						clear_rectangle destination_rectangle, texture_plane plane, std::array<bool, 3> flip, bool typeless);
 	void draw_impl(std::span<const cached_surface_use> surfaces,
 				   const std::function<void(context&, std::span<const id<MTLTexture>>)>& encode, bool snapshot_feedback,
-				   const surface_allocation_description* transient = nullptr, surface_lease* reservation = nullptr);
+				   const surface_allocation_description* transient = nullptr, surface_lease* reservation = nullptr,
+				   std::function<void()> publication_check = {});
+	struct scaled_image_endpoints
+	{
+		std::array<cached_surface_ref,2> surfaces;
+		std::array<clear_rectangle,2> regions;
+	};
+	[[nodiscard]] std::optional<scaled_image_endpoints> prepare_scaled_image(const scaled_image_plan& plan,
+		std::chrono::milliseconds timeout);
+	void draw_scaled_image(const scaled_image_endpoints& endpoints,
+		const std::function<void(context&,std::span<const id<MTLTexture>>)>& encode,
+		std::function<void()> publication_check,std::chrono::milliseconds timeout);
 
   public:
 	surface_cache(context& ctx, std::shared_ptr<guest_surface_memory> memory, std::size_t heap_budget, std::shared_ptr<metal4::heap_budget> shared_budget = {}, cpu_capture_dispatch capture = {}, surface_metadata_limits metadata = {});

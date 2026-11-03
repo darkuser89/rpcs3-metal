@@ -128,7 +128,16 @@ std::optional<resolved_fragment_texture> guest_texture_cache::resolve_assembly(c
 	const auto epoch=surfaces.texture_source_epoch();
 	const auto current=[&](const auto& assembly)
 	{
-		bool valid=assembly.native_epoch==epoch&&std::all_of(assembly.native.begin(),assembly.native.end(),[](const auto& p){return p->source_current();});
+		bool valid=assembly.topology_epoch==surfaces.texture_source_topology_epoch()&&std::all_of(assembly.native.begin(),assembly.native.end(),[](const auto& p){return p->source_current();});
+		// An unrelated draw advances the global native epoch too. Recheck the
+		// actual source set before discarding a ready image. A newly deferred or
+		// dirty owner in a former VM hole must still invalidate that image.
+		if(valid&&assembly.native_epoch!=epoch)
+		{
+			const auto sources=surfaces.texture_sources(assembly.input.coverage);
+			valid=std::all_of(sources.begin(),sources.end(),[&](const auto& source)
+				{return std::any_of(assembly.native.begin(),assembly.native.end(),[&](const auto& p){return p->matches_source(source,false);});});
+		}
 		if(valid)m_resolver.cpu_capture([&]{valid=m_resolver.current(assembly.input,assembly.revisions)&&assembly.receipt->current();});return valid;
 	};
 	const auto metadata=[&](texture_cache_state value){value.coordinates=((words.format>>8)&0x40)?normalize_guest_pixels(input.plan.width,input.plan.height,input.plan.depth):texture_coordinates{};return value;};
@@ -315,7 +324,7 @@ std::optional<resolved_fragment_texture> guest_texture_cache::resolve_assembly(c
 	assembly->metadata.depth_float=input.plan.codec.depth&&(*input.plan.codec.depth==surface_depth::z16_float||*input.plan.codec.depth==surface_depth::z24s8_float);assembly->metadata=metadata(assembly->metadata);
 	for(const auto& slice:assembly->slices){assembly->source_bytes=checked_texture_sum(assembly->source_bytes,checked_texture_product(slice.pixel_map.size(),4));if(slice.vm)assembly->source_bytes=checked_texture_sum(assembly->source_bytes,slice.vm->storage_bytes());if(slice.cast)assembly->source_bytes=checked_texture_sum(assembly->source_bytes,slice.cast->packed.storage_bytes);if(slice.bytes)assembly->source_bytes=checked_texture_sum(assembly->source_bytes,checked_texture_sum(checked_texture_sum(slice.bytes->plan.storage_bytes,slice.bytes->raw_bytes),checked_texture_sum(slice.bytes->linear_bytes,slice.bytes->vm_bytes.size())));}
 	if(assembly->source_bytes>m_resolver.m_limit)throw std::length_error("RTT assembly source bytes exceed budget");
-	m_resolver.prepare_texture_assembly(*assembly);assembly->native_epoch=planned_epoch;
+	m_resolver.prepare_texture_assembly(*assembly);assembly->native_epoch=planned_epoch;assembly->topology_epoch=surfaces.texture_source_topology_epoch();
 	guest_texture_resolver::native_cast_input cast{};cast.plan=input.plan;cast.packed=input.plan;cast.packed.storage_bytes=assembly->source_bytes;cast.format=assembly->native.front()->format();cast.source=assembly->native.front()->texture();cast.metadata=assembly->metadata;cast.assembly=assembly;
 	if(receipt)*receipt=assembly->receipt;
 	++m_stats.assemblies_created;for(const auto& slice:assembly->slices){m_stats.assembly_native_planes+=bool(slice.native||slice.bytes);m_stats.assembly_vm_planes+=bool(slice.vm);if(slice.vm)m_stats.assembly_vm_bytes+=slice.vm->storage_bytes();if(slice.bytes)m_stats.assembly_vm_bytes+=slice.bytes->vm_bytes.size();}
@@ -325,13 +334,14 @@ std::optional<resolved_fragment_texture> guest_texture_cache::resolve_assembly(c
 		*pending_index=pending_image{pending->casts.size(),true};pending->casts.push_back(std::move(cast));return resolved_fragment_texture{nil,assembly->metadata};
 	}
 	std::vector<std::shared_ptr<prepared_surface_snapshot>> copies;for(const auto& native:assembly->native)if(native->needs_copy())copies.push_back(native);
+	surfaces.prepare_texture_boundary(true);
 	const auto work=m_resolver.enqueue_mixed({},std::span{&cast,1},{},copies);auto image=work.finish().at(0);for(const auto& native:copies)native->completed();
 	m_resolver.cpu_capture([&]{if(!assembly->receipt->current()||!m_resolver.current(assembly->input,assembly->revisions))throw texture_revision_conflict();});for(const auto& native:copies)native->publish();publish_assembly(assembly,image);return image;
 }
 void guest_texture_cache::publish_assembly(const std::shared_ptr<guest_texture_resolver::texture_assembly_input>& assembly,const resolved_fragment_texture& image)
 {
 	if(assembly->native.empty()||!assembly->native.front()->cache_native_epoch(assembly->native_epoch)||!std::all_of(assembly->native.begin(),assembly->native.end(),[](const auto& p){return p->source_current();}))return;
-	auto compact=std::make_shared<guest_texture_resolver::texture_assembly_input>();compact->input=assembly->input;compact->revisions=assembly->revisions;compact->receipt=assembly->receipt;compact->metadata=assembly->metadata;compact->native_epoch=assembly->native_epoch;
+	auto compact=std::make_shared<guest_texture_resolver::texture_assembly_input>();compact->input=assembly->input;compact->revisions=assembly->revisions;compact->receipt=assembly->receipt;compact->metadata=assembly->metadata;compact->native_epoch=assembly->native_epoch;compact->topology_epoch=assembly->topology_epoch;
 	std::size_t bytes=image.texture.heap.size;for(const auto& native:assembly->native){compact->native.push_back(native->needs_copy()?native->settled():native);bytes=checked_texture_sum(bytes,native->texture().heap.size);}if(bytes>m_resolver.m_limit)return;
 	std::vector<std::shared_ptr<const physical_surface>> physical;physical.reserve(assembly->input.coverage.size());bool complete=true;
 	const auto publication=publication_guard();const auto memory=m_resolver.m_memory;const auto translate=m_resolver.m_translate;const auto capture=m_resolver.m_capture;

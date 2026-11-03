@@ -1071,7 +1071,7 @@ versioned_guest_texture_job guest_texture_cache::prepare_versioned_batch(std::sp
 	if (m_resolver.m_context.buffer_ledger() != m_resolver.m_budget)
 		throw std::invalid_argument("Native texture cache batch requires one buffer/texture ledger");
 	if (m_batch_owner->preparing) throw std::logic_error("Native texture batch preparation cannot reenter itself");
-	surfaces.prepare_texture_boundary(!words.empty());
+	surfaces.prepare_texture_boundary(false);
 	m_batch_owner->preparing = true;
 	struct preparation_scope { bool& active; ~preparation_scope() { active = false; } } preparation_guard{m_batch_owner->preparing};
 	auto state = std::make_shared<versioned_guest_texture_job::state>();
@@ -1088,6 +1088,7 @@ versioned_guest_texture_job guest_texture_cache::prepare_versioned_batch(std::sp
 				state->result.push_back(resolve_versioned_impl(words[i], &surfaces, &state->pending, &state->indices[i]));
 			if (!state->pending.vm.empty() || !state->pending.casts.empty() || !state->pending.native.empty())
 			{
+				surfaces.prepare_texture_boundary(true);
 				std::vector<captured_guest_texture> captured;
 				captured.reserve(state->pending.vm.size());
 				for (auto& upload : state->pending.vm) captured.push_back(std::move(upload.snapshot));
@@ -1330,6 +1331,7 @@ resolved_fragment_texture guest_texture_cache::resolve_impl(const fragment_textu
 				return {nil,metadata};
 			}
 			resolved_fragment_texture cast;
+			surfaces->prepare_texture_boundary(true);
 			for (;;)
 			{
 				try { cast = m_resolver.cast_surface(input.plan, *source_format, texture, metadata, *row_offset); break; }
@@ -1351,11 +1353,6 @@ resolved_fragment_texture guest_texture_cache::resolve_impl(const fragment_textu
 		}
 	}
 	if(surfaces)if(const auto assembled=resolve_assembly(words,input,*surfaces,source_revision,pending,pending_index))return *assembled;
-	if (surfaces && input.segments.size() > 1)
-	{
-		for (const auto& part : input.segments) surfaces->prepare_cpu_read({part.address, part.size});
-		if (after_flush) after_flush();
-	}
 	m_resolver.cpu_capture([&] { m_resolver.watch(input); });
 	const auto same = [&](const guest_texture_resolver::source& candidate)
 	{
@@ -1385,6 +1382,11 @@ resolved_fragment_texture guest_texture_cache::resolve_impl(const fragment_textu
 			++m_stats.invalidations;
 			break;
 		}
+	if (surfaces && input.segments.size() > 1)
+	{
+		for (const auto& part : input.segments) surfaces->prepare_cpu_read({part.address, part.size});
+		if (after_flush) after_flush();
+	}
 	if (pending)
 	{
 		for (std::size_t i = 0; i < pending->vm.size(); ++i)
@@ -1414,6 +1416,7 @@ resolved_fragment_texture guest_texture_cache::resolve_impl(const fragment_textu
 	}
 	std::vector<std::uint64_t> revisions;
 	resolved_fragment_texture resource;
+	if (surfaces) surfaces->prepare_texture_boundary(true);
 	for (;;)
 	{
 		try

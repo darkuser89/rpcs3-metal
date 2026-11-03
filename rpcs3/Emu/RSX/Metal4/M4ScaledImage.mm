@@ -124,23 +124,53 @@ void scaled_image_compute::encode(context& ctx, const scaled_image_plan& plan, i
 }
 struct scaled_image_transfer::pending
 {
-	submission work;
+	std::optional<submission> work;
 	std::vector<captured_image_part> destination;
 	std::vector<guest_surface_range> ranges;
 	std::size_t output_bytes;
 	id<MTLBuffer> output;
 	std::function<void()> validate_metadata;
+	std::shared_ptr<bool> native_owner={};
+	cached_surface_ref native_target={};
 };
 scaled_image_transfer::scaled_image_transfer(context& ctx, surface_cache& surfaces, guest_texture_cache& textures,
 											 std::shared_ptr<guest_surface_memory> memory, cpu_capture_dispatch capture, std::size_t limit)
-	: m_context(ctx), m_surfaces(surfaces), m_textures(textures), m_memory(std::move(memory)), m_capture(std::move(capture)), m_compute(ctx, limit), m_limit(limit)
+	: m_context(ctx), m_surfaces(surfaces), m_textures(textures), m_memory(std::move(memory)), m_capture(std::move(capture)), m_compute(ctx, limit), m_colors(ctx), m_samples(ctx), m_limit(limit)
 {
 	if (!m_memory || !m_capture)
 		throw std::invalid_argument("Native scaled-image requires coherent memory and a CPU capture epoch");
 	m_surfaces.validate_texture_adapter(ctx, *m_memory);
 	m_textures.validate_surface_adapter(ctx, m_surfaces);
 }
-scaled_image_transfer::~scaled_image_transfer() = default;
+scaled_image_transfer::~scaled_image_transfer()
+{
+	if(m_pending&&m_pending->native_owner)*m_pending->native_owner=false;
+}
+void scaled_image_transfer::encode_native(const scaled_image_plan& plan,std::span<const clear_rectangle> regions,
+	context& ctx,std::span<const id<MTLTexture>> images)
+{
+	std::array<id<MTLTexture>,2> linear{images[0],images[1]};
+	for(unsigned side=0;side<2;++side)if(images[side].sampleCount>1)
+	{
+		const auto size=sample_expanded_size(images[side].width,images[side].height,static_cast<unsigned>(images[side].sampleCount));
+		auto descriptor=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:images[side].pixelFormat width:size[0] height:size[1] mipmapped:NO];
+		descriptor.storageMode=MTLStorageModePrivate;descriptor.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;
+		linear[side]=make_texture(ctx,descriptor);
+		// Import writes the whole expanded sample raster. Preserve native pixels
+		// outside a cropped destination too,without ever reading guest storage.
+		m_samples.expand(ctx,images[side],linear[side]);
+	}
+	auto canonical=plan;canonical.source=plan_guest_surface(0,plan.source.width,plan.source.height,plan.source.pixel_bytes);
+	canonical.destination=plan_guest_surface(0,plan.destination.width,plan.destination.height,plan.destination.pixel_bytes);
+	canonical.source_tile.reset();canonical.destination_tile.reset();canonical.source_segments.clear();canonical.destination_segments.clear();
+	const auto source=make_buffer(ctx,canonical.source.range.size,buffer_storage::private_gpu),target=make_buffer(ctx,canonical.destination.range.size,buffer_storage::private_gpu);
+	texture_region input,output;input.origin=MTLOriginMake(regions[0].x,regions[0].y,0);input.size=MTLSizeMake(regions[0].width,regions[0].height,1);
+	output.origin=MTLOriginMake(regions[1].x,regions[1].y,0);output.size=MTLSizeMake(regions[1].width,regions[1].height,1);
+	const auto sf=plan.source_format==scaled_image_format::rgb565?surface_color::rgb565:surface_color::argb8;
+	const auto df=plan.destination_format==scaled_image_format::rgb565?surface_color::rgb565:surface_color::argb8;
+	m_colors.download(ctx,sf,linear[0],input,source,{});m_compute.encode(ctx,canonical,source,target);m_colors.upload(ctx,df,target,{},linear[1],output);
+	if(images[1].sampleCount>1)m_samples.import(ctx,linear[1],images[1]);
+}
 void scaled_image_transfer::execute(scaled_image_plan plan, std::chrono::milliseconds timeout, const std::function<void(context&)>& dependencies,
 									std::function<void()> validate_metadata)
 {
@@ -152,6 +182,30 @@ void scaled_image_transfer::execute(scaled_image_plan plan, std::chrono::millise
 		synchronize(timeout);
 		if (validate_metadata)
 			checked_cpu_capture(m_capture, validate_metadata);
+		if(const auto endpoints=m_surfaces.prepare_scaled_image(plan,timeout))
+		{
+			auto owner=std::make_shared<bool>(true);
+			m_pending=std::make_unique<pending>(pending{std::nullopt,{},storage_ranges(plan.destination,plan.destination_segments),0,nil,validate_metadata,owner,endpoints->surfaces[1]});
+			try
+			{
+				m_surfaces.draw_scaled_image(*endpoints,[&](context& commands,auto images)
+				{
+					m_pending->work=commands.recording_submission();
+					if(dependencies)dependencies(commands);
+					encode_native(plan,endpoints->regions,commands,images);
+				},[owner,validate=std::move(validate_metadata)]
+				{
+					if(!*owner)throw std::runtime_error("Abandoned native scaled-image output cannot publish");
+					if(validate)validate();
+				},timeout);
+			}
+			catch(...)
+			{
+				if(!m_pending->work||(!m_surfaces.status(m_pending->native_target).pending&&m_pending->work->ready()))m_pending.reset();
+				throw;
+			}
+			synchronize(timeout);return;
+		}
 		const auto source_ranges = storage_ranges(plan.source, plan.source_segments);
 		auto destination_ranges = storage_ranges(plan.destination, plan.destination_segments);
 		for (const auto range : source_ranges)
@@ -193,13 +247,21 @@ void scaled_image_transfer::synchronize(std::chrono::milliseconds timeout)
 			throw std::invalid_argument("Native scaled-image wait timeout must be nonnegative");
 		if (!m_pending)
 			return;
+		if(m_pending->native_owner)
+		{
+			try{m_surfaces.synchronize(timeout);m_pending->work->wait(timeout);}
+			catch(...){if(!m_surfaces.status(m_pending->native_target).pending&&m_pending->work->ready())m_pending.reset();throw;}
+			auto completed=std::move(m_pending);
+			for(const auto range:completed->ranges)m_textures.invalidate(range);
+			++m_native_completed;return;
+		}
 		try
 		{
-			m_pending->work.wait(timeout);
+			m_pending->work->wait(timeout);
 		}
 		catch (...)
 		{
-			if (m_pending->work.ready())
+			if (m_pending->work->ready())
 				m_pending.reset();
 			throw;
 		}
@@ -217,6 +279,7 @@ void scaled_image_transfer::synchronize(std::chrono::milliseconds timeout)
 		}, m_capture);
 		for (const auto range : completed->ranges)
 			m_textures.invalidate(range);
+		++m_vm_completed;
 	}
 }
 } // namespace metal4
