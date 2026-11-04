@@ -105,5 +105,15 @@ kernel void rpcs3_scaled_image(device const uchar* source [[buffer(0)]],device u
         destination[to]=uchar(word>>8);destination[to+1]=uchar(word);
     }
 }
+struct gather_copy {ulong target,source,ordinal,size;};
+kernel void rpcs3_scaled_gather(device const uchar* source [[buffer(0)]],device uchar* destination [[buffer(1)]],
+    device const gather_copy* copies [[buffer(2)]],constant ulong2& shape [[buffer(3)]],uint tid [[thread_position_in_grid]])
+{
+    const ulong at=tid;if(at>=shape.x)return;
+    ulong lo=0,hi=shape.y;
+    while(lo+1<hi){const ulong middle=(lo+hi)/2;if(copies[middle].ordinal<=at)lo=middle;else hi=middle;}
+    const auto copy=copies[lo];const ulong delta=at-copy.ordinal;
+    destination[copy.target+delta]=source[copy.source+delta];
+}
 )metal";
 } // namespace metal4

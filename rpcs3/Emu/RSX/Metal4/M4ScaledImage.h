@@ -11,6 +11,7 @@ class scaled_image_compute final
 {
 	id<MTLDevice> m_device;
 	id<MTLComputePipelineState> m_pipeline;
+	id<MTLComputePipelineState> m_gather;
 	std::size_t m_limit;
 
   public:
@@ -18,6 +19,8 @@ class scaled_image_compute final
 	// Encode only:source/destination are independent owned storage snapshots.
 	// Writes active destination pixels;all padding/Morton exterior survives.
 	void encode(context& ctx, const scaled_image_plan& plan, id<MTLBuffer> source, id<MTLBuffer> destination) const;
+	void gather(context& ctx,id<MTLBuffer> source,id<MTLBuffer> destination,
+		std::span<const display_storage_copy> copies,std::size_t input) const;
 };
 // Render-owner transfer with recoverable pending GPU work. Suitable native
 // RGB565/ARGB8 authorities stay GPU-resident:private guest-word snapshots feed
@@ -31,7 +34,15 @@ class scaled_image_compute final
 // raster;the result stays dirty on GPU. Deferred endpoints materialize their
 // captured native sections before use;full rectangular unions need no guest
 // background. Partial copies preserve native/spilled or coherent RAM background.
-// Competing dirty aliases still require separate assembly. Unsupported combinations
+// Inputs from disjoint native color/depth byte authorities are packed on
+// GPU,including guest-format reinterpretation. Sources remain validated draw
+// readers;odd pitches,Morton andbanked storage retain their active byte order.
+// Only missing input bytes use coherent RAM snapshots;their owned revision
+// receipts remain mandatory through final publication and pending timeouts.
+// Depth/stencil packing uses the established guest-word codecs,not color
+// normalization. MSAA depth retains the finite [0,1] sample-transfer contract.
+// Overlapping dirty owners and multi-owner outputs still require
+// broader assembly. Unsupported combinations
 // retain the coherent VM snapshot/CAS route. Banked VM coverage is conservative.
 // No retained guest pointers,no CPU image processing or legacy backend.
 class scaled_image_transfer final
@@ -44,12 +55,17 @@ class scaled_image_transfer final
 	cpu_capture_dispatch m_capture;
 	scaled_image_compute m_compute;
 	surface_color_transfer m_colors;
+	std::unique_ptr<surface_depth_transfer> m_depth;
 	sample_transfer m_samples;
+	std::unique_ptr<surface_swizzle_transfer> m_swizzle;
+	std::unique_ptr<surface_banked_transfer> m_banked;
 	std::size_t m_limit;
 	std::unique_ptr<pending> m_pending;
 	std::uint64_t m_native_completed=0,m_vm_completed=0;
 	void encode_native(const scaled_image_plan& plan,std::span<const clear_rectangle> regions,
-		context& ctx,std::span<const id<MTLTexture>> images);
+		context& ctx,std::span<const id<MTLTexture>> images,
+		std::span<const cached_surface_description> inputs={},std::span<const display_storage_copy> copies={},
+		std::span<const std::byte> input_bytes={},std::span<const display_storage_copy> input_patches={});
 
   public:
 	scaled_image_transfer(context& ctx, surface_cache& surfaces, guest_texture_cache& textures,

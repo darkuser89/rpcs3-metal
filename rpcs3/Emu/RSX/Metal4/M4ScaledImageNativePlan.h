@@ -29,6 +29,27 @@ namespace metal4
 	const auto physical=banked_display_storage_offset(*source.tile,logical);
 	return physical<source.tile->size?std::optional<std::size_t>{physical}:std::nullopt;
 }
+// Canonical packed pixel order -> actual guest byte spans. These are address
+// receipts,never pixel data. Inactive bank cells cannot supply an input word.
+[[nodiscard]] inline std::optional<std::vector<guest_storage_segment>> scaled_image_dense_segments(const display_storage_source& source)
+{
+	std::vector<guest_storage_segment> result;const auto& g=source.geometry;
+	for(std::size_t y=0;y<g.height;++y)for(std::size_t byte=0;byte<g.width*g.pixel_bytes;)
+	{
+		const auto at=scaled_image_storage_offset(source,byte/g.pixel_bytes,y,byte%g.pixel_bytes);if(!at)return {};
+		const auto* part=texture_assembly_segment(source.segments,*at);if(!part)return {};
+		auto count=g.width*g.pixel_bytes-byte;
+		if(g.morton)count=std::min(count,g.pixel_bytes-byte%g.pixel_bytes);
+		if(source.tile)count=std::min(count,32-(*at&31));
+		count=std::min(count,part->size-(*at-part->offset));
+		const auto address=static_cast<std::uint32_t>(std::uint64_t(part->address)+*at-part->offset);
+		const auto offset=y*g.width*g.pixel_bytes+byte;
+		if(!result.empty()&&std::uint64_t(result.back().address)+result.back().size==address&&result.back().offset+result.back().size==offset)result.back().size+=count;
+		else {if(result.size()==(1u<<20))throw std::length_error("Scaled-image packed source exceeds span budget");result.push_back({address,offset,count});}
+		byte+=count;
+	}
+	return result;
+}
 // Prove the complete requested raster against one native rectangle. The
 // first matching address is only a candidate:every byte is checked through
 // one stable physical-identity callback. No guest or native pixels are read.

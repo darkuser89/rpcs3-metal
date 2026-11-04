@@ -1974,6 +1974,7 @@ std::optional<surface_cache::scaled_image_endpoints> surface_cache::prepare_scal
 	prepare_texture_boundary(true);m_impl->synchronize(timeout);
 	scaled_image_endpoints result;
 	std::array<std::optional<cached_surface_description>,2> create;
+	std::vector<std::pair<guest_surface_range,std::size_t>> input_holes;
 	const auto native_limit=max_2d_texture_dimension(m_impl->ctx.device());
 	bool complete=true;
 	m_impl->cpu([&]
@@ -1987,10 +1988,13 @@ std::optional<surface_cache::scaled_image_endpoints> surface_cache::prepare_scal
 			std::vector<guest_surface_layout> coverage;for(const auto& part:projected)coverage.push_back(part.coverage);
 			const auto candidates=m_impl->cpu_aliases(coverage,true);
 			const auto dirty=std::count_if(candidates.begin(),candidates.end(),[](const auto& s){return s->dirty||!s->deferred.empty();});
-			if(dirty>1){complete=false;break;}
+			if(dirty>1&&side){complete=false;break;}
+			if(side&&!result.inputs.empty()&&std::any_of(result.inputs.begin(),result.inputs.end(),[&](const auto& input)
+				{return std::find(candidates.begin(),candidates.end(),input)!=candidates.end();})){complete=false;break;}
 			const auto expected=(side?plan.destination_format:plan.source_format)==scaled_image_format::rgb565?surface_color::rgb565:surface_color::argb8;
 			for(const auto& surface:candidates)
 			{
+				if(dirty>1)break;
 				if(dirty&&!surface->dirty&&surface->deferred.empty())continue;
 				m_impl->check_mapping(surface);
 				const bool deferred=!surface->deferred.empty();
@@ -2030,9 +2034,89 @@ std::optional<surface_cache::scaled_image_endpoints> surface_cache::prepare_scal
 				if(result.surfaces[side]&&result.surfaces[side]->native_write_epoch>=surface->native_write_epoch)continue;
 				result.surfaces[side]=surface;result.regions[side]=*region;
 			}
+			if(!side&&!result.surfaces[0]&&!candidates.empty())
+			{
+				// Resolve byte authority before preparing any source. Preparing
+				// overlapping dirty owners would otherwise flush one to VM.
+				std::vector<display_storage_source> layouts;
+				std::vector<cached_surface_ref> sources;
+				bool supported=true;
+				for(const auto& surface:candidates)
+				{
+					m_impl->check_mapping(surface);
+					if(surface->faulted)
+					{if(surface->dirty||!surface->deferred.empty())supported=false;continue;}
+					if(m_impl->current(surface)!=(surface->deferred.empty()?surface->revision:surface->deferred_revision))
+					{if(surface->dirty||!surface->deferred.empty())throw surface_conflict_error(surface->storage.parts.front().coverage.range);continue;}
+					if(!surface->initialized&&surface->deferred.empty())continue;
+					const auto& d=surface->description;const auto& a=d.allocation;
+					const auto size=a.samples==1?std::array{a.width,a.height}:sample_expanded_size(a.width,a.height,a.samples);
+					auto storage=plan_guest_surface(d.tile?d.tile->address:d.address,size[0],size[1],surface_guest_bytes(a.format),d.row_pitch,d.morton);
+					if(d.tile)storage.range={d.tile->address,d.tile->size};
+					if(storage.range.size>m_impl->snapshot_limit){if(surface->dirty||!surface->deferred.empty())supported=false;continue;}
+					auto layout=scaled_image_storage(storage,d.tile,d.segments);layout.dirty=surface->dirty||!surface->deferred.empty();layout.epoch=surface->native_write_epoch;
+					layouts.push_back(std::move(layout));sources.push_back(surface);
+				}
+				if(supported&&!sources.empty()&&sources.size()<=64)if(const auto spans=scaled_image_dense_segments(requested))
+				{
+					bool identities=true;for(const auto& span:*spans)if(!m_impl->memory->storage_identity({span.address,span.size})){identities=false;break;}
+					if(!identities){complete=false;break;}
+					auto assembly=plan_display_storage_assembly(*m_impl->memory,plan_guest_surface(0,image.width,image.height,image.pixel_bytes),layouts,*spans);
+					if(!assembly.copies.empty())
+					{
+						std::vector<std::size_t> selected;
+						for(const auto& copy:assembly.copies)if(std::find(selected.begin(),selected.end(),copy.input)==selected.end())selected.push_back(copy.input);
+						bool isolated=selected.size()<=64;
+						for(const auto i:selected)
+						{
+							for(const auto& other:m_impl->plan_aliases(sources[i]))if(other->dirty||!other->deferred.empty())isolated=false;
+							for(const auto j:selected)if(i!=j&&memory_storage_overlap(*m_impl->memory,sources[i]->storage,sources[j]->storage))isolated=false;
+							// A retained old output may overlap physical storage after
+							// losing its original VA. Do not mistake it for clean RAM.
+							if(sources[i]->physical)for(const auto& other:m_impl->surfaces)
+							{
+								if(other==sources[i]||(!other->dirty&&other->deferred.empty()))continue;
+								if(!other->physical){isolated=false;break;}
+								for(const auto& a:*sources[i]->physical)for(const auto& b:*other->physical)if(a->overlaps(*b))isolated=false;
+							}
+							if(!sources[i]->physical)for(const auto& other:m_impl->surfaces)
+							{
+								if(other==sources[i]||!other->physical||(!other->dirty&&other->deferred.empty()))continue;
+								for(const auto& ticket:*other->physical)for(const auto& part:sources[i]->storage.parts)
+								{
+									guest_surface_byte_cursor cursor(part.coverage);while(const auto run=cursor.next())
+									{const auto match=m_impl->memory->physical_surface_overlaps_current(*ticket,*run);if(!match||*match)isolated=false;}
+								}
+							}
+						}
+						if(isolated)
+						{
+							// The complement is expressed in packed pixel order.
+							// Rebase only those missing bytes to actual EAs;never
+							// capture source pixels supplied by a native authority.
+							for(const auto& hole:assembly.vm)for(std::size_t at=hole.address,end=at+hole.size;at<end;)
+							{
+								const auto* part=texture_assembly_segment(*spans,at);if(!part)throw std::logic_error("Scaled-image RAM hole lacks storage metadata");
+								const auto count=std::min(end-at,part->size-(at-part->offset));
+								const guest_surface_range range{static_cast<std::uint32_t>(std::uint64_t(part->address)+at-part->offset),count};
+								// A retained dirty owner may have lost its original VA.
+								// Its physical bytes must never become an apparent RAM hole.
+								for(const auto& other:m_impl->surfaces)if(other->physical&&(other->dirty||!other->deferred.empty())&&
+									std::find(sources.begin(),sources.end(),other)==sources.end())for(const auto& ticket:*other->physical)
+								{const auto match=m_impl->memory->physical_surface_overlaps_current(*ticket,range);if(!match||*match)throw surface_conflict_error(range);}
+								if(input_holes.size()==(1u<<20))throw std::length_error("Scaled-image RAM hole metadata exceeds budget");
+								input_holes.push_back({range,at});at+=count;
+							}
+							for(auto& copy:assembly.copies)copy.input=std::find(selected.begin(),selected.end(),copy.input)-selected.begin();
+							for(const auto i:selected){result.inputs.push_back(sources[i]);result.descriptions.push_back(sources[i]->description);}
+							result.assembly=std::move(assembly);result.regions[0]={0,0,image.width,image.height};
+						}
+					}
+				}
+			}
 			const auto& tile=side?plan.destination_tile:plan.source_tile;
 			const auto& segments=side?plan.destination_segments:plan.source_segments;
-			if(!result.surfaces[side]&&!dirty&&image.width<=native_limit&&image.height<=native_limit&&
+			if(!result.surfaces[side]&&(side||result.inputs.empty())&&!dirty&&image.width<=native_limit&&image.height<=native_limit&&
 				((!tile&&segments.empty())||image.range.size<=m_impl->snapshot_limit))
 			{
 				// Missing input captures only its requested raster through the
@@ -2053,13 +2137,29 @@ std::optional<surface_cache::scaled_image_endpoints> surface_cache::prepare_scal
 				create[side]=cached_surface_description{address,{image.width,image.height,1,expected,false},
 					image.morton?0:image.row_pitch,image.morton,tile,segments};
 			}
-			complete=bool(result.surfaces[side])||create[side].has_value();
+			complete=bool(result.surfaces[side])||create[side].has_value()||(!side&&!result.inputs.empty());
+		}
+		if(complete&&!input_holes.empty())
+		{
+			std::vector<guest_surface_layout> watched;std::vector<std::uint64_t> revisions;
+			for(const auto& [range,target]:input_holes)
+			{
+				if(range.size>m_impl->snapshot_limit-result.input_bytes.size())throw std::length_error("Scaled-image RAM holes exceed snapshot budget");
+				auto coverage=m_impl->memory->watch_surface(guest_byte_coverage(range));
+				const auto captured=m_impl->memory->read_surface(coverage);
+				if(captured.bytes.size()!=range.size)throw std::runtime_error("Scaled-image RAM hole snapshot is incomplete");
+				result.input_patches.push_back({target,result.input_bytes.size(),range.size,0});
+				result.input_bytes.insert(result.input_bytes.end(),captured.bytes.begin(),captured.bytes.end());
+				watched.push_back(std::move(coverage));revisions.push_back(captured.revision);
+			}
+			result.input_revision=std::make_shared<surface_texture_revision>(m_impl->memory,std::move(watched),std::move(revisions),nullptr);
 		}
 	});
 	if(!complete)return {};
 	// Metadata admission must not retire either selected endpoint while its
 	// missing peer is registered. Handles remain cold until draw preparation.
 	surface_list_guard pins(m_impl->pinned,result.surfaces);
+	surface_list_guard input_pins(m_impl->pinned,result.inputs);
 	for(unsigned side=0;side<2;++side)if(create[side])
 	{
 		result.surfaces[side]=acquire(*create[side]);
@@ -2081,17 +2181,29 @@ void surface_cache::draw_scaled_image(const scaled_image_endpoints& endpoints,
 	struct restore_timeout{impl& state;std::chrono::milliseconds value;~restore_timeout(){state.timeout=value;}} restore{*m_impl,previous};
 	m_impl->timeout=timeout;
 	surface_list_guard pins(m_impl->pinned,endpoints.surfaces);
-	const std::array uses{cached_surface_use{endpoints.surfaces[0],false},cached_surface_use{endpoints.surfaces[1],true}};
-	draw_impl(uses,encode,true,nullptr,nullptr,std::move(publication_check),endpoints.overwrite_destination?endpoints.surfaces[1]:cached_surface_ref{});
+	std::vector<cached_surface_use> uses;
+	if(endpoints.inputs.empty())uses.push_back({endpoints.surfaces[0],false});
+	else for(const auto& input:endpoints.inputs)uses.push_back({input,false});
+	uses.push_back({endpoints.surfaces[1],true});
+	if(endpoints.input_revision)publication_check=[check=std::move(publication_check),receipt=endpoints.input_revision]
+	{
+		if(check)check();
+		if(!receipt->current())throw std::runtime_error("Scaled-image RAM input changed before native output publication");
+	};
+	draw_impl(uses,encode,true,nullptr,nullptr,std::move(publication_check),endpoints.overwrite_destination?endpoints.surfaces[1]:cached_surface_ref{},true);
 }
 void surface_cache::draw_impl(std::span<const cached_surface_use> uses, const std::function<void(context&, std::span<const id<MTLTexture>>)>& encode, bool feedback,
-							  const surface_allocation_description* transient, surface_lease* reservation,std::function<void()> publication_check,const cached_surface_ref& overwrite)
+							  const surface_allocation_description* transient, surface_lease* reservation,std::function<void()> publication_check,const cached_surface_ref& overwrite,bool scaled_inputs)
 {
 	if(publication_check)m_impl->cpu(publication_check);
-	// Sixteen fragment inputs, four vertex inputs, four color targets and depth.
-	if (uses.empty() || uses.size() > 25 || !encode || std::count_if(uses.begin(), uses.end(), [](const auto& use)
+	// Ordinary RSX draws retain their sixteen fragment/four vertex/five target
+	// bound. A scaled transfer instead has up to64 metadata-proved byte readers
+	// and exactly one final writer;they are packed sequentially on the GPU.
+	if (uses.empty() || uses.size() > (scaled_inputs?65u:25u) || !encode || std::count_if(uses.begin(), uses.end(), [](const auto& use)
 																	 { return use.write; }) > 5)
-		throw std::invalid_argument("Native cache draw needs at most 25 uses/five write targets and an encoder");
+		throw std::invalid_argument("Native cache draw exceeds its use/write limits or lacks an encoder");
+	if(scaled_inputs&&(uses.size()<2||!uses.back().write||std::any_of(uses.begin(),uses.end()-1,[](const auto& use){return use.write;})))
+		throw std::invalid_argument("Scaled input batches require read-only sources and one final output");
 	for (std::size_t i = 0; i < uses.size(); ++i)
 	{
 		m_impl->check(uses[i].surface);
@@ -2099,8 +2211,9 @@ void surface_cache::draw_impl(std::span<const cached_surface_use> uses, const st
 			if ((feedback ? uses[i].write && uses[j].write : uses[i].write || uses[j].write) && memory_storage_overlap(*m_impl->memory, uses[i].surface->storage, uses[j].surface->storage))
 				throw std::invalid_argument("Native cache draw write targets overlap guest storage");
 	}
-	if(overwrite&&(uses.size()!=2||uses[0].write||!uses[1].write||uses[1].surface!=overwrite||overwrite->dirty||!overwrite->deferred.empty()))
-		throw std::logic_error("Native full-overwrite draw requires one cold output and one input");
+	if(overwrite&&(uses.size()<2||!uses.back().write||uses.back().surface!=overwrite||overwrite->dirty||!overwrite->deferred.empty()||
+		std::any_of(uses.begin(),uses.end()-1,[](const auto& use){return use.write;})))
+		throw std::logic_error("Native full-overwrite draw requires one cold output and read-only inputs");
 	std::vector<std::uint64_t> overwrite_revision;
 	if (std::any_of(uses.begin(), uses.end(), [](const auto& use) { return !use.write; }))
 		m_impl->synchronize(m_impl->timeout);

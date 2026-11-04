@@ -3,6 +3,7 @@
 #include "M4ScaledImageMapping.h"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -167,6 +168,14 @@ class native_access final : public exclusive_guest_memory,public exclusive_guest
 	std::vector<std::byte> bytes=std::vector<std::byte>(1u<<20,std::byte{0xcd});
   public:
 	unsigned notifications=0;
+	bool typed_identities=false;
+	std::optional<std::vector<storage_identity_span>> storage_identity(guest_surface_range range) override
+	{
+		if(!typed_identities)return {};
+		const auto offset=range.address%bytes.size();
+		if(range.address>=2*bytes.size()||range.size>bytes.size()-offset)throw std::out_of_range("Native scale identity range");
+		return std::vector<storage_identity_span>{{shared_from_this(),offset,range}};
+	}
 	void execute(const std::function<void(view&)>& work) override
 	{
 		if(auto* active=guest_memory_epoch::current(*this)){work(*active);return;}
@@ -191,7 +200,7 @@ class native_memory final : public guest_surface_memory
   public:
 	std::shared_ptr<native_access> access=std::make_shared<native_access>();
 	std::shared_ptr<guarded_guest_memory> raw=std::make_shared<guarded_guest_memory>(access);
-	bool forbid_pixels=false;unsigned reads=0,writes=0;
+	bool forbid_pixels=false;unsigned reads=0,writes=0;std::size_t read_bytes=0;
     std::vector<guest_surface_range> allowed_input_reads;
     void check_read(guest_surface_range range)const
     {
@@ -200,7 +209,7 @@ class native_memory final : public guest_surface_memory
         require(std::any_of(allowed_input_reads.begin(),allowed_input_reads.end(),[&](const auto& p){const auto begin=p.address%mirror;return address>=begin&&address-begin<=p.size&&range.size<=p.size-(address-begin);}),"Native scale captured VM outside its RAM input");
     }
 	guest_surface_layout watch_surface(const guest_surface_layout& coverage) override {return raw->watch_surface(coverage);}
-	guest_surface_snapshot read_surface(const guest_surface_layout& coverage) override {check_read(coverage.range);++reads;return raw->read_surface(coverage);}
+	guest_surface_snapshot read_surface(const guest_surface_layout& coverage) override {check_read(coverage.range);++reads;read_bytes+=coverage.range.size;return raw->read_surface(coverage);}
 	std::uint64_t surface_revision(const guest_surface_layout& coverage) override {return raw->surface_revision(coverage);}
 	std::optional<std::vector<storage_identity_span>> storage_identity(guest_surface_range r) override {return raw->storage_identity(r);}
 	std::shared_ptr<void> retain_backing(std::span<const guest_surface_range> ranges) override {return raw->retain_backing(ranges);}
@@ -211,7 +220,7 @@ class native_memory final : public guest_surface_memory
 	std::optional<bool> physical_surface_overlaps_current(const physical_surface& p,guest_surface_range r) override {return raw->physical_surface_overlaps_current(p,r);}
 	std::optional<bool> physical_identity_overlaps_current(const physical_identity& p,const guest_surface_layout& r) override {return raw->physical_identity_overlaps_current(p,r);}
 	std::optional<bool> physical_surface_virtual_current(const physical_surface& p,std::uint64_t v) override {return raw->physical_surface_virtual_current(p,v);}
-	std::optional<guest_surface_snapshot> read_physical_surface(const physical_surface& p) override {check_read(p.coverage().range);++reads;return raw->read_physical_surface(p);}
+	std::optional<guest_surface_snapshot> read_physical_surface(const physical_surface& p) override {check_read(p.coverage().range);++reads;read_bytes+=p.coverage().range.size;return raw->read_physical_surface(p);}
 	std::optional<physical_surface_publication> compare_write_physical(std::span<const physical_surface_write> w,std::span<const std::uint64_t> v) override {require(!forbid_pixels,"Native scale wrote physical VMpixels");++writes;return raw->compare_write_physical(w,v);}
 	std::optional<std::uint64_t> compare_write(const guest_surface_layout& c,std::uint64_t v,std::span<const std::byte> b) override {require(!forbid_pixels,"Native scale wrote VMpixels");++writes;return raw->compare_write(c,v,b);}
 	std::optional<std::uint64_t> compare_write_many(std::span<const guest_surface_write> w) override {require(!forbid_pixels,"Native scale scattered VMpixels");++writes;return raw->compare_write_many(w);}
@@ -650,6 +659,407 @@ void ram_source_prefix_lifetime(bool deferred=false)
     std::cout<<(deferred?"Deferred source materialization prefix:":"RAM source upload prefix:")<<cases<<" real queued input timeouts with existing/cold targets;one captured input epoch,explicit finished-prefix retry,transfer-owner abandonment andblocked cache/context shutdown never publish early output;provider retirement/zero ledger charges passed\n";
 }
 
+void depth_scaled_image_cases(bool stencil_family)
+{
+    context ctx(2);auto ledger=std::make_shared<heap_budget>(ctx,64u<<20);ctx.set_buffer_budget(ledger);surface_color_transfer colors(ctx);sample_transfer samples(ctx);
+    unsigned profiles=0;std::size_t exact_bytes=0,raw_bytes=0,hole_bytes=0;
+    for(unsigned type=1;type<=4;++type)for(unsigned out:{2u,4u})for(unsigned layout=0;layout<4;++layout)for(unsigned kind=0;kind<3;++kind)
+    for(unsigned count:{1u,2u,4u})for(bool clean:{false,true})for(bool cold:{false,true})for(unsigned flags=0;flags<8;++flags)
+    {
+        if(bool(type%2==0)!=stencil_family||(layout==3&&kind))continue;
+        @autoreleasepool
+        {
+            try
+            {
+            const auto format=static_cast<surface_depth>(type);const auto metadata=describe_surface_depth(format);const auto in=metadata.guest_bytes;
+            auto memory=std::make_shared<native_memory>();memory->access->typed_identities=true;const cpu_capture_dispatch capture=[access=memory->access](const auto& work){access->execute([&](auto&){work();});};auto io=std::make_shared<io_mapping_epoch>();
+            surface_cache surfaces(ctx,memory,16u<<20,ledger,capture);guest_texture_cache textures(ctx,memory,[](unsigned a,unsigned,std::size_t){return a;},1u<<20,ledger,64,{capture,io});scaled_image_transfer transfer(ctx,surfaces,textures,memory,capture,1u<<20);
+            const auto factors=count==1?sample_layout{1,1}:rsx_sample_layout(count);
+            const auto morton=layout==1?std::optional<swizzle_region>{{{8,8,1},{1,2,0},{4,4,1}}}:std::nullopt;
+            const auto tile=layout>=2?std::optional<banked_tile_layout>{{0x10000,0x40000,256,1,0x1200+in}}:std::nullopt;
+            auto source=plan_guest_surface(tile?tile->address+tile->offset:0x1000,4,4,in,morton?0:tile?256:4*in+1,morton);if(tile)source=attach_banked_tile(source,*tile);
+            std::vector<std::byte> input(16*in);std::array<std::uint32_t,16> native_depth{};std::array<unsigned char,16> native_stencil{};
+            for(unsigned i=0;i<16;++i)
+            {
+                std::uint32_t guest=0,bits=0;const auto s=static_cast<unsigned char>(37+i*53);native_stencil[i]=s;
+                if(type==1){bits=i==0?0:i==15?65535:(i*7919+73)&65535;guest=bits;}
+                else if(type==2){const float value=i==0?0.f:i==15?1.f:.0625f+float(i)/32;bits=std::bit_cast<std::uint32_t>(value);guest=(static_cast<std::uint32_t>(value*16777215.f)<<8)|s;}
+                else if(type==3){const auto word=i==15?0x7000u:(i*0x5b1u+0x123u)&0x6fffu;const float value=std::ldexp(1.f+float(word%4096)/4096,int(word/4096)-7);bits=std::bit_cast<std::uint32_t>(value);guest=word;}
+                else {bits=i==0?0:i==15?std::bit_cast<std::uint32_t>(1.f):0x3e800000u+i*0x19017u;guest=((bits>>7)<<8)|s;}
+                native_depth[i]=bits;for(unsigned lane=0;lane<in;++lane)input[i*in+lane]=std::byte(guest>>(8*(in-1-lane)));
+            }
+            if(kind==2)for(unsigned y=0;y<4;++y)for(unsigned byte=2*in;byte<4*in;++byte)input[y*4*in+byte]=std::byte((y*43+byte*67+19)&255);
+            struct depth_source {cached_surface_ref ref;unsigned width;std::vector<std::byte> expected;};std::vector<depth_source> sources;std::vector<cached_surface_ref> pieces;
+            const auto expanded=[&](context& commands,id<MTLTexture> image,unsigned width)
+            {if(count==1)return image;auto d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:image.pixelFormat width:width height:4 mipmapped:NO];d.storageMode=MTLStorageModePrivate;d.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead|MTLTextureUsagePixelFormatView;return make_texture(commands,d);};
+            for(unsigned side=0;side<(kind?2u:1u);++side)
+            {
+                const unsigned width=kind?2:4;const bool color=kind==2&&side;const auto color_format=in==2?surface_color::rgb565:surface_color::argb8;
+                cached_surface_description description;
+                if(layout==3)description={tile->address+tile->offset,{4/factors.x,4/factors.y,count,format,false},256,{},tile};
+                else
+                {
+                    const auto swizzle=layout==1?std::optional<swizzle_region>{{{width,4,1},{},{width,4,1}}}:std::nullopt;
+                    const auto geometry=plan_guest_surface(0,width,4,in,swizzle?0:width*in+1,swizzle);std::vector<unsigned> addresses(geometry.range.size);
+                    for(unsigned i=0;i<addresses.size();++i)addresses[i]=0xd0000+side*0x1000+i;
+                    for(unsigned y=0;y<4;++y)for(unsigned byte=0;byte<width*in;++byte)
+                    {
+                        const auto x=side*2+byte/in,lane=byte%in,index=(y*4+x)*in+lane;auto at=offset(source,x,y)+lane;if(tile)at=banked_display_storage_offset(*tile,tile->offset+at);
+                        const auto actual=(tile?tile->address:source.range.address)+static_cast<unsigned>(at);
+                        if(kind==1&&(y+byte+side)%3==0){input[index]^=std::byte{0x5b};memory->raw->write({actual,1},std::span{&input[index],1});memory->allowed_input_reads.push_back({actual,1});}
+                        else addresses[offset(geometry,byte/in,y)+lane]=actual+(side?0x100000:0);
+                    }
+                    std::vector<guest_storage_segment> spans;for(unsigned i=0;i<addresses.size();++i){if(!spans.empty()&&std::uint64_t(spans.back().address)+spans.back().size==addresses[i])++spans.back().size;else spans.push_back({addresses[i],i,1});}
+                    description={spans.front().address,{width/factors.x,4/factors.y,count,color?surface_format{color_format}:surface_format{format},false},swizzle?0:geometry.row_pitch,swizzle,{},spans};
+                }
+                const auto piece=surfaces.acquire(description);surfaces.prepare(piece,surface_initialization::background);
+                std::vector<std::byte> depth_plane(256*4,std::byte{0xa5}),stencil_plane(256*4,std::byte{0xa5}),expected;
+                for(unsigned y=0;y<4;++y)for(unsigned x=0;x<width;++x){const auto i=y*4+side*2+x;for(unsigned lane=0;lane<metadata.depth_bytes;++lane){const auto b=std::byte(native_depth[i]>>(lane*8));depth_plane[y*256+x*metadata.depth_bytes+lane]=b;expected.push_back(b);}stencil_plane[y*256+x]=std::byte(native_stencil[i]);}
+                if(metadata.stencil)for(unsigned y=0;y<4;++y)for(unsigned x=0;x<width;++x)expected.push_back(std::byte(native_stencil[y*4+side*2+x]));
+                surfaces.draw(std::array{cached_surface_use{piece,true}},[&](context& commands,auto images)
+                {
+                    const auto image=expanded(commands,images[0],width);texture_region all;all.size=MTLSizeMake(width,4,1);
+                    if(color){std::vector<std::byte> words(width*4*in);for(unsigned y=0;y<4;++y)std::copy_n(input.begin()+(y*4+side*2)*in,width*in,words.begin()+y*width*in);colors.upload(commands,color_format,make_upload(commands,words),{},image,all);}
+                    else {buffer_to_texture(commands,make_upload(commands,depth_plane),0,image,all,256,0,texture_plane::depth);if(metadata.stencil)buffer_to_texture(commands,make_upload(commands,stencil_plane),0,image,all,256,0,texture_plane::stencil);}
+                    if(count>1)samples.import(commands,image,images[0]);
+                });
+                if(clean)surfaces.flush(piece);if(flags&1)surfaces.spill(piece);pieces.push_back(piece);if(!color)sources.push_back({piece,width,std::move(expected)});
+            }
+            const auto read_source=[&](const depth_source& item)
+            {
+                const auto depth_buffer=make_buffer(ctx,256*4,buffer_storage::shared),stencil_buffer=metadata.stencil?make_buffer(ctx,256*4,buffer_storage::shared):nil;
+                surfaces.draw(std::array{cached_surface_use{item.ref,false}},[&](context& commands,auto images){const auto image=expanded(commands,images[0],item.width);if(count>1)samples.expand(commands,images[0],image);texture_region all;all.size=MTLSizeMake(item.width,4,1);texture_to_buffer(commands,image,all,depth_buffer,0,256,0,texture_plane::depth);if(metadata.stencil)texture_to_buffer(commands,image,all,stencil_buffer,0,256,0,texture_plane::stencil);});
+                std::vector<std::byte> result;const auto* d=static_cast<const std::byte*>(depth_buffer.contents);for(unsigned y=0;y<4;++y)result.insert(result.end(),d+y*256,d+y*256+item.width*metadata.depth_bytes);
+                if(metadata.stencil){const auto* s=static_cast<const std::byte*>(stencil_buffer.contents);for(unsigned y=0;y<4;++y)result.insert(result.end(),s+y*256,s+y*256+item.width);}return result;
+            };
+            for(const auto& item:sources){require(read_source(item)==item.expected,"Depth source sample placement/native bits differ before scaled input");if(flags&1)surfaces.spill(item.ref);}
+            std::sort(memory->allowed_input_reads.begin(),memory->allowed_input_reads.end(),[](auto a,auto b){return a.address<b.address;});std::vector<guest_surface_range> allowed;
+            for(const auto& r:memory->allowed_input_reads){if(!allowed.empty()&&std::uint64_t(allowed.back().address)+allowed.back().size==r.address)allowed.back().size+=r.size;else allowed.push_back(r);}memory->allowed_input_reads=std::move(allowed);std::size_t holes=0;for(const auto& r:memory->allowed_input_reads)holes+=r.size;
+            const auto df=out==2?surface_color::rgb565:surface_color::argb8;const auto destination=cold?cached_surface_ref{}:surfaces.acquire({0x6000,{8/factors.x,8/factors.y,count,df,false},8*out+1,{}});std::vector<std::byte> background(64*out,std::byte{0xa5});
+            if(destination){surfaces.prepare(destination,surface_initialization::background);surfaces.draw(std::array{cached_surface_use{destination,true}},[&](context& commands,auto images){auto image=images[0];if(count>1){auto d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:image.pixelFormat width:8 height:8 mipmapped:NO];d.storageMode=MTLStorageModePrivate;d.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;image=make_texture(commands,d);}texture_region all;all.size=MTLSizeMake(8,8,1);colors.upload(commands,df,make_upload(commands,background),{},image,all);if(count>1)samples.import(commands,image,images[0]);});}
+            const auto target=plan_guest_surface(0x6000+(8*out+1)+out,5,3,out,8*out+1);scaled_image_plan plan{source,target,in==2?scaled_image_format::rgb565:scaled_image_format::argb8,out==2?scaled_image_format::rgb565:scaled_image_format::argb8,4,4,7,5,1,1,bool(flags&1),bool(flags&2),bool(flags&4),tile};
+            auto packed=plan;packed.source=plan_guest_surface(0,4,4,in);packed.destination=plan_guest_surface(0,5,3,out);packed.source_tile.reset();const auto patch=reference(packed,input,std::vector<std::byte>(15*out));
+            const auto vm=memory->access->copy();const auto reads=memory->read_bytes,writes=std::size_t(memory->writes),notifications=std::size_t(memory->access->notifications);memory->forbid_pixels=true;transfer.execute(plan);
+            require(transfer.native_completed()==1&&transfer.vm_completed()==0&&memory->read_bytes-reads==holes&&memory->writes==writes&&memory->access->notifications==notifications&&memory->access->copy()==vm,"Depth scaled input bypassed native byte authority orcaptured native/target VMpixels");
+            for(const auto& item:sources){require(read_source(item)==item.expected,"Depth/stencil native source bits changed during scaled packing");raw_bytes+=2*item.expected.size();}
+            for(const auto& piece:pieces)require(surfaces.status(piece).dirty==!clean,"Depth/color source clean-dirty authority changed");memory->forbid_pixels=false;
+            if(destination){for(unsigned y=0;y<3;++y)std::copy_n(patch.begin()+y*5*out,5*out,background.begin()+((y+1)*8+1)*out);const auto raw=make_buffer(ctx,background.size(),buffer_storage::shared);surfaces.draw(std::array{cached_surface_use{destination,false}},[&](context& commands,auto images){auto image=images[0];if(count>1){auto d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:image.pixelFormat width:8 height:8 mipmapped:NO];d.storageMode=MTLStorageModePrivate;d.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;image=make_texture(commands,d);samples.expand(commands,images[0],image);}texture_region all;all.size=MTLSizeMake(8,8,1);colors.download(commands,df,image,all,raw,{});});require(std::memcmp(raw.contents,background.data(),background.size())==0,"Depth packed native output/background differs from independent word/filter oracle");exact_bytes+=background.size();}
+            else {surfaces.prepare_cpu_read(target.range);auto expected=vm;for(unsigned y=0;y<3;++y)std::copy_n(patch.begin()+y*5*out,5*out,expected.begin()+target.range.address+y*target.row_pitch);require(memory->access->copy()==expected,"Depth packed cold-output observation changed source/padding/VM gaps");exact_bytes+=patch.size();}
+            hole_bytes+=holes;++profiles;
+            }
+            catch(const std::exception& error){throw std::runtime_error("Depth scale type="+std::to_string(type)+" out="+std::to_string(out)+" layout="+std::to_string(layout)+" kind="+std::to_string(kind)+" samples="+std::to_string(count)+" clean="+std::to_string(clean)+" cold="+std::to_string(cold)+" flags="+std::to_string(flags)+": "+error.what());}
+        }
+    }
+    std::cout<<"Native depth scaled images "<<(stencil_family?"Z24":"Z16")<<":"<<profiles<<" raw depth/stencil seed/native-plane oracles;single/two-source/RAM-XORholes/mixed-color,oddpitch/Morton/banked,1-2-4samples,dirty-clean/resident-spill,existing-cold,flips/filter/clip;"<<exact_bytes<<" exact output-background bytes,"<<raw_bytes<<" exact raw source depth-stencil bytes,"<<hole_bytes<<" only missing RAMbytes captured;no native/target VMcapture/write/notifications andwholeVM padding exact passed\n";
+}
+
+void depth_scaled_image_transactions(bool stencil_family)
+{
+    using namespace std::chrono_literals;context ctx(2);auto ledger=std::make_shared<heap_budget>(ctx,64u<<20);ctx.set_buffer_budget(ledger);surface_depth_transfer depths(ctx);surface_color_transfer colors(ctx);sample_transfer samples(ctx);unsigned cases=0;
+    for(unsigned type=1;type<=4;++type)for(unsigned count:{1u,4u})for(bool clean:{false,true})for(bool cold:{false,true})for(unsigned failure=0;failure<9;++failure)
+    {
+        if(bool(type%2==0)!=stencil_family)continue;
+        @autoreleasepool
+        {
+            try
+            {
+            const auto format=static_cast<surface_depth>(type);const auto metadata=describe_surface_depth(format);const auto in=metadata.guest_bytes;
+            auto memory=std::make_shared<native_memory>();memory->access->typed_identities=true;auto refuse=std::make_shared<bool>(false);const cpu_capture_dispatch capture=[access=memory->access,refuse](const auto& work){if(*refuse)throw std::range_error("Depth output dispatcher refused");access->execute([&](auto&){work();});};auto io=std::make_shared<io_mapping_epoch>();
+            surface_cache surfaces(ctx,memory,16u<<20,ledger,capture);guest_texture_cache textures(ctx,memory,[](unsigned a,unsigned,std::size_t){return a;},1u<<20,ledger,64,{capture,io});auto transfer=std::make_unique<scaled_image_transfer>(ctx,surfaces,textures,memory,capture,1u<<20);
+            const auto factors=count==1?sample_layout{1,1}:rsx_sample_layout(count);const auto source=surfaces.acquire({0x1000,{4/factors.x,2/factors.y,count,format,false},4*in,{}}),target=surfaces.acquire({0x6000,{cold?3u:4/factors.x,cold?2u:4/factors.y,cold?1u:count,surface_color::argb8,false},17,{}});
+            std::vector<std::byte> input(8*in),background(64,std::byte{0xa5});for(unsigned i=0;i<8;++i){const auto s=(17+i*53)&255;const std::uint32_t word=type==1?(i*7919+13)&65535:type==2?((i&1?0xffffffu:0)<<8)|s:type==3?0x1000u+i*0x500:((std::bit_cast<std::uint32_t>(float(i+1)/16)>>7)<<8)|s;for(unsigned lane=0;lane<in;++lane)input[i*in+lane]=std::byte(word>>(8*(in-1-lane)));}
+            surfaces.prepare(source,surface_initialization::background);surfaces.draw(std::array{cached_surface_use{source,true}},[&](context& commands,auto images){auto image=images[0];if(count>1){auto d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:image.pixelFormat width:4 height:2 mipmapped:NO];d.storageMode=MTLStorageModePrivate;d.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead|MTLTextureUsagePixelFormatView;image=make_texture(commands,d);}texture_region all;all.size=MTLSizeMake(4,2,1);depths.upload(commands,format,make_upload(commands,input),{},image,all);if(count>1)samples.import(commands,image,images[0]);});
+            if(clean)surfaces.flush(source);if(failure&1)surfaces.spill(source);
+            if(!cold){surfaces.prepare(target,surface_initialization::background);surfaces.draw(std::array{cached_surface_use{target,true}},[&](context& commands,auto images){auto image=images[0];if(count>1){auto d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:image.pixelFormat width:4 height:4 mipmapped:NO];d.storageMode=MTLStorageModePrivate;d.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;image=make_texture(commands,d);}texture_region all;all.size=MTLSizeMake(4,4,1);colors.upload(commands,surface_color::argb8,make_upload(commands,background),{},image,all);if(count>1)samples.import(commands,image,images[0]);});}
+            const auto before=surfaces.status(target);const auto vm=memory->access->copy();const auto reads=memory->read_bytes;
+            scaled_image_plan plan{plan_guest_surface(0x1000,4,2,in),plan_guest_surface(0x6000,3,2,4,17),in==2?scaled_image_format::rgb565:scaled_image_format::argb8,scaled_image_format::argb8,4,2,5,3,1,1,true,true,true};auto packed=plan;packed.source=plan_guest_surface(0,4,2,in);packed.destination=plan_guest_surface(0,3,2,4);const auto patch=reference(packed,input,std::vector<std::byte>(24));auto expected=background;for(unsigned y=0;y<2;++y)std::copy_n(patch.begin()+y*12,12,expected.begin()+y*16);
+            const auto readback=[&]{const auto raw=make_buffer(ctx,64,buffer_storage::shared);surfaces.draw(std::array{cached_surface_use{target,false}},[&](context& commands,auto images){auto image=images[0];if(count>1){auto d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:image.pixelFormat width:4 height:4 mipmapped:NO];d.storageMode=MTLStorageModePrivate;d.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;image=make_texture(commands,d);samples.expand(commands,images[0],image);}texture_region all;all.size=MTLSizeMake(4,4,1);colors.download(commands,surface_color::argb8,image,all,raw,{});});const auto bytes=map_buffer(raw,0,64);return std::vector<std::byte>(bytes.begin(),bytes.end());};
+            const auto gate=[ctx.device() newSharedEvent];struct release{id<MTLSharedEvent> gate;~release(){gate.signaledValue=1;}} cleanup{gate};std::optional<submission> token;auto valid=std::make_shared<bool>(true);const auto validate=[valid,access=memory->access]{require(guest_memory_epoch::current(*access)!=nullptr,"Depth metadata escaped producer exclusion");if(!*valid)throw scaled_image_mapping_conflict();};
+            std::vector<id<MTLBuffer>> blockers;if(failure==8){(void)surfaces.reclaim_idle();(void)ctx.trim_upload_pages();for(const auto storage:{MTLStorageModeShared,MTLStorageModePrivate}){auto state=ledger->statistics();auto attempt=state.budget-state.reserved_bytes;while(attempt){try{blockers.push_back(ledger->buffer(attempt,storage));state=ledger->statistics();attempt=state.budget-state.reserved_bytes;}catch(const heap_budget_error&){attempt/=2;}}}}
+            memory->forbid_pixels=true;bool failed=false;const auto execute=[&]{try{transfer->execute(plan,failure==8?30s:1ms,[&](context& commands){token=commands.recording_submission();if(failure==6)throw std::range_error("Depth encode refused");commands.wait_event(gate,1);},validate);}catch(const std::runtime_error&){failed=true;}};execute();
+            for(unsigned retry=0;!token&&surfaces.status(source).pending&&retry<4;++retry){surfaces.synchronize();failed=false;execute();}
+            require(failed&&surfaces.status(target).content_generation==before.content_generation&&memory->access->copy()==vm,"Depth scaled output published before actual GPU completion");
+            if(failure==8){require(!transfer->has_pending()&&(!token||(token->ready()&&token->cancelled())),"Depth quota refusal lost native owner");blockers.clear();transfer->execute(plan,30s,{},validate);failed=false;}
+            else if(failure==6)require(token&&token->cancelled()&&!transfer->has_pending()&&!surfaces.status(target).pending,"Depth encode cancellation retained output");
+            else
+            {
+                require(token&&transfer->has_pending()&&surfaces.status(target).pending&&!token->ready(),"Depth transaction lacks real gated native output");
+                if(failure==1||failure==2)memory->raw->write({failure==1?0x1000u:0x6000u,1},std::array{std::byte{0x5c}});if(failure==3)*valid=false;if(failure==4)require(token->cancel_pending(),"Depth queued cancellation refused");if(failure==5)transfer.reset();if(failure==7)*refuse=true;
+                gate.signaledValue=1;failed=false;try{if(transfer)transfer->synchronize();else surfaces.synchronize();}catch(const std::runtime_error&){failed=true;}
+                if(failure==7){require(failed&&transfer->has_pending()&&surfaces.status(target).pending,"Depth dispatcher refusal dropped pending output");*refuse=false;transfer->synchronize();failed=false;}if(failure==4)ctx.recover_completed_errors();
+            }
+            const bool rejected=failure>=1&&failure<=6;require(failed==rejected&&!surfaces.status(target).pending&&!surfaces.status(target).faulted&&(!transfer||!transfer->has_pending())&&surfaces.status(target).content_generation==before.content_generation+unsigned(!rejected),"Depth native completion/rollback metadata differs");
+            if(cold){if(rejected)require(!surfaces.status(target).initialized&&!surfaces.status(target).dirty,"Rejected depth transfer initialized cold output");}else if(failure!=2)require(readback()==(rejected?background:expected),"Depth native rollback/output lost exact background bytes");
+            if(failure==1||failure==2)require(memory->raw->read({failure==1?0x1000u:0x6000u,1}).bytes[0]==std::byte{0x5c},"Depth native output overwrote CPU writer");else require(memory->access->copy()==vm,"Depth native execute wrote VMpixels");
+            require(memory->read_bytes==reads&&surfaces.status(source).dirty==!clean,"Depth native preparation recaptured VMpixels orchanged source authority");memory->forbid_pixels=false;
+            if(cold&&!rejected){surfaces.prepare_cpu_read(plan.destination.range);auto expected_vm=vm;for(unsigned y=0;y<2;++y)std::copy_n(patch.begin()+y*12,12,expected_vm.begin()+0x6000+y*17);require(memory->access->copy()==expected_vm,"Depth cold observation changed source/padding");}++cases;
+            }
+            catch(const std::exception& error){throw std::runtime_error("Depth transaction type="+std::to_string(type)+" samples="+std::to_string(count)+" clean="+std::to_string(clean)+" cold="+std::to_string(cold)+" failure="+std::to_string(failure)+": "+error.what());}
+        }
+    }
+    std::cout<<"Native depth transactions "<<(stencil_family?"Z24":"Z16")<<":"<<cases<<" actual gated dirty-clean/resident-spill,1-4sample inputs/existing-cold outputs;CPUwriter/metadata conflicts,queued-encode cancellation,abandoned helper owner,CPUdispatcher andShared-Private quota refusal/retry;exact rollback/generation/background/CPU visibility,zero VMpixel reads/writes duringexecute passed\n";
+}
+
+void assembled_scaled_image_cases(bool mixed=false,bool clean=false)
+{
+    context ctx(2);auto ledger=std::make_shared<heap_budget>(ctx,64u<<20);ctx.set_buffer_budget(ledger);surface_color_transfer colors(ctx);sample_transfer samples(ctx);
+    unsigned profiles=0;std::size_t exact_bytes=0,hole_bytes=0;
+    for(unsigned in:{2u,4u})for(unsigned out:{2u,4u})for(unsigned kind=0;kind<4;++kind)for(unsigned layout=0;layout<3;++layout)
+    for(bool source_morton:{false,true})for(unsigned count:{1u,2u,4u})for(bool cold:{false,true})for(unsigned flags=0;flags<8;++flags)
+    {
+        if(kind==3&&source_morton)continue;
+        if(mixed&&kind==3)continue;
+        @autoreleasepool
+        {
+            auto memory=std::make_shared<native_memory>();memory->access->typed_identities=true;const cpu_capture_dispatch capture=[access=memory->access](const auto& work){access->execute([&](auto&){work();});};
+            auto io=std::make_shared<io_mapping_epoch>();surface_cache surfaces(ctx,memory,16u<<20,ledger,capture);guest_texture_cache textures(ctx,memory,[](unsigned a,unsigned,std::size_t){return a;},1u<<20,ledger,64,{capture,io});scaled_image_transfer transfer(ctx,surfaces,textures,memory,capture,1u<<20);
+            const auto morton=layout==1?std::optional<swizzle_region>{{{8,8,1},{1,2,0},{4,4,1}}}:std::nullopt;
+            const auto tile=layout==2?std::optional<banked_tile_layout>{{0x10000,0x40000,256,1,0x1200+in}}:std::nullopt;
+            auto source=plan_guest_surface(tile?tile->address+tile->offset:0x1000,4,4,in,morton?0:tile?256:4*in+1,morton);
+            if(tile)source=attach_banked_tile(source,*tile);
+            std::vector<std::byte> input(16*in);for(unsigned i=0;i<input.size();++i)input[i]=std::byte((i*37+i/3+109)&255);
+            const auto factors=count==1?sample_layout{1,1}:rsx_sample_layout(count);
+            const auto format=kind==0?(in==2?surface_color::rgb565:surface_color::argb8):kind==1?surface_color::b8:kind==2?surface_color::gb8:in==2?surface_color::gb8:surface_color::abgr8;
+            const auto bpp=surface_guest_bytes(surface_format{format}),width=(kind==3?4:2)*in/bpp;
+            std::vector<cached_surface_ref> pieces;
+            const auto seed=[&](const cached_surface_ref& ref,surface_color sf,std::span<const std::byte> bytes,unsigned w,unsigned h)
+            {
+                surfaces.prepare(ref,surface_initialization::background);
+                surfaces.draw(std::array{cached_surface_use{ref,true}},[&](context& commands,auto images)
+                {
+                    auto image=images[0];if(count>1){auto d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:image.pixelFormat width:w height:h mipmapped:NO];d.storageMode=MTLStorageModePrivate;d.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;image=make_texture(commands,d);}
+                    texture_region all;all.size=MTLSizeMake(w,h,1);colors.upload(commands,sf,make_upload(commands,bytes),{},image,all);if(count>1)samples.import(commands,image,images[0]);
+                });
+            };
+            for(unsigned side=0;side<(kind==3?1u:2u);++side)
+            {
+                if(kind==3)
+                {
+                    auto piece=surfaces.acquire({tile?tile->address+tile->offset:source.range.address,{4/factors.x,4/factors.y,count,format,false},source.morton?0:source.row_pitch,source.morton,tile});
+                    seed(piece,format,input,4,4);if(clean)surfaces.flush(piece);if(flags&1)surfaces.spill(piece);pieces.push_back(piece);continue;
+                }
+                const auto swizzle=source_morton?std::optional<swizzle_region>{{{width,4,1},{},{width,4,1}}}:std::nullopt;
+                const auto geometry=plan_guest_surface(0,width,4,bpp,swizzle?0:width*bpp+1,swizzle);
+                std::vector<unsigned> addresses(geometry.range.size);for(unsigned i=0;i<addresses.size();++i)addresses[i]=0xd0000+side*0x1000+i;
+                std::vector<std::byte> bytes(8*in);
+                for(unsigned y=0;y<4;++y)for(unsigned byte=0;byte<2*in;++byte)
+                {
+                    const auto x=side*2+byte/in,lane=byte%in;
+                    auto at=offset(source,x,y)+lane;if(tile)at=banked_display_storage_offset(*tile,tile->offset+at);
+                    const unsigned actual=(tile?tile->address:source.range.address)+unsigned(at);
+                    if(mixed&&(y+byte+side)%3==0)
+                    {
+                        memory->raw->write({actual,1},std::span{&input[(y*4+side*2)*in+byte],1});memory->allowed_input_reads.push_back({actual,1});
+                    }
+                    else addresses[offset(geometry,byte/bpp,y)+byte%bpp]=actual+(side?0x100000:0);
+                    bytes[y*2*in+byte]=input[(y*4+side*2)*in+byte];
+                }
+                std::vector<guest_storage_segment> spans;
+                for(unsigned i=0;i<addresses.size();++i){if(!spans.empty()&&std::uint64_t(spans.back().address)+spans.back().size==addresses[i])++spans.back().size;else spans.push_back({addresses[i],i,1});}
+                auto piece=surfaces.acquire({spans.front().address,{width/factors.x,4/factors.y,count,format,false},swizzle?0:geometry.row_pitch,swizzle,{},spans});seed(piece,format,bytes,width,4);pieces.push_back(piece);
+                if(clean)surfaces.flush(piece);
+                if(flags&1)surfaces.spill(piece);
+            }
+            std::sort(memory->allowed_input_reads.begin(),memory->allowed_input_reads.end(),[](auto a,auto b){return a.address<b.address;});
+            std::vector<guest_surface_range> allowed;for(const auto& r:memory->allowed_input_reads){if(!allowed.empty()&&std::uint64_t(allowed.back().address)+allowed.back().size==r.address)allowed.back().size+=r.size;else allowed.push_back(r);}memory->allowed_input_reads=std::move(allowed);
+            std::size_t requested_holes=0;for(const auto& r:memory->allowed_input_reads)requested_holes+=r.size;
+            const auto df=out==2?surface_color::rgb565:surface_color::argb8;
+            auto destination=cold?cached_surface_ref{}:surfaces.acquire({0x6000,{8/factors.x,8/factors.y,count,df,false},8*out+1,{}});
+            std::vector<std::byte> background(64*out,std::byte{0xa5});if(destination)seed(destination,df,background,8,8);
+            const auto target=plan_guest_surface(0x6000+(8*out+1)+out,5,3,out,8*out+1);
+            scaled_image_plan plan{source,target,in==2?scaled_image_format::rgb565:scaled_image_format::argb8,out==2?scaled_image_format::rgb565:scaled_image_format::argb8,4,4,7,5,1,1,bool(flags&1),bool(flags&2),bool(flags&4),tile};
+            auto packed=plan;packed.source=plan_guest_surface(0,4,4,in);packed.destination=plan_guest_surface(0,5,3,out);packed.source_tile.reset();
+            const auto patch=reference(packed,input,std::vector<std::byte>(15*out));
+            const auto vm=memory->access->copy();const auto reads=memory->reads,writes=memory->writes,notifications=memory->access->notifications;const auto bytes_read=memory->read_bytes;const auto entries=surfaces.metadata_statistics().entries;
+            memory->forbid_pixels=true;transfer.execute(plan);memory->forbid_pixels=false;
+            require(transfer.native_completed()==1&&transfer.vm_completed()==0,"Native split input used VM route");
+            require((mixed||memory->reads==reads)&&memory->read_bytes-bytes_read==requested_holes&&memory->writes==writes&&memory->access->notifications==notifications&&memory->access->copy()==vm,"Native split input accessed VMpixels outside exact RAM holes");
+            hole_bytes+=requested_holes;
+            for(const auto& piece:pieces)require(surfaces.status(piece).dirty==!clean,"Native split input changed clean/dirty authority");
+            require(surfaces.metadata_statistics().entries==entries+unsigned(cold),"Assembly admitted an unused guest-input raster");
+            if(destination)
+            {
+                for(unsigned y=0;y<3;++y)std::copy_n(patch.begin()+y*5*out,5*out,background.begin()+((y+1)*8+1)*out);
+                const auto raw=make_buffer(ctx,background.size(),buffer_storage::shared);
+                surfaces.draw(std::array{cached_surface_use{destination,false}},[&](context& commands,auto images)
+                {
+                    auto image=images[0];if(count>1){auto d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:image.pixelFormat width:8 height:8 mipmapped:NO];d.storageMode=MTLStorageModePrivate;d.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;image=make_texture(commands,d);samples.expand(commands,images[0],image);}
+                    texture_region all;all.size=MTLSizeMake(8,8,1);colors.download(commands,df,image,all,raw,{});
+                });
+                require(std::memcmp(raw.contents,background.data(),background.size())==0,"Native assembled output/background differs from independent rational oracle");exact_bytes+=background.size();
+            }
+            else
+            {
+                surfaces.prepare_cpu_read(target.range);auto expected=vm;
+                for(unsigned y=0;y<3;++y)std::copy_n(patch.begin()+y*5*out,5*out,expected.begin()+target.range.address+y*target.row_pitch);
+                require(memory->access->copy()==expected,"Assembled cold-output observation changed source/padding/VM gaps");exact_bytes+=patch.size();
+            }
+            ++profiles;
+        }
+    }
+    std::cout<<(clean?(mixed?"Clean mixed native/RAM scaled images:":"Clean assembled scaled images:"):(mixed?"Mixed native/RAM scaled images:":"Native assembled scaled images:"))<<profiles<<(mixed?" two disjoint partial sources withbyte holes inside packed words":" two disjoint sources/split words andsingle GB8-ABGR8 reinterpretation")<<",RGB565-ARGB8/B8/GB8 byte authorities,odd-pitch/Morton/banked requests,linear-Morton native sources,1-2-4samples,raw-spilled inputs,physical mirrors,flips/filter/clip andexisting-cold targets;"<<exact_bytes<<" exact output/background bytes;"<<hole_bytes<<" exact missing RAMbytes captured,zero target capture/VMwrite/notifications duringexecute,source clean-dirty epochs retained,no unused input raster passed\n";
+}
+
+void assembled_scaled_image_transactions(bool mixed=false,bool clean=false)
+{
+    using namespace std::chrono_literals;
+    context ctx(2);auto ledger=std::make_shared<heap_budget>(ctx,64u<<20);ctx.set_buffer_budget(ledger);surface_color_transfer colors(ctx);sample_transfer samples(ctx);unsigned cases=0;
+    for(bool cold:{false,true})for(unsigned count:{1u,4u})for(unsigned failure=0;failure<(mixed?13u:10u);++failure)
+    {
+        @autoreleasepool
+        {
+            auto memory=std::make_shared<native_memory>();memory->access->typed_identities=true;auto refuse=std::make_shared<bool>(false);
+            const cpu_capture_dispatch capture=[access=memory->access,refuse](const auto& work){if(*refuse)throw std::range_error("Assembly completion dispatcher refused");access->execute([&](auto&){work();});};
+            auto io=std::make_shared<io_mapping_epoch>();surface_cache surfaces(ctx,memory,16u<<20,ledger,capture);guest_texture_cache textures(ctx,memory,[](unsigned a,unsigned,std::size_t){return a;},1u<<20,ledger,64,{capture,io});auto transfer=std::make_unique<scaled_image_transfer>(ctx,surfaces,textures,memory,capture,1u<<20);
+            const auto factors=count==1?sample_layout{1,1}:rsx_sample_layout(count);
+            const auto first=surfaces.acquire({0x1000,{2/factors.x,2/factors.y,count,surface_color::rgb565,false},8,{}});
+            cached_surface_description second_description{0x1004,{2/factors.x,2/factors.y,count,surface_color::rgb565,false},8,{}};
+            if(mixed)for(unsigned i=0;i<plan_guest_surface(0,2,2,2,8).range.size;++i)second_description.segments.push_back({i==1||i==9?0xd4000u+i:0x1004u+i,i,1});
+            const auto second=surfaces.acquire(second_description);
+            const auto target=surfaces.acquire({0x6000,{cold?3u:4/factors.x,cold?2u:4/factors.y,cold?1u:count,surface_color::rgb565,false},10,{}});
+            std::vector<std::byte> input(16),background(32,std::byte{0xa5});for(unsigned i=0;i<input.size();++i)input[i]=std::byte((i*37+109)&255);
+            if(mixed){for(const auto i:{5u,13u})memory->raw->write({0x1000+i,1},std::span{&input[i],1});memory->allowed_input_reads={{0x1005,1},{0x100d,1}};}
+            const auto seed=[&](const cached_surface_ref& ref,std::span<const std::byte> bytes,unsigned width,unsigned height)
+            {
+                surfaces.prepare(ref,surface_initialization::background);surfaces.draw(std::array{cached_surface_use{ref,true}},[&](context& commands,auto images)
+                {auto image=images[0];if(count>1){auto d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:image.pixelFormat width:width height:height mipmapped:NO];d.storageMode=MTLStorageModePrivate;d.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;image=make_texture(commands,d);}texture_region all;all.size=MTLSizeMake(width,height,1);colors.upload(commands,surface_color::rgb565,make_upload(commands,bytes),{},image,all);if(count>1)samples.import(commands,image,images[0]);});
+            };
+            for(unsigned side=0;side<2;++side){std::vector<std::byte> part(8);for(unsigned y=0;y<2;++y)std::copy_n(input.begin()+y*8+side*4,4,part.begin()+y*4);seed(side?second:first,part,2,2);}
+            if(clean){surfaces.flush(first);surfaces.flush(second);}
+            if(!cold)seed(target,background,4,4);
+            const auto before=surfaces.status(target);const auto vm=memory->access->copy();const auto captured_bytes=memory->read_bytes;
+            scaled_image_plan plan{plan_guest_surface(0x1000,4,2,2,8),plan_guest_surface(0x6000,3,2,2,10),scaled_image_format::rgb565,scaled_image_format::rgb565,4,2,5,3,1,1,true,true,true};
+            auto canonical=plan;canonical.source=plan_guest_surface(0,4,2,2);canonical.destination=plan_guest_surface(0,3,2,2);
+            const auto patch=reference(canonical,input,std::vector<std::byte>(12));auto expected=background;for(unsigned y=0;y<2;++y)std::copy_n(patch.begin()+y*6,6,expected.begin()+y*8);
+            const auto readback=[&]
+            {
+                const auto raw=make_buffer(ctx,32,buffer_storage::shared);surfaces.draw(std::array{cached_surface_use{target,false}},[&](context& commands,auto images)
+                {auto image=images[0];if(count>1){auto d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:image.pixelFormat width:4 height:4 mipmapped:NO];d.storageMode=MTLStorageModePrivate;d.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;image=make_texture(commands,d);samples.expand(commands,images[0],image);}texture_region all;all.size=MTLSizeMake(4,4,1);colors.download(commands,surface_color::rgb565,image,all,raw,{});});const auto bytes=map_buffer(raw,0,32);return std::vector<std::byte>(bytes.begin(),bytes.end());
+            };
+            const auto gate=[ctx.device() newSharedEvent];struct release{id<MTLSharedEvent> event;~release(){event.signaledValue=1;}} cleanup{gate};std::optional<submission> token;auto valid=std::make_shared<bool>(true);
+            const auto validate=[valid,access=memory->access]{require(guest_memory_epoch::current(*access)!=nullptr,"Assembly metadata escaped producer exclusion");if(!*valid)throw scaled_image_mapping_conflict();};
+            std::vector<id<MTLBuffer>> blockers;if(failure==9){(void)surfaces.reclaim_idle();(void)ctx.trim_upload_pages();for(const auto storage:{MTLStorageModeShared,MTLStorageModePrivate}){auto state=ledger->statistics();auto attempt=state.budget-state.reserved_bytes;while(attempt){try{blockers.push_back(ledger->buffer(attempt,storage));state=ledger->statistics();attempt=state.budget-state.reserved_bytes;}catch(const heap_budget_error&){attempt/=2;}}}}
+            memory->forbid_pixels=true;bool failed=false;
+            try{transfer->execute(plan,failure==9?30s:1ms,[&](context& commands){token=commands.recording_submission();if(failure==7)throw std::range_error("Assembly encode refused");commands.wait_event(gate,1);},validate);}catch(const std::runtime_error&){failed=true;}
+            require(failed&&surfaces.status(target).content_generation==before.content_generation&&memory->access->copy()==vm,"Assembly published before real output completion");
+            if(failure==9){require(!transfer->has_pending()&&(!token||(token->ready()&&token->cancelled())),"Assembly quota refusal lost pending ownership");blockers.clear();transfer->execute(plan,30s,{},validate);failed=false;}
+            else if(failure==7){require(token&&token->cancelled()&&!transfer->has_pending()&&!surfaces.status(target).pending,"Assembly encode cancellation retained current output");}
+            else
+            {
+                require(token&&transfer->has_pending()&&surfaces.status(target).pending&&!token->ready(),"Assembly lacks actual gated native output");
+                if(failure>=1&&failure<=3)memory->raw->write({failure==1?0x1000u:failure==2?0x1004u:0x6000u,1},std::array{std::byte{0x5c}});
+                if(failure==10||failure==11){memory->raw->write({0x1005,1},std::array{std::byte{0x5c}});if(failure==11)memory->raw->write({0x1005,1},std::span{&input[5],1});}
+                if(failure==12)memory->raw->write({0x1010,1},std::array{std::byte{0x7d}});
+                if(failure==4)*valid=false;if(failure==5)require(token->cancel_pending(),"Assembly queued cancellation refused");if(failure==6)transfer.reset();if(failure==8)*refuse=true;
+                gate.signaledValue=1;failed=false;try{if(transfer)transfer->synchronize();else surfaces.synchronize();}catch(const std::runtime_error&){failed=true;}
+                if(failure==8){require(failed&&transfer->has_pending()&&surfaces.status(target).pending,"Assembly dispatcher rejection dropped current transaction");*refuse=false;transfer->synchronize();failed=false;}
+                if(failure==5)ctx.recover_completed_errors();
+            }
+            const bool rejected=(failure>=1&&failure<=7)||failure==10||failure==11;
+            require(failed==rejected&&!surfaces.status(target).pending&&!surfaces.status(target).faulted&&(!transfer||!transfer->has_pending()),"Assembly completion/rejection metadata differs");
+            require(surfaces.status(target).content_generation==before.content_generation+unsigned(!rejected),"Assembly changed generation after rejected native output");
+            if(cold){if(rejected)require(!surfaces.status(target).initialized&&!surfaces.status(target).dirty,"Assembly rejection initialized cold output");}
+            else if(failure!=3)require(readback()==(rejected?background:expected),"Assembly native rollback lost exact output/background");
+            auto expected_vm=vm;if(failure==10)expected_vm[0x1005]=std::byte{0x5c};if(failure==12)expected_vm[0x1010]=std::byte{0x7d};
+            if(failure>=1&&failure<=3)require(memory->raw->read({failure==1?0x1000u:failure==2?0x1004u:0x6000u,1}).bytes[0]==std::byte{0x5c},"Assembly overwrote competing CPU writer");else require(memory->access->copy()==expected_vm,"Assembly wrote VMpixels orlost unrelated CPUbytes before observation");
+            if(clean){require(!surfaces.status(first).dirty&&!surfaces.status(second).dirty,"Assembly dirtied clean input authorities");if(!mixed)require(memory->read_bytes==captured_bytes,"Clean input quota/retry recaptured VMpixels");}
+            memory->forbid_pixels=false;
+            if(cold&&!rejected){surfaces.prepare_cpu_read(plan.destination.range);for(unsigned y=0;y<2;++y)std::copy_n(patch.begin()+y*6,6,expected_vm.begin()+0x6000+y*10);require(memory->access->copy()==expected_vm,"Assembly cold observation changed source/padding");}
+            ++cases;
+        }
+    }
+    std::cout<<(clean?(mixed?"Clean mixed native/RAM transactions:":"Clean assembled transactions:"):(mixed?"Mixed native/RAM transactions:":"Native assembled transactions:"))<<cases<<" real gated single-four-sample source/existing-cold target cases;both native source andtarget CPUwriters,owned metadata rejection,queued/encode cancellation,owner abandonment,CPUdispatcher refusal/retry andactual Shared-Private quota refusal/retry"<<(mixed?",RAM hole writer/identical-byte ABA refused,unrelated writer preserved":"")<<";exact rollback/background andno early output passed\n";
+}
+
+void mixed_source_lifetimes()
+{
+    using namespace std::chrono_literals;unsigned cases=0;
+    for(bool cold:{false,true})for(unsigned outcome=0;outcome<3;++outcome)
+    {
+        std::weak_ptr<native_access> provider;std::shared_ptr<heap_budget> ledger;
+        @autoreleasepool
+        {
+            auto ctx=std::make_unique<context>(2);ledger=std::make_shared<heap_budget>(*ctx,64u<<20);ctx->set_buffer_budget(ledger);
+            {
+                auto memory=std::make_shared<native_memory>();memory->access->typed_identities=true;provider=memory->access;
+                const cpu_capture_dispatch capture=[access=memory->access](const auto& work){access->execute([&](auto&){work();});};auto io=std::make_shared<io_mapping_epoch>();
+                auto surfaces=std::make_unique<surface_cache>(*ctx,memory,16u<<20,ledger,capture);auto textures=std::make_unique<guest_texture_cache>(*ctx,memory,[](unsigned a,unsigned,std::size_t){return a;},1u<<20,ledger,64,texture_capture_bindings{capture,io});auto transfer=std::make_unique<scaled_image_transfer>(*ctx,*surfaces,*textures,memory,capture,1u<<20);surface_color_transfer colors(*ctx);
+                const auto piece=surfaces->acquire({0x1000,{3,2,1,surface_color::b8,false},8,{}}),target=surfaces->acquire({0x6000,{2,2,1,surface_color::argb8,false},9,{}});
+                std::vector<std::byte> input(16),native(6),background(16,std::byte{0xa5});for(unsigned i=0;i<16;++i)input[i]=std::byte((i*37+109)&255);const auto expected=input;
+                for(unsigned y=0;y<2;++y){std::copy_n(input.begin()+y*8,3,native.begin()+y*3);memory->raw->write({0x1003+y*8,5},std::span{input}.subspan(y*8+3,5));memory->allowed_input_reads.push_back({0x1003+y*8,5});}
+                const auto seed=[&](const cached_surface_ref& ref,surface_color format,std::span<const std::byte> bytes,unsigned width)
+                {surfaces->prepare(ref,surface_initialization::background);surfaces->draw(std::array{cached_surface_use{ref,true}},[&](context& commands,auto images){texture_region all;all.size=MTLSizeMake(width,2,1);colors.upload(commands,format,make_upload(commands,bytes),{},images[0],all);});};
+                seed(piece,surface_color::b8,native,3);if(!cold)seed(target,surface_color::argb8,background,2);
+                const auto before=surfaces->status(target);const auto vm=memory->access->copy();const auto bytes=memory->read_bytes;
+                scaled_image_plan plan{plan_guest_surface(0x1000,2,2,4),plan_guest_surface(0x6000,2,2,4,9),scaled_image_format::argb8,scaled_image_format::argb8,2,2,2,2};
+                const auto gate=[ctx->device() newSharedEvent];struct release{id<MTLSharedEvent> gate;~release(){gate.signaledValue=1;}} cleanup{gate};std::optional<submission> token;memory->forbid_pixels=true;bool failed=false;
+                try{transfer->execute(plan,1ms,[&](context& commands){token=commands.recording_submission();commands.wait_event(gate,1);});}catch(const std::runtime_error&){failed=true;}
+                require(failed&&token&&!token->ready()&&transfer->has_pending()&&surfaces->status(target).pending&&memory->read_bytes-bytes==10&&memory->access->copy()==vm,"Mixed input lifetime lacks real pending output orcaptured extra VMbytes");
+                input.assign(input.size(),std::byte{});native.clear();
+                if(outcome==1)transfer.reset();if(outcome==2)ctx->shutdown();else gate.signaledValue=1;
+                failed=false;try{if(transfer)transfer->synchronize();else surfaces->synchronize();}catch(const std::runtime_error&){failed=true;}
+                require(failed==bool(outcome)&&!surfaces->status(target).pending&&!surfaces->status(target).faulted&&surfaces->status(target).content_generation==before.content_generation+unsigned(!outcome)&&memory->access->copy()==vm,"Mixed input abandonment/shutdown published early orlost target metadata");
+                if(outcome==2)require(token->ready()&&token->cancelled(),"Explicit mixed input shutdown left queued native work live");
+                if(outcome&&cold)require(!surfaces->status(target).initialized&&!surfaces->status(target).dirty,"Mixed input teardown initialized cold target");
+                if(outcome!=2)
+                {
+                    memory->forbid_pixels=false;surfaces->prepare_cpu_read(plan.destination.range);auto expected_vm=vm;
+                    if(!outcome||!cold){const auto& pixels=outcome?background:expected;for(unsigned y=0;y<2;++y)std::copy_n(pixels.begin()+y*8,8,expected_vm.begin()+0x6000+y*9);}
+                    require(memory->access->copy()==expected_vm,"Mixed input owned bytes/background did not survive pending owner lifetime");
+                }
+            }
+            ctx.reset();
+        }
+        require(provider.expired()&&ledger->statistics().reserved_bytes==0,"Mixed input watches/provider/native ledger survived complete cache/context teardown");++cases;
+    }
+    std::cout<<"Mixed source lifetime:"<<cases<<" actual pending outputs with existing-cold targets,owned RAM bytes after caller mutation,transfer abandonment andexplicit blocked context.shutdown;no early output,exact bytes/background,provider retirement/zero native ledger passed\n";
+}
+
+void assembled_source_bounds()
+{
+    context ctx(2);auto ledger=std::make_shared<heap_budget>(ctx,64u<<20);ctx.set_buffer_budget(ledger);surface_color_transfer colors(ctx);
+    unsigned cases=0;
+    for(unsigned state=0;state<4;++state)for(unsigned mode=0;mode<7;++mode)
+    {
+        @autoreleasepool
+        {
+            auto memory=std::make_shared<native_memory>();memory->access->typed_identities=mode!=2;
+            const cpu_capture_dispatch capture=[access=memory->access](const auto& work){access->execute([&](auto&){work();});};auto io=std::make_shared<io_mapping_epoch>();
+            surface_cache surfaces(ctx,memory,16u<<20,ledger,capture);guest_texture_cache textures(ctx,memory,[](unsigned a,unsigned,std::size_t){return a;},1u<<20,ledger,64,{capture,io});scaled_image_transfer transfer(ctx,surfaces,textures,memory,capture,1u<<20);
+            const bool clean=state>=2,spill=state&1;
+            const unsigned width=mode==1?5:mode==6?13:mode>=4?8:6,height=mode==1||mode==6?5:mode>=4?8:4;
+            const unsigned count=width*height-unsigned(mode==3||mode==5);
+            std::vector<std::byte> input(width*height*2);for(unsigned i=0;i<input.size();++i)input[i]=std::byte((i*37+119)&255);
+            if(mode==3||mode==5)memory->raw->write({0x1000+count*2,2},std::span{input}.last(2));
+            cached_surface_ref first;std::vector<cached_surface_ref> pieces;
+            for(unsigned i=0;i<count;++i)
+            {
+                const auto piece=surfaces.acquire({0x1000+i*2,{2,1,1,surface_color::b8,false},2,{}});surfaces.prepare(piece,surface_initialization::background);
+                surfaces.draw(std::array{cached_surface_use{piece,true}},[&](context& commands,auto images){texture_region all;all.size=MTLSizeMake(2,1,1);colors.upload(commands,surface_color::b8,make_upload(commands,std::span{input}.subspan(i*2,2)),{},images[0],all);});
+                if(!first)first=piece;if(clean)surfaces.flush(piece);if(spill)surfaces.spill(piece);pieces.push_back(piece);
+            }
+            // Public RSX draw slots keep their original bound even though
+            // the private transfer batch accepts more sequential readers.
+            const auto submitted=surfaces.transaction_statistics().submitted;bool encoded=false,refused=false;
+            try{surfaces.draw(std::vector<cached_surface_use>(26,{first,false}),[&](context&,auto){encoded=true;});}catch(const std::invalid_argument&){refused=true;}
+            require(refused&&!encoded&&surfaces.transaction_statistics().submitted==submitted,"Wide transfer changed the public RSX draw slot bound");
+            scaled_image_plan plan{plan_guest_surface(0x1000,width,height,2),plan_guest_surface(0x6000,4,3,2,9),scaled_image_format::rgb565,scaled_image_format::rgb565,width,height,5,4,1,1,true,false,true};
+            auto packed=plan;packed.source=plan_guest_surface(0,width,height,2);packed.destination=plan_guest_surface(0,4,3,2);const auto patch=reference(packed,input,std::vector<std::byte>(24));
+            const bool direct=mode!=2&&mode!=6,native=direct||(mode==6&&clean);if(mode==3||mode==5)memory->allowed_input_reads={{0x1000+count*2,2}};
+            const auto vm=memory->access->copy();const auto bytes_read=memory->read_bytes;memory->forbid_pixels=direct;transfer.execute(plan);memory->forbid_pixels=false;
+            if(transfer.native_completed()!=unsigned(native)||transfer.vm_completed()!=unsigned(!native))throw std::runtime_error("Native assembly routing differs state="+std::to_string(state)+" mode="+std::to_string(mode)+" sources="+std::to_string(count)+" native="+std::to_string(transfer.native_completed())+" vm="+std::to_string(transfer.vm_completed()));
+            if(native)for(const auto& piece:pieces)require(surfaces.status(piece).dirty==!clean,"Wide source preparation changed its clean/dirty authority");
+            if(mode==6&&clean)require(memory->read_bytes-bytes_read==input.size(),"65 clean sources did not use one exact coherent RAM input");
+            auto expected=vm;if(!native)std::copy(input.begin(),input.end(),expected.begin()+0x1000);
+            if(native){require(memory->access->copy()==vm,"Native assembly wrote source VM");surfaces.prepare_cpu_read(plan.destination.range);}
+            for(unsigned y=0;y<3;++y)std::copy_n(patch.begin()+y*8,8,expected.begin()+0x6000+y*9);
+            require(memory->access->copy()==expected,"Assembly source bound/fallback lost exact bytes orpadding");
+            ++cases;
+        }
+    }
+    std::cout<<"Wide native assembly:"<<cases<<" dirty-clean/resident-spilled profiles;24-25-64native sources and23-63native-plus-one-RAMhole feed native output without native VMcapture;65dirty sources/missing exact identity use coherent VM fallback,65clean sources use one exact RAMinput/native output;public26-use RSX draws refused beforeencoding,wholeVM/padding exact passed\n";
+}
+
 void rational_filter_boundaries()
 {
     context ctx(2);scaled_image_compute compute(ctx,1u<<20);unsigned cases=0;
@@ -681,7 +1091,29 @@ int main(int argc,char** argv)
 	{
 		try
 		{
-            if(argc>1){if(argc==2&&std::string_view(argv[1])=="deferred-transactions"){deferred_scaled_image_transactions();return 0;}throw std::invalid_argument("Unknown scaled-image test selection");}
+            if(argc>1)
+            {
+                if(argc!=2)throw std::invalid_argument("Unknown scaled-image test selection");
+                const std::string_view selection=argv[1];
+                if(selection=="deferred-transactions")deferred_scaled_image_transactions();
+                else if(selection=="assembly"){assembled_scaled_image_cases();assembled_scaled_image_transactions();assembled_source_bounds();}
+                else if(selection=="holes"){assembled_scaled_image_cases(true);assembled_scaled_image_transactions(true);mixed_source_lifetimes();assembled_source_bounds();}
+                else if(selection=="hole-transactions"){assembled_scaled_image_transactions(true);mixed_source_lifetimes();assembled_source_bounds();}
+                else if(selection=="clean"){assembled_scaled_image_cases(false,true);assembled_scaled_image_cases(true,true);assembled_scaled_image_transactions(false,true);assembled_scaled_image_transactions(true,true);}
+                else if(selection=="clean-transactions"){assembled_scaled_image_transactions(false,true);assembled_scaled_image_transactions(true,true);assembled_source_bounds();}
+                else if(selection=="bounds")assembled_source_bounds();
+                else if(selection=="depth-z16"){depth_scaled_image_cases(false);depth_scaled_image_transactions(false);}
+                else if(selection=="depth-z24"){depth_scaled_image_cases(true);depth_scaled_image_transactions(true);}
+                else if(selection=="depth-transactions"){depth_scaled_image_transactions(false);depth_scaled_image_transactions(true);}
+                else throw std::invalid_argument("Unknown scaled-image test selection");
+                return 0;
+            }
+			assembled_scaled_image_cases();
+			assembled_scaled_image_transactions();
+			assembled_source_bounds();
+			assembled_scaled_image_cases(true);
+			assembled_scaled_image_transactions(true);
+			mixed_source_lifetimes();
 			rational_filter_boundaries();
             native_scaled_image_cases();
             native_scaled_image_cases(true);

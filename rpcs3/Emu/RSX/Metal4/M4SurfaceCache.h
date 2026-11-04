@@ -16,6 +16,7 @@
 #include "M4SurfaceTextureRevision.h"
 #include "M4SurfaceTextureRegion.h"
 #include "M4TextureBlit.h"
+#include "M4DisplayAssembly.h"
 
 #include <functional>
 
@@ -185,12 +186,22 @@ class surface_cache final
 	void draw_impl(std::span<const cached_surface_use> surfaces,
 				   const std::function<void(context&, std::span<const id<MTLTexture>>)>& encode, bool snapshot_feedback,
 				   const surface_allocation_description* transient = nullptr, surface_lease* reservation = nullptr,
-				   std::function<void()> publication_check = {}, const cached_surface_ref& overwrite = {});
+				   std::function<void()> publication_check = {}, const cached_surface_ref& overwrite = {}, bool scaled_inputs = false);
 	struct scaled_image_endpoints
 	{
 		std::array<cached_surface_ref,2> surfaces;
 		std::array<clear_rectangle,2> regions;
 		bool overwrite_destination = false;
+		// A packed input assembled from disjoint native byte authorities.
+		// Every selected source remains a validated draw reader.
+		std::vector<cached_surface_ref> inputs;
+		std::vector<cached_surface_description> descriptions;
+		display_storage_assembly assembly;
+		// Only bytes missing from every native authority. Their watched CPU
+		// epoch must survive preparation,timeouts and final output publication.
+		std::vector<std::byte> input_bytes;
+		std::vector<display_storage_copy> input_patches;
+		std::shared_ptr<const surface_texture_revision> input_revision;
 	};
 	[[nodiscard]] std::optional<scaled_image_endpoints> prepare_scaled_image(const scaled_image_plan& plan,
 		std::chrono::milliseconds timeout);
