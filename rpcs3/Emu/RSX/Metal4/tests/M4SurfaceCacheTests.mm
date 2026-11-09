@@ -4,9 +4,11 @@
 #include "M4VertexShader.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <iostream>
 #include <mutex>
+#include <string_view>
 #include <thread>
 
 namespace
@@ -55,6 +57,7 @@ class memory_fixture final : public guest_surface_memory
 
   public:
 	std::function<void()> before_compare;
+	std::function<void(guest_surface_range)> after_read;
 	std::function<std::shared_ptr<void>(std::span<const guest_surface_range>)> backing;
 	std::shared_ptr<void> retain_backing(std::span<const guest_surface_range> ranges) override
 	{
@@ -63,9 +66,14 @@ class memory_fixture final : public guest_surface_memory
 	explicit memory_fixture(std::size_t bytes = 1 << 20) : data(bytes), versions(bytes) {}
 	guest_surface_snapshot read_surface(const guest_surface_layout& coverage) override
 	{
-		std::lock_guard lock(mutex);
-		check(coverage.range);
-		return {version(coverage), {data.begin() + coverage.range.address, data.begin() + coverage.range.address + coverage.range.size}};
+		guest_surface_snapshot snapshot;
+		{
+			std::lock_guard lock(mutex);
+			check(coverage.range);
+			snapshot = {version(coverage), {data.begin() + coverage.range.address, data.begin() + coverage.range.address + coverage.range.size}};
+		}
+		if (after_read) after_read(coverage.range);
+		return snapshot;
 	}
 	std::uint64_t surface_revision(const guest_surface_layout& coverage) override
 	{
@@ -998,13 +1006,14 @@ void deferred_lifetime(context& ctx)
 							   pass.colorAttachments[0].clearColor = MTLClearColorMake(1, 0, 0, 1);
 							   (void)commands.render(pass);
 							   commands.end_encoding(); });
-				require(cache.status(destination).deferred_copies == 0, "Native draw modified an unconsumed captured source");
+				require(cache.status(destination).deferred_copies == 1 && !cache.status(destination).dirty,
+					"Private native draw published an unrelated deferred reader");
 			}
 			cache.clear(source, 0xf0, 0x11223344, 0, 255, {0, 0, 8, 6});
 			if (action == 0)
 				require(cache.status(destination).deferred_copies == 0 && cache.status(source).content_generation > generation,
 						"In-place native clear did not materialize frozen source readers");
-			if (action == 1 || action == 2)
+			if (action == 1 || action == 2 || action == 5)
 				require(cache.status(destination).deferred_copies == 1,
 						"Replacement allocation altered a frozen retired native source epoch");
 			cache.flush(destination);
@@ -2353,12 +2362,13 @@ void spilled_snapshot_ready_cases()
 						"Ready snapshot waited/restored/submitted/allocated behind an unrelated genuinely pending queue gate");
 				}
 				gate.signaledValue = 1; pending.wait();
-				// Cache invalidation still needs the original source restored for a
-				// genuinely new copy. New writers must not reuse the captured image.
+				// A genuinely new copy reads the spill directly. A subsequent
+				// writer still creates a new native generation.
 				cache.clear_snapshots();
 				const auto fresh = cache.snapshot_texture(coverage.range,matches,ledger);
-				require(fresh != original && !cache.status(source).spilled && cache.transaction_statistics().submitted > submits,
-					"Snapshot miss did not retain the real raw-spill restoration contract");
+				require(fresh != original && cache.status(source).spilled && cache.memory_statistics().leased_allocations == 0 &&
+					cache.transaction_statistics().submitted == submits + 1,
+					"Snapshot miss did not copy the spill in a single submission");
 				cache.clear(source,std::holds_alternative<surface_color>(format) ? 0xf0 : 3,0xff804020,0x4000,53,{0,0,4,4});
 				if (const auto color = std::get_if<surface_color>(&format); color && !decode_color_clear(*color,0xff804020,0xf0).write_mask)
 				{
@@ -2383,7 +2393,7 @@ void spilled_snapshot_ready_cases()
 		++cases;
 	}
 	require(cases == 54, "Spilled ready-source matrix omitted color/depth/sample profiles");
-	std::cout << "Spilled ready snapshot:54 color/depth/1-2-4sample profiles,1728 hits while the only native slot is truly event-gated;no source restore,allocation,encoder orsubmit,raw spill remains;cache miss restores,new writer changes identity,all native charges retire passed\n";
+	std::cout << "Spilled ready snapshot:54 color/depth/1-2-4sample profiles,1728 hits while the only native slot is truly event-gated;no source restore,allocation,encoder orsubmit,raw spill remains;cache miss copies in one submission,new writer changes identity,all native charges retire passed\n";
 }
 void clean_texture_active_coverage(context& ctx)
 {
@@ -2812,13 +2822,1118 @@ void backing_lifetime()
 	}
 	std::cout << "Guest backing owners survive dirty spill,deferred output,GPU timeout and cache/context destruction;writeback,cancel,revision conflict and actual GPU completion retire them\n";
 }
-int main()
+void typed_wait_timeout_completion()
+{
+    using namespace metal4;using namespace std::chrono_literals;
+    context ctx(2);auto memory=std::make_shared<memory_fixture>();surface_cache cache(ctx,memory,16u<<20);surface_color_transfer colors(ctx);
+    const auto surface=cache.acquire({0x1000,{4,4,1,surface_color::argb8,false},16,{}});
+    cache.clear(surface,0xf0,0xff123456,0,255,{0,0,4,4});cache.flush(surface);
+    unsigned timeouts=0,ready_at_catch=0;
+    for(unsigned trial=0;trial<256;++trial)
+    {
+        std::vector<std::byte> expected(64);for(unsigned i=0;i<64;++i)expected[i]=std::byte((trial*37+i*17+73)&255);
+        const auto before=cache.status(surface).content_generation;const auto vm=memory->read({0x1000,64}).bytes;
+        std::optional<submission> work;cache.set_wait_timeout(0ms);
+        try
+        {
+            cache.draw(std::array{cached_surface_use{surface,true}},[&](context& commands,auto images)
+            {work=commands.recording_submission();texture_region all;all.size=MTLSizeMake(4,4,1);colors.upload(commands,surface_color::argb8,make_upload(commands,expected),{},images[0],all);});
+        }
+        catch(const submission_wait_timeout&)
+        {
+            ++timeouts;require(work&&cache.status(surface).pending&&cache.status(surface).content_generation==before,"Typed wait timeout lost native pending transaction orpublished metadata");
+            ready_at_catch+=work->ready();work->wait(30s);
+            require(work->ready()&&cache.status(surface).pending&&cache.status(surface).content_generation==before&&memory->read({0x1000,64}).bytes==vm,"Completed timed-out work lost pending ownership orpublished before explicit retry");
+        }
+        cache.set_wait_timeout(30s);cache.synchronize(30s);
+        require(work&&work->ready()&&!cache.status(surface).pending&&!cache.status(surface).faulted&&cache.status(surface).content_generation==before+1,"Explicit timeout completion retry rejected valid GPU work orchanged generation twice");
+        cache.flush(surface);require(memory->read({0x1000,64}).bytes==expected,"Late native completion retry lost exact GPU pixels at CPU observation");
+    }
+    require(timeouts>0,"Zero-deadline native completion fixture observed no CPU timeouts");
+    std::cout<<"Typed native wait deadlines:256 actual GPU writes,"<<timeouts<<" typed CPU timeouts,"<<ready_at_catch<<" ready at caller catch;after GPUcompletion,pending owners/old generations/VM retained until explicit retry,one generation andexact pixels,no false GPU failure passed\n";
+}
+void draw_target_loads(bool spilled)
+{
+	using namespace std::chrono_literals;
+	for (unsigned profile = 0; profile < 5; ++profile)
+	{
+		context ctx(2);
+		auto memory = std::make_shared<memory_fixture>();
+		surface_cache cache(ctx, memory, 8 << 20);
+		clear_engine clears(ctx);
+		const bool depth = profile == 2;
+		const bool swizzled = profile == 1;
+		const bool cancel = profile == 3;
+		const bool supersede = profile == 4;
+		const unsigned samples = spilled ? (depth ? 2u : swizzled ? 4u : 1u) : 1u;
+		const auto grid = samples == 1 ? sample_layout{1,1} : rsx_sample_layout(samples);
+		const std::array<std::size_t,3> storage{4 * grid.x, 4 * grid.y, 1};
+		const surface_format format = depth ? surface_format{surface_depth::z24s8_float} : surface_format{surface_color::argb8};
+		cached_surface_description description{0x1000, {4,4,samples,format,false}, swizzled ? 0u : storage[0] * 4 + 1, {}};
+		if (swizzled) description.morton = swizzle_region{storage, {}, storage};
+		const auto layout = plan_guest_surface(description.address, storage[0], storage[1], 4, description.row_pitch, description.morton);
+		const auto offset = [&](unsigned x, unsigned y)
+		{
+			return swizzled ? 4 * morton(x,y,0,storage) : y * layout.row_pitch + x * 4;
+		};
+		const std::uint32_t seed = depth ? 0x7d00002au : 0xff112233u;
+		const std::uint32_t painted = depth ? 0x7e000035u : 0xff345678u;
+		std::vector<std::byte> bytes(layout.range.size, std::byte{0xa5});
+		for (unsigned y = 0; y < storage[1]; ++y)
+			for (unsigned x = 0; x < storage[0]; ++x)
+			{
+				const auto sample = x % grid.x + y % grid.y * grid.x;
+				const auto value = seed + static_cast<std::uint32_t>(sample) * (depth ? 0x00000101u : 0x00010203u);
+				store(std::span{bytes}.subspan(offset(x,y), 4), value, 4);
+			}
+		memory->write(layout.range, bytes);
+		const auto target = cache.acquire(description);
+		const auto native_seed = depth ? 0x7f00002au : 0xff789abcu;
+		if (spilled)
+		{
+			cache.prepare(target);
+			if (!supersede)
+				cache.clear(target, depth ? 3 : 0xf0, native_seed, 0xffffff2a, 255,
+					cancel ? clear_rectangle{0,0,4,4} : clear_rectangle{0,3,1,1});
+			cache.spill(target);
+			require(cache.status(target).spilled && memory->read_surface(layout).bytes == bytes,
+				"Fixture spill published guest bytes");
+		}
+		const auto target_before = cache.status(target);
+		const auto prefix_target = cache.acquire({0x8000, {4,4,1,surface_color::argb8,false},16,{}});
+		cache.clear(prefix_target, 0xf0, 0xff112233, 0, 255, {0,0,4,4});
+		const auto before = cache.transaction_statistics();
+		const auto gate = [ctx.device() newSharedEvent];
+		struct release_event { id<MTLSharedEvent> event; ~release_event() { event.signaledValue = 1; } } release{gate};
+		auto batch = cache.batch_draws();
+		cache.clear(prefix_target, 0xf0, 0xff405060, 0, 255, {0,0,4,4});
+		const auto token = ctx.recording_submission();
+		const std::array uses{cached_surface_use{target,true}};
+		for (unsigned row = 0; row < 2; ++row)
+		{
+			cache.draw(uses, [&](context& commands, auto images)
+			{
+				if (row == 0) commands.wait_event(gate, 1);
+				clear_request request;
+				request.rectangle = {1,row,2,1};
+				request.color_value = painted;
+				request.zstencil_value = painted;
+				request.stencil_write_mask = 255;
+				request.mask = depth ? 3 : 0xf0;
+				if (depth)
+				{
+					request.depth = {images[0],0,0};
+					request.depth_format = surface_depth::z24s8_float;
+				}
+				else request.colors[0] = {{images[0],0,0},surface_color::argb8};
+				(void)clears.run(commands, request);
+			});
+			const auto state = cache.status(target);
+			require(token.same_batch(ctx.recording_submission()) && state.initialized == target_before.initialized &&
+				state.spilled == target_before.spilled && state.content_generation == target_before.content_generation &&
+				cache.transaction_statistics().submitted == before.submitted,
+				"Draw target published or submitted while recording its load and partial writers");
+		}
+		batch.submit();
+		require(!cache.poll_submitted() && cache.transaction_statistics().submitted == before.submitted + 1,
+			"Cold target and independent prefix did not share a gated submission");
+		if (cancel) require(token.cancel_pending(), "Cold-target GPU work escaped its cancellation gate");
+		if (supersede)
+		{
+			bytes[offset(0,0)] = std::byte{0x77};
+			memory->write(layout.range, bytes);
+		}
+		if (!cancel) gate.signaledValue = 1;
+		bool failed = false;
+		try { cache.synchronize(); }
+		catch (const submission_wait_timeout&) { throw; }
+		catch (const surface_conflict_error&) { require(supersede, "Unexpected cold-target revision conflict"); failed = true; }
+		catch (const std::runtime_error&) { require(cancel, "Unexpected cold-target GPU failure"); failed = true; }
+		if (cancel || supersede)
+		{
+			const auto state = cache.status(target);
+			require(failed && state.initialized == target_before.initialized && state.dirty == target_before.dirty &&
+				state.spilled == target_before.spilled && !state.faulted && !state.pending &&
+				state.content_generation == target_before.content_generation && memory->read_surface(layout).bytes == bytes,
+				"Rejected draw target retained provisional native state or changed guest bytes");
+			if (cancel) ctx.recover_completed_errors();
+			cache.prepare(target, surface_initialization::guest);
+			require(cache.status(target).initialized && !cache.status(target).spilled && cache.status(target).dirty == target_before.dirty,
+				"Rejected draw target could not reload its authoritative contents");
+			if (spilled && cancel)
+			{
+				cache.flush(target);
+				for (unsigned y = 0; y < storage[1]; ++y)
+					for (unsigned x = 0; x < storage[0]; ++x)
+						store(std::span{bytes}.subspan(offset(x,y), 4), native_seed, 4);
+				require(memory->read_surface(layout).bytes == bytes, "Cancelled draw lost the dirty spill's original bytes");
+			}
+			continue;
+		}
+		const auto state = cache.status(target);
+		require(!failed && state.initialized && !state.spilled && state.dirty &&
+			state.content_generation == target_before.content_generation + (spilled ? 2u : 3u),
+			"Draw target load and two partial writes did not publish once in order");
+		cache.flush(target);
+		const auto stored = depth
+			? (std::bit_cast<std::uint32_t>(float(painted >> 8) / 16777215.0f) >> 7 << 8) | (painted & 255)
+			: painted;
+		for (unsigned y = 0; y < storage[1]; ++y)
+			for (unsigned x = 0; x < storage[0]; ++x)
+			{
+				const auto pixel_x = x / grid.x, pixel_y = y / grid.y;
+				const bool covered = pixel_y < 2 && pixel_x >= 1 && pixel_x < 3;
+				if (covered || (spilled && pixel_x == 0 && pixel_y == 3))
+					store(std::span{bytes}.subspan(offset(x,y), 4), covered ? stored : native_seed, 4);
+			}
+		if (memory->read_surface(layout).bytes != bytes)
+			throw std::runtime_error("Draw target profile " + std::to_string(profile) + " changed the expected guest bytes");
+	}
+	std::cout << (spilled ? "Spilled" : "Cold")
+		<< " draw targets: 3 exact byte profiles in one submission each, cancellation and VM revision rollback/reload passed\n";
+}
+
+void deferred_draw_targets()
+{
+	using namespace std::chrono_literals;
+	for (unsigned profile = 0; profile < 7; ++profile)
+	{
+		context ctx(2);
+		auto memory = std::make_shared<memory_fixture>();
+		surface_cache cache(ctx, memory, 8 << 20);
+		clear_engine clears(ctx);
+		const bool full = profile == 0, spilled = profile == 2, self = profile == 3;
+		const bool cancel = profile == 4, supersede = profile == 5;
+		const bool depth = profile == 6;
+		const unsigned a = depth ? 0x7f000035 : 0xff123456, b = depth ? 0x7e000067 : 0xff654321;
+		const unsigned seed = depth ? 0x7d000010 : 0xff102030, native = 0xff485868;
+		const unsigned draw = depth ? 0x7d000053 : 0xffa1b2c3;
+		const surface_format format = depth ? surface_format{surface_depth::z24s8_float} : surface_format{surface_color::argb8};
+		const auto layout = plan_guest_surface(0x1000, 4, 4, 4, 16);
+		std::vector<std::byte> bytes(layout.range.size);
+		for (unsigned i = 0; i < 16; ++i) store(std::span{bytes}.subspan(i * 4, 4), seed + i, 4);
+		memory->write(layout.range, bytes);
+		const auto target = cache.acquire({0x1000, {4,4,1,format,false},16,{}});
+		const auto first = cache.acquire({0x2000, {4,4,1,format,false},16,{}});
+		const auto second = cache.acquire({0x3000, {4,4,1,format,false},16,{}});
+		const auto prefix = cache.acquire({0x4000, {4,4,1,surface_color::argb8,false},16,{}});
+		cache.clear(first, depth ? 3 : 0xf0, a, 0xffffff35, 255, {0,0,4,4});
+		cache.clear(second, depth ? 3 : 0xf0, b, 0x80000067, 255, {0,0,4,4});
+		cache.clear(prefix, 0xf0, seed, 0, 255, {0,0,4,4});
+		if (spilled)
+		{
+			cache.clear(target, 0xf0, native, 0, 255, {0,0,4,4});
+			cache.spill(target);
+		}
+		if (full)
+		{
+			cache.defer_copy(first, {0,0,2,4}, target, 0, 0);
+			cache.defer_copy(second, {0,0,2,4}, target, 2, 0);
+		}
+		else if (self)
+		{
+			cache.defer_copy(target, {0,0,1,4}, target, 1, 0);
+			cache.defer_copy(first, {0,0,1,4}, target, 2, 0);
+			cache.defer_copy(second, {0,0,1,1}, target, 2, 3);
+		}
+		else
+		{
+			cache.defer_copy(first, {0,0,2,3}, target, 1, 0, depth ? texture_plane::depth : texture_plane::all);
+			cache.defer_copy(second, {0,0,1,2}, target, 2, 1, depth ? texture_plane::stencil : texture_plane::all);
+		}
+		const auto target_before = cache.status(target);
+		const auto submitted = cache.transaction_statistics().submitted;
+		const auto gate = [ctx.device() newSharedEvent];
+		struct unblock { id<MTLSharedEvent> gate; ~unblock() { gate.signaledValue = 1; } } release{gate};
+		auto batch = cache.batch_draws();
+		cache.clear(prefix, 0xf0, native, 0, 255, {0,0,4,4});
+		const auto token = ctx.recording_submission();
+		const std::array uses{cached_surface_use{target,true}};
+		for (const unsigned pixel : {0u,3u})
+		{
+			cache.draw(uses, [&](context& commands, auto images)
+			{
+				if (pixel == 0) commands.wait_event(gate, 1);
+				clear_request request;
+				request.rectangle = {pixel,pixel,1,1};
+				request.color_value = draw;
+				request.mask = depth ? 3 : 0xf0;
+				if (depth)
+				{
+					request.depth = {images[0],0,0};
+					request.depth_format = surface_depth::z24s8_float;
+					request.zstencil_value = 0x40000053;
+					request.stencil_write_mask = 255;
+				}
+				else request.colors[0] = {{images[0],0,0},surface_color::argb8};
+				(void)clears.run(commands, request);
+			});
+			const auto pending = cache.status(target);
+			require(token.same_batch(ctx.recording_submission()) && pending.deferred_copies == target_before.deferred_copies &&
+				pending.content_generation == target_before.content_generation && cache.transaction_statistics().submitted == submitted,
+				"Deferred target submitted early, repeated preparation or exposed its new generation");
+		}
+		batch.submit();
+		require(!cache.poll_submitted() && cache.transaction_statistics().submitted == submitted + 1,
+			"Deferred target, its draws and unrelated prefix did not share a gated submission");
+		if (cancel) require(token.cancel_pending(), "Deferred target escaped its cancellation gate");
+		if (supersede)
+		{
+			bytes[0] = std::byte{0x77};
+			memory->write(layout.range, bytes);
+		}
+		if (!cancel) gate.signaledValue = 1;
+		bool failed = false;
+		try { cache.synchronize(); }
+		catch (const submission_wait_timeout&) { throw; }
+		catch (const surface_conflict_error&) { require(supersede, "Unexpected deferred target VM conflict"); failed = true; }
+		catch (const std::runtime_error&) { require(cancel, "Unexpected deferred target GPU failure"); failed = true; }
+		if (cancel || supersede)
+		{
+			const auto state = cache.status(target);
+			require(failed && state.initialized == target_before.initialized && state.dirty == target_before.dirty &&
+				state.spilled == target_before.spilled && !state.faulted && !state.pending &&
+				state.deferred_copies == target_before.deferred_copies && state.content_generation == target_before.content_generation &&
+				memory->read_surface(layout).bytes == bytes, "Rejected deferred target lost its frozen sources or changed VM");
+			if (supersede)
+			{
+				cache.cancel_deferred_copies(target);
+				continue;
+			}
+			ctx.recover_completed_errors();
+		}
+		else
+		{
+			const auto state = cache.status(target);
+			require(!failed && state.initialized && state.dirty && !state.spilled && state.deferred_copies == 0 &&
+				state.content_generation == target_before.content_generation + (profile == 1 || depth ? 4u : 3u),
+				"Deferred target did not publish copies and both writes in order");
+		}
+		cache.flush(target);
+		for (unsigned y = 0; y < 4; ++y)
+			for (unsigned x = 0; x < 4; ++x)
+			{
+				auto value = spilled ? native : seed + y * 4 + x;
+				if (full) value = x < 2 ? a : b;
+				else if (self)
+				{
+					if (x == 1) value = seed + y * 4;
+					if (x == 2) value = y == 3 ? b : a;
+				}
+				else
+				{
+					if (x >= 1 && x <= 2 && y < 3) value = depth ? (a & ~255u) | (value & 255u) : a;
+					if (x == 2 && y >= 1 && y < 3) value = depth ? (value & ~255u) | (b & 255u) : b;
+				}
+				if (!cancel && ((x == 0 && y == 0) || (x == 3 && y == 3))) value = draw;
+				store(std::span{bytes}.subspan((y * 4 + x) * 4, 4), value, 4);
+			}
+		require(memory->read_surface(layout).bytes == bytes, "Deferred draw changed frozen background, copy order or exact draw bytes");
+	}
+	std::cout << "Deferred draw targets: 5 exact byte profiles in one submission each, cancellation and VM revision rollback passed\n";
+}
+
+void clear_target_loads()
+{
+	for (unsigned profile = 0; profile < 5; ++profile)
+	{
+		context ctx(2);
+		auto memory = std::make_shared<memory_fixture>();
+		surface_cache cache(ctx, memory, 8 << 20);
+		const bool depth = profile == 1, deferred = profile == 2, stale = profile == 3, cancel = profile == 4;
+		const surface_format format = depth ? surface_format{surface_depth::z24s8_float} : surface_format{surface_color::argb8};
+		const auto layout = plan_guest_surface(0x1000,4,4,4,17);
+		std::vector<std::byte> bytes(layout.range.size, std::byte{0xa5});
+		const auto paint = [&](unsigned x, unsigned y, std::uint32_t value)
+		{
+			store(std::span{bytes}.subspan(y * layout.row_pitch + x * 4, 4), value, 4);
+		};
+		const std::uint32_t seed = depth ? 0x7d00002a : 0xff112233;
+		const std::uint32_t cleared = depth ? 0x7d000025 : 0xff6789ab;
+		for (unsigned y = 0; y < 4; ++y)
+			for (unsigned x = 0; x < 4; ++x)
+				paint(x, y, seed);
+		memory->write(layout.range, bytes);
+		const auto target = cache.acquire({layout.range.address,{4,4,1,format,false},layout.row_pitch,{}});
+		if (depth || stale)
+		{
+			cache.prepare(target);
+			if (depth) cache.clear(target, 2, 0, 0x2f, 255, {0,3,1,1});
+			cache.spill(target);
+			if (stale)
+			{
+				paint(0, 3, 0xff776655);
+				memory->write(layout.range, bytes);
+			}
+		}
+		if (deferred)
+		{
+			const auto donor = cache.acquire({0x2000,{4,4,1,surface_color::argb8,false},16,{}});
+			cache.clear(donor, 0xf0, 0xff776655, 0, 255, {0,0,4,4});
+			cache.defer_copy(donor, {0,0,2,1}, target, 0, 3);
+		}
+		const auto partial_clear = [&] { cache.clear(target, depth ? 2 : 0xf0, cleared, 5, 0x0f, {1,0,2,2}); };
+		if (cancel)
+		{
+			const auto prefix = cache.acquire({0x4000,{4,4,1,surface_color::argb8,false},16,{}});
+			cache.clear(prefix, 0xf0, seed, 0, 255, {0,0,4,4});
+			const auto gate = [ctx.device() newSharedEvent];
+			struct release_event { id<MTLSharedEvent> gate; ~release_event() { gate.signaledValue = 1; } } release{gate};
+			auto batch = cache.batch_draws();
+			cache.draw(std::array{cached_surface_use{prefix,true}},
+				[&](context& commands, auto) { commands.wait_event(gate, 1); });
+			const auto token = ctx.recording_submission();
+			const auto submitted = cache.transaction_statistics().submitted;
+			partial_clear();
+			cache.clear(target, 0xf0, cleared, 0, 255, {3,3,1,1});
+			require(token.same_batch(ctx.recording_submission()) && !cache.status(target).initialized &&
+				cache.transaction_statistics().submitted == submitted, "Partial clear split its target load or published the cold target early");
+			batch.submit();
+			require(token.cancel_pending(), "Partial clear escaped the cancellation gate");
+			bool rejected = false;
+			try { cache.synchronize(); } catch (const submission_wait_timeout&) { throw; } catch (const std::runtime_error&) { rejected = true; }
+			const auto state = cache.status(target);
+			require(rejected && !state.initialized && !state.dirty && !state.faulted && state.content_generation == 0 &&
+				memory->read_surface(layout).bytes == bytes, "Cancelled partial clear changed target authority or guest bytes");
+			ctx.recover_completed_errors();
+			continue;
+		}
+		const auto original = cache.status(target);
+		const auto submitted = cache.transaction_statistics().submitted;
+		partial_clear();
+		const auto state = cache.status(target);
+		require(cache.transaction_statistics().submitted == submitted + 1 && state.initialized && state.dirty &&
+			!state.spilled && state.deferred_copies == 0 &&
+			state.content_generation == original.content_generation + (deferred ? 3u : depth ? 1u : 2u),
+			"Partial clear did not commit its load and clear in one submission");
+		require(memory->read_surface(layout).bytes == bytes, "Partial clear wrote back before explicit flush");
+		cache.flush(target);
+		for (unsigned y = 0; y < 2; ++y)
+			for (unsigned x = 1; x <= 2; ++x)
+				paint(x, y, cleared);
+		if (depth) paint(0, 3, 0x7d00002f);
+		if (deferred) { paint(0, 3, 0xff776655); paint(1, 3, 0xff776655); }
+		require(memory->read_surface(layout).bytes == bytes, "Partial clear changed untouched pixels, aspect or padding");
+	}
+	std::cout << "Clear target loads: cold, spilled, deferred and stale VM profiles passed exact bytes in one submission each; cancelled batch kept prior authority\n";
+}
+
+void deferred_reader_pressure()
+{
+	context ctx(2);
+	const surface_allocation_description allocation{16,16,1,surface_color::argb8,false};
+	std::size_t cost;
+	{
+		surface_pool probe(ctx, 1 << 20);
+		cost = probe.acquire(allocation)->reserved_bytes();
+	}
+	auto memory = std::make_shared<memory_fixture>();
+	surface_cache cache(ctx, memory, cost * 2);
+	const auto writer = cache.acquire({0x1000, allocation, 64, {}});
+	const auto reader = cache.acquire({0x2000, allocation, 64, {}});
+	cache.clear(writer, 0xf0, 0xff112233, 0, 255, {0,0,16,16});
+	cache.clear(reader, 0xf0, 0xff000000, 0, 255, {0,0,16,16});
+	cache.defer_copy(writer, {0,0,16,16}, reader, 0, 0);
+	const auto before = cache.transaction_statistics();
+	cache.draw(std::array{cached_surface_use{writer,true}}, [](context& commands, auto images)
+	{
+		auto pass = [MTL4RenderPassDescriptor new];
+		pass.colorAttachments[0].texture = images[0];
+		pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+		pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+		pass.colorAttachments[0].clearColor = MTLClearColorMake(1,0,0,1);
+		(void)commands.render(pass);
+		commands.end_encoding();
+	});
+	require(cache.status(reader).deferred_copies == 0 && cache.status(reader).dirty &&
+		cache.transaction_statistics().raw_backup_submissions == before.raw_backup_submissions + 2,
+		"In-place pressure fallback failed to finish the reader before changing its donor");
+	cache.flush(reader);
+	cache.flush(writer);
+	const auto exact = [&](std::uint32_t address, std::uint32_t color)
+	{
+		std::vector<std::byte> expected(1024);
+		for (unsigned i = 0; i < 256; ++i) store(std::span{expected}.subspan(i * 4, 4), color, 4);
+		return memory->read({address,1024}).bytes == expected;
+	};
+	require(exact(0x1000, 0xffff0000) && exact(0x2000, 0xff112233),
+		"In-place fallback changed the deferred reader's captured bytes");
+	std::cout << "Deferred reader pressure: raw in-place fallback finished reader before writer and retained exact bytes\n";
+}
+
+void resident_target_reload()
+{
+	for (unsigned profile = 0; profile < 4; ++profile)
+	{
+		context ctx(2);
+		auto memory = std::make_shared<memory_fixture>();
+		surface_cache cache(ctx, memory, 8 << 20);
+		clear_engine clears(ctx);
+		const bool clear = profile == 1, cancel = profile == 2, dirty = profile == 3;
+		const auto layout = plan_guest_surface(0x1000,4,4,4,17);
+		auto filled = [&](std::uint32_t value)
+		{
+			std::vector<std::byte> data(layout.range.size, std::byte{0xa5});
+			for (unsigned y = 0; y < 4; ++y)
+				for (unsigned x = 0; x < 4; ++x)
+					store(std::span{data}.subspan(y * 17 + x * 4, 4), value, 4);
+			return data;
+		};
+		const auto old = filled(0xff112233);
+		auto fresh = filled(0xff789abc);
+		memory->write(layout.range, old);
+		const auto target = cache.acquire({0x1000,{4,4,1,surface_color::argb8,false},17,{}});
+		const auto reader = cache.acquire({0x2000,{4,4,1,surface_color::argb8,false},17,{}});
+		cache.prepare(target);
+		if (dirty) cache.clear(target, 0xf0, 0xff445566, 0, 255, {0,0,4,4});
+		if (!clear && !dirty) cache.defer_copy(target, {0,0,4,4}, reader, 0, 0);
+		const auto before = cache.status(target);
+		memory->write(layout.range, fresh);
+		const auto submitted = cache.transaction_statistics().submitted;
+		if (dirty)
+		{
+			bool conflict = false;
+			auto batch = cache.batch_draws();
+			try { cache.draw(std::array{cached_surface_use{target,true}}, [](context&, auto) {}); }
+			catch (const surface_conflict_error&) { conflict = true; }
+			batch.finish();
+			require(conflict && cache.transaction_statistics().submitted == submitted &&
+				cache.status(target).dirty && cache.status(target).content_generation == before.content_generation,
+				"Resident reload replaced dirty native authority after a VM write");
+			continue;
+		}
+		const auto gate = [ctx.device() newSharedEvent];
+		struct unblock { id<MTLSharedEvent> gate; ~unblock() { gate.signaledValue = 1; } } release{gate};
+		if (clear)
+			cache.clear(target, 0xf0, 0xffabcdef, 0, 255, {1,0,2,2});
+		else
+		{
+			auto batch = cache.batch_draws();
+			std::optional<submission> token;
+			for (unsigned y = 0; y < 2; ++y)
+			{
+				cache.draw(std::array{cached_surface_use{target,true}}, [&](context& commands, auto images)
+				{
+					if (y == 0) commands.wait_event(gate, 1);
+					clear_request request;
+					request.mask = 0xf0;
+					request.color_value = 0xffabcdef;
+					request.rectangle = {1,y,2,1};
+					request.colors[0] = {{images[0],0,0}, surface_color::argb8};
+					(void)clears.run(commands, request);
+				});
+				if (!token) token = ctx.recording_submission();
+				require(token->same_batch(ctx.recording_submission()) && cache.transaction_statistics().submitted == submitted &&
+					cache.status(target).content_generation == before.content_generation && cache.status(reader).deferred_copies == 1,
+					"Resident reload split the draw or retired the frozen reader prematurely");
+			}
+			batch.submit();
+			require(!cache.poll_submitted(), "Resident reload bypassed the pending GPU event");
+			if (cancel) require(token->cancel_pending(), "Resident reload bypassed cancellation");
+			else gate.signaledValue = 1;
+			bool rejected = false;
+			try { cache.synchronize(); } catch (const submission_wait_timeout&) { throw; } catch (const std::runtime_error&) { rejected = true; }
+			require(rejected == cancel && cache.status(reader).deferred_copies == 1, "Resident reload lost the old reader");
+			if (cancel) ctx.recover_completed_errors();
+			cache.flush(reader);
+			const auto old_read = memory->read({0x2000,layout.range.size}).bytes;
+			for (unsigned y = 0; y < 4; ++y)
+				require(std::equal(old.begin() + y * 17, old.begin() + y * 17 + 16, old_read.begin() + y * 17),
+					"Reader saw the new VM revision or new draw instead of its original pixels");
+		}
+		const auto state = cache.status(target);
+		require(cache.transaction_statistics().submitted >= submitted + 1 && state.dirty == !cancel &&
+			state.content_generation == before.content_generation + (cancel ? 0u : clear ? 2u : 3u) &&
+			memory->read_surface(layout).bytes == fresh,
+			"Resident reload published stale authority or wrote back early");
+		if (clear)
+			require(cache.transaction_statistics().submitted == submitted + 1, "Resident clear made a separate upload submission");
+		if (!cancel)
+		{
+			cache.flush(target);
+			for (unsigned y = 0; y < 2; ++y)
+				for (unsigned x = 1; x <= 2; ++x)
+					store(std::span{fresh}.subspan(y * 17 + x * 4, 4), 0xffabcdef, 4);
+			require(memory->read_surface(layout).bytes == fresh, "Resident reload lost the newer VM background or an earlier draw");
+		}
+	}
+	std::cout << "Resident target reload: exact draw and clear bytes, frozen reader and rollback, dirty conflict refused\n";
+}
+
+void prefetched_draw_targets(bool partial_clear = false)
+{
+	using namespace std::chrono_literals;
+	const unsigned profiles = partial_clear ? 5u : 4u;
+	for (unsigned profile = 0; profile < profiles; ++profile)
+	{
+		const bool superseded = profile == 1, alias = profile == 2, cancel = profile == 3, pressure = profile == 4;
+		context ctx(2);
+		auto budget = std::make_shared<heap_budget>(ctx, 8 << 20);
+		ctx.set_buffer_budget(budget);
+		auto memory = std::make_shared<memory_fixture>();
+		id<MTLBuffer> blocker = nil;
+		std::vector<id<MTLBuffer>> pressure_tail;
+		std::optional<submission> release_budget_after;
+		const cpu_capture_dispatch capture = [&](const auto& work)
+		{
+			if (release_budget_after && release_budget_after->ready())
+			{
+				blocker = nil;
+				pressure_tail.clear();
+				release_budget_after.reset();
+			}
+			work();
+		};
+		surface_cache cache(ctx, memory, 8 << 20, budget, capture);
+		clear_engine clears(ctx);
+		const auto layout = plan_guest_surface(0x1000, 4, 4, 4, 16);
+		const auto target = cache.acquire({0x1000, {4,4,1,surface_color::argb8,false}, 16, {}});
+		const auto prior = cache.acquire({alias ? 0x1000u : 0x2000u, {2,4,1,surface_color::argb8,false}, 16, {}});
+		std::array<std::byte, 64> initial, newer;
+		for (unsigned i = 0; i < 16; ++i)
+		{
+			store(std::span{initial}.subspan(i * 4, 4), 0xff123456, 4);
+			store(std::span{newer}.subspan(i * 4, 4), 0xff456789, 4);
+		}
+		memory->write(layout.range, initial);
+		const auto gate = [ctx.device() newSharedEvent];
+		struct open_gate { id<MTLSharedEvent> event; ~open_gate() { event.signaledValue = 1; } } release{gate};
+		auto prior_batch = cache.batch_draws();
+		cache.draw(std::array{cached_surface_use{prior, true}}, [&](context& commands, auto)
+		{
+			commands.wait_event(gate, 1);
+		});
+		cache.clear(prior, 0xf0, 0xff112233, 0, 255, {0,0,2,4});
+		const auto predecessor = ctx.recording_submission();
+		prior_batch.submit();
+		require(!predecessor.ready(), "Prefetch predecessor was not gated");
+		unsigned reclaims = 0;
+		const auto reclaimer = budget->register_reclaimer([&](memory_pressure_request) { ++reclaims; });
+		if (pressure)
+		{
+			const auto usage = budget->statistics();
+			// Account for the large allocation's page rounding, then consume
+			// enough of the tail to refuse a buffer of the target's exact size.
+			const auto available = usage.budget - usage.reserved_bytes;
+			blocker = budget->shared_buffer(available & ~std::size_t(16383));
+			while (auto buffer = budget->try_shared_buffer(layout.range.size)) pressure_tail.push_back(buffer);
+			release_budget_after = predecessor;
+		}
+		const auto allocations = budget->statistics().created;
+		std::atomic<bool> staged_while_pending = false;
+		std::jthread release_after_staging;
+		if (!alias && !cancel && !pressure)
+			release_after_staging = std::jthread([&](std::stop_token stop)
+			{
+				while (!stop.stop_requested() && budget->statistics().created == allocations)
+					std::this_thread::sleep_for(100us);
+				if (stop.stop_requested()) return;
+				staged_while_pending = !predecessor.ready();
+				gate.signaledValue = 1;
+			});
+
+		unsigned reads = 0;
+		bool early = false, cancelled = false, encoded = false, cancelled_before_slot = false;
+		memory->after_read = [&](guest_surface_range range)
+		{
+			if (range.address != layout.range.address || range.size != layout.range.size || ++reads != 1) return;
+			early = !predecessor.ready();
+			if (superseded) memory->write(layout.range, newer);
+			if (cancel)
+			{
+				cancelled = predecessor.cancel_pending();
+				if (partial_clear && cancelled)
+				{
+					// This fixture holds no VM lock. Force cancellation to finish
+					// before the partial clear attempts to open its own slot.
+					try { predecessor.wait(2s); }
+					catch (const submission_wait_timeout&) { throw; }
+					catch (const std::runtime_error&) { cancelled_before_slot = predecessor.ready(); }
+				}
+			}
+			if (pressure) gate.signaledValue = 1;
+		};
+		const auto draw = [&]
+		{
+			auto next = cache.batch_draws();
+			if (partial_clear)
+			{
+				cache.clear(target, 0xf0, 0xffaabbcc, 0, 255, {3,3,1,1});
+				encoded = true;
+			}
+			else cache.draw(std::array{cached_surface_use{target, true}}, [&](context& commands, auto images)
+			{
+				encoded = true;
+				clear_request request;
+				request.colors[0] = {{images[0], 0, 0}, surface_color::argb8};
+				request.mask = 0xf0;
+				request.color_value = 0xffaabbcc;
+				request.rectangle = {3, 3, 1, 1};
+				(void)clears.run(commands, request);
+			});
+			next.finish();
+		};
+		cache.set_wait_timeout(alias ? 1ms : 2s);
+		bool timed_out = false, failed = false;
+		try { draw(); }
+		catch (const submission_wait_timeout&) { timed_out = true; }
+		catch (const std::runtime_error&) { if (!cancel) throw; failed = true; }
+		if (alias || cancel)
+		{
+			const auto state = cache.status(target);
+			require(timed_out == alias && failed == cancel && cancelled == cancel && early == cancel &&
+				reads == unsigned(cancel) && !encoded && !state.initialized && !state.dirty && !state.faulted,
+				"Aliased or cancelled predecessor exposed a provisional target");
+			if (partial_clear && cancel) require(cancelled_before_slot, "Partial clear did not exercise cancellation before slot start");
+			if (cancel) ctx.recover_completed_errors();
+			gate.signaledValue = 1;
+			cache.set_wait_timeout(5s);
+			draw();
+		}
+		else if (pressure)
+			require(!timed_out && early && !blocker && !reclaims && reads == 1,
+				"Early allocation pressure reclaimed resources or lost the captured guest bytes");
+		else
+			require(!timed_out && early && staged_while_pending && reads == (superseded ? 2u : 1u),
+				"Cold target did not stage a Metal upload while the predecessor was gated or refresh a changed revision");
+		memory->after_read = {};
+		auto expected = superseded ? newer : initial;
+		if (alias)
+			for (unsigned y = 0; y < 4; ++y)
+				for (unsigned x = 0; x < 2; ++x)
+					store(std::span{expected}.subspan((y * 4 + x) * 4, 4), 0xff112233, 4);
+		store(std::span{expected}.subspan(60, 4), 0xffaabbcc, 4);
+		const auto actual = cache.cpu_read(layout.range).bytes;
+		require(encoded && std::ranges::equal(actual, expected), "Prefetched target lost alias, VM revision or draw pixels");
+	}
+	std::cout << "Cold target staging for " << (partial_clear ? "partial clear" : "draw")
+		<< ": " << profiles << " gated profiles, " << profiles * 64
+		<< " exact guest bytes, early Metal upload, revision reuse/refresh, alias wait and cancellation passed\n";
+	if (partial_clear) std::cout << "Cold partial clear: full early budget, CPU snapshot reused after completion without reclaiming, cancellation before slot start passed\n";
+}
+
+enum class overlap_writer { full_clear, partial_color, partial_stencil, draw, mixed_draw, resident_draw,
+	spilled_draw, deferred_draw, deferred_spill_draw, deferred_guest_draw, deferred_guest_clear,
+	resident_clear, spilled_clear, deferred_spill_clear };
+void overlapping_target_recording(overlap_writer writer)
+{
+	using namespace std::chrono_literals;
+	const bool partial = writer != overlap_writer::full_clear;
+	const bool stencil = writer == overlap_writer::partial_stencil;
+	const bool mixed = writer == overlap_writer::mixed_draw;
+	const bool resident = writer == overlap_writer::resident_draw;
+	const bool resident_clear = writer == overlap_writer::resident_clear;
+	const bool spilled_clear = writer == overlap_writer::spilled_clear;
+	const bool deferred_spill_clear = writer == overlap_writer::deferred_spill_clear;
+	const bool native_clear = resident_clear || spilled_clear || deferred_spill_clear;
+	const bool spilled = writer == overlap_writer::spilled_draw || writer == overlap_writer::deferred_spill_draw;
+	const bool deferred_guest = writer == overlap_writer::deferred_guest_draw || writer == overlap_writer::deferred_guest_clear;
+	const bool deferred_clear = writer == overlap_writer::deferred_guest_clear || deferred_spill_clear;
+	const bool deferred = writer == overlap_writer::deferred_draw || writer == overlap_writer::deferred_spill_draw || deferred_guest || deferred_clear;
+	const bool draw = !deferred_clear && (writer == overlap_writer::draw || mixed || resident || spilled || deferred);
+	enum class scenario { success, timeout, cancelled, revised, alias, one_slot };
+	for (const auto test : {scenario::success, scenario::timeout, scenario::cancelled,
+		scenario::revised, scenario::alias, scenario::one_slot})
+	{
+		// The draw variant places its deferred target in the independent slot
+		// when testing an alias on the other target.
+		if (deferred_clear && test == scenario::alias) continue;
+		const bool rejects_revision = deferred_clear && test == scenario::revised;
+		context ctx(test == scenario::one_slot ? 1u : 2u, 64, 5s, context::recording_overlap::explicit_predecessor);
+		auto budget = std::make_shared<heap_budget>(ctx, 8 << 20);
+		ctx.set_buffer_budget(budget);
+		auto memory = std::make_shared<memory_fixture>();
+		const auto gate = [ctx.device() newSharedEvent];
+		struct open_gate { id<MTLSharedEvent> event; ~open_gate() { event.signaledValue = 1; } } release{gate};
+		std::optional<submission> predecessor;
+		std::uint64_t first_encoders = 0, first_compute = 0;
+		bool observed_recording = false, observed_publication = false, cancel_accepted = false;
+		const auto layout = plan_guest_surface(0x1000, 4, 4, 4, 16);
+		const auto companion_layout = plan_guest_surface(0x2000, 4, 4, 4, 16);
+		const surface_format format = stencil ? surface_format{surface_depth::z24s8_float} : surface_format{surface_color::argb8};
+		const std::uint32_t revised_pixel = stencil ? 0x7c000044 : 0xff212223;
+		std::array<std::byte, 64> initial;
+		for (unsigned i = 0; i < 16; ++i) store(std::span{initial}.subspan(i * 4, 4), (stencil ? 0x7d00002a : 0xff506070) + i, 4);
+		memory->write(layout.range, initial);
+		if (draw) memory->write(companion_layout.range, initial);
+		const cpu_capture_dispatch capture = [&](const auto& work)
+		{
+			if (predecessor && !observed_recording && !predecessor->ready())
+			{
+				try { observed_recording = !ctx.recording_submission().same_batch(*predecessor); }
+				catch (const std::logic_error&) {}
+				if (observed_recording && (test == scenario::success || test == scenario::revised)) gate.signaledValue = 1;
+				if (observed_recording && test == scenario::cancelled) cancel_accepted = predecessor->cancel_pending();
+			}
+			const auto stats = ctx.encoding_statistics();
+			if (predecessor && !observed_publication && predecessor->ready() && observed_recording &&
+				(draw ? stats.compute_encoders > first_compute : stats.render_encoders > first_encoders))
+			{
+				observed_publication = true;
+				if (test == scenario::revised)
+				{
+					std::array<std::byte, 4> guest_write;
+					store(guest_write, revised_pixel, 4);
+					memory->write({layout.range.address, guest_write.size()}, guest_write);
+				}
+			}
+			work();
+		};
+		surface_cache cache(ctx, memory, 8 << 20, budget, capture);
+		clear_engine clears(ctx);
+		const auto target = cache.acquire({layout.range.address, {4,4,1,format,false},16,{}});
+		const auto companion = draw ? cache.acquire({companion_layout.range.address, {4,4,1,format,false},16,{}}) : cached_surface_ref{};
+		if (resident)
+		{
+			cache.prepare(target);
+			cache.prepare(companion);
+		}
+		if (mixed || spilled) cache.clear(companion, 0xf0, 0xff765432, 0, 255, {0,0,4,4});
+		if (spilled) cache.spill(companion);
+		if (native_clear) cache.prepare(target);
+		if (deferred_spill_clear && !rejects_revision) cache.clear(target, 0xf0, 0xff765432, 0, 255, {0,0,4,4});
+		if (spilled_clear || deferred_spill_clear) cache.spill(target);
+		cached_surface_ref donor;
+		if (deferred)
+		{
+			donor = cache.acquire({0x4000, {4,4,1,format,false},16,{}});
+			cache.clear(donor, 0xf0, 0xff38495a, 0, 255, {0,0,4,4});
+			const auto area = spilled || deferred_guest || deferred_spill_clear ? clear_rectangle{0,0,1,2} : clear_rectangle{0,0,4,4};
+			cache.defer_copy(donor, area, deferred_clear ? target : companion, 0, 0);
+		}
+		const bool rewrites_donor = deferred && test != scenario::alias;
+		const auto prior = rewrites_donor ? donor : cache.acquire({test == scenario::alias ? layout.range.address : 0x3000u,
+			{2,4,1,format,false},16,{}});
+		const auto prior_before = cache.status(prior);
+		const auto target_before = cache.status(target);
+		const auto companion_before = companion ? cache.status(companion) : cached_surface_status{};
+		auto previous_batch = cache.batch_draws();
+		cache.draw(std::array{cached_surface_use{prior, true}}, [&](context& commands, auto)
+		{
+			commands.wait_event(gate, 1);
+		});
+		cache.clear(prior, stencil ? 2 : 0xf0, 0xff112233, 0x33, 255, {0,0,rewrites_donor ? 4u : 2u,4});
+		const auto old = ctx.recording_submission();
+		previous_batch.submit();
+		predecessor = old;
+		first_encoders = ctx.encoding_statistics().render_encoders;
+		first_compute = ctx.encoding_statistics().compute_encoders;
+		const auto before = cache.transaction_statistics();
+		const bool blocks = test == scenario::timeout || test == scenario::alias || test == scenario::one_slot;
+		cache.set_wait_timeout(blocks ? 2ms : 2s);
+		auto next_batch = cache.batch_draws();
+		const auto area = partial ? clear_rectangle{1,1,2,2} : clear_rectangle{0,0,4,4};
+		unsigned draw_calls = 0;
+		const auto clear = [&]
+		{
+			if (!draw)
+			{
+				cache.clear(target, stencil ? 2 : 0xf0, 0xff345678, 8, stencil ? 0x0f : 255, area);
+				return;
+			}
+			const auto requirements = std::array{*clear_engine::upload_for(format, 0xf0, 255, false)};
+			const auto plan = ctx.prepare_uploads(requirements);
+			cache.draw(std::array{cached_surface_use{target, true}, cached_surface_use{companion, true}},
+				[&](context& commands, auto images)
+				{
+					++draw_calls;
+					require(!predecessor || (predecessor->ready() && cache.status(prior).initialized),
+						"Draw callback ran before predecessor publication");
+					clear_request request;
+					request.colors[0] = {{images[0], 0, 0}, surface_color::argb8};
+					request.colors[1] = {{images[1], 0, 0}, surface_color::argb8};
+					request.mask = 0xf0;
+					request.color_value = 0xff345678;
+					request.rectangle = area;
+					commands.with_uploads(plan, [&] { (void)clears.run(commands, request); });
+				});
+		};
+		bool timed_out = false, cancelled = false, rejected_revision = false;
+		try { clear(); }
+		catch (const submission_wait_timeout&) { timed_out = true; }
+		catch (const surface_conflict_error&) { if (!rejects_revision) throw; rejected_revision = true; }
+		catch (const std::runtime_error&) { if (test != scenario::cancelled) throw; cancelled = true; }
+		const bool overlaps = test != scenario::alias && test != scenario::one_slot;
+		const auto encoded = ctx.encoding_statistics().render_encoders - first_encoders;
+		const bool discards = test == scenario::timeout || test == scenario::cancelled || test == scenario::revised;
+		const auto staged = ctx.encoding_statistics().compute_encoders - first_compute;
+		const unsigned attempts = unsigned(overlaps) + unsigned(test == scenario::revised && !rejects_revision);
+		const unsigned rendered = draw ? unsigned(test == scenario::success || test == scenario::revised) : attempts;
+		const auto prepared = cache.transaction_statistics();
+		const auto target_after = cache.status(target);
+		require(timed_out == blocks && cancelled == (test == scenario::cancelled) && observed_recording == overlaps &&
+			rejected_revision == rejects_revision &&
+			encoded == rendered && staged == (partial ? attempts : 0) && (!draw || draw_calls == rendered) &&
+			prepared.cancelled_draw_batches == before.cancelled_draw_batches + unsigned(discards) &&
+			prepared.submitted == before.submitted && target_after.initialized == target_before.initialized &&
+			target_after.content_generation == target_before.content_generation && target_after.deferred_copies == target_before.deferred_copies &&
+			target_after.spilled == target_before.spilled,
+			"Early target preparation did not record privately, retry a changed revision, or respect the alias/slot boundary");
+		if (resident_clear)
+			require(prepared.native_version_blits - before.native_version_blits == unsigned(overlaps),
+				"Early partial clear did not preserve the resident allocation through a native copy");
+		if (draw)
+		{
+			const auto companion_after = cache.status(companion);
+			const unsigned expected_blits = mixed ? attempts : resident ? unsigned(overlaps) * 2 + unsigned(test == scenario::revised) : 0;
+			require(prepared.native_version_blits - before.native_version_blits == expected_blits &&
+				companion_after.content_generation == companion_before.content_generation && companion_after.dirty == companion_before.dirty &&
+				companion_after.spilled == companion_before.spilled && companion_after.deferred_copies == companion_before.deferred_copies,
+				"Early target preparation did not copy the resident versions privately");
+		}
+		if (test == scenario::cancelled)
+		{
+			require(cancel_accepted && cache.status(prior).initialized == prior_before.initialized &&
+				cache.status(prior).content_generation == prior_before.content_generation && !cache.status(target).faulted,
+				"Predecessor cancellation changed surface authority");
+			ctx.recover_completed_errors();
+		}
+		if (test == scenario::success || test == scenario::revised)
+			require(observed_publication && cache.status(prior).initialized, "Clear preceded its predecessor's publication");
+		predecessor.reset();
+		if (rejects_revision) cache.cancel_deferred_copies(target);
+		if (blocks || cancelled || rejects_revision)
+		{
+			gate.signaledValue = 1;
+			cache.set_wait_timeout(2s);
+			clear();
+		}
+		next_batch.finish();
+		auto expected = initial;
+		if (deferred_spill_clear && !rejects_revision)
+			for (unsigned i = 0; i < 16; ++i) store(std::span{expected}.subspan(i * 4, 4), 0xff765432, 4);
+		if (test == scenario::revised) store(std::span{expected}.first(4), revised_pixel, 4);
+		if (deferred_clear && !rejects_revision)
+			for (unsigned y = 0; y < 2; ++y)
+				store(std::span{expected}.subspan(y * 16, 4), 0xff38495a, 4);
+		if (test == scenario::alias)
+			for (unsigned y = 0; y < 4; ++y)
+				for (unsigned x = 0; x < 2; ++x)
+				{
+					auto word = std::span{expected}.subspan((y * 4 + x) * 4, 4);
+					if (stencil) word[3] = std::byte{0x33};
+					else store(word, 0xff112233, 4);
+				}
+		for (std::size_t y = area.y; y < area.y + area.height; ++y)
+			for (std::size_t x = area.x; x < area.x + area.width; ++x)
+			{
+				auto word = std::span{expected}.subspan((y * 4 + x) * 4, 4);
+				if (stencil) word[3] = (word[3] & std::byte{0xf0}) | std::byte{8};
+				else store(word, 0xff345678, 4);
+			}
+		require(std::ranges::equal(cache.cpu_read(layout.range).bytes, expected), "Early clear changed guest pixel bytes");
+		if (draw)
+		{
+			auto companion_expected = initial;
+			if (mixed || spilled)
+				for (unsigned i = 0; i < 16; ++i) store(std::span{companion_expected}.subspan(i * 4, 4), 0xff765432, 4);
+			if (deferred)
+				for (unsigned y = 0; y < (spilled || deferred_guest ? 2u : 4u); ++y)
+					for (unsigned x = 0; x < (spilled || deferred_guest ? 1u : 4u); ++x)
+						store(std::span{companion_expected}.subspan((y * 4 + x) * 4, 4), 0xff38495a, 4);
+			for (std::size_t y = area.y; y < area.y + area.height; ++y)
+				for (std::size_t x = area.x; x < area.x + area.width; ++x)
+					store(std::span{companion_expected}.subspan((y * 4 + x) * 4, 4), 0xff345678, 4);
+			require(draw_calls == 1 && std::ranges::equal(cache.cpu_read(companion_layout.range).bytes, companion_expected),
+				"Early draw lost its second target or consumed the upload plan twice");
+		}
+	}
+	if (draw)
+	{
+		const auto label = deferred_guest ? "deferred guest draw" : deferred ? (spilled ? "deferred spill draw" : "deferred draw") :
+			spilled ? "spilled draw" : mixed ? "mixed draw" : resident ? "resident draw" : "draw";
+		std::cout << "Early " << label
+			<< " target recording: six gated strict-context profiles, 768 exact guest bytes across two targets, single-use draw upload after predecessor publication passed\n";
+		return;
+	}
+	if (native_clear)
+	{
+		const auto label = resident_clear ? "resident" : spilled_clear ? "spilled" : "deferred spill";
+		std::cout << "Early native " << label << " partial clear: " << (deferred_spill_clear ? 5 : 6)
+			<< " gated profiles, " << (deferred_spill_clear ? 320 : 384) << " exact guest bytes passed\n";
+		return;
+	}
+	if (deferred_clear)
+	{
+		std::cout << "Early deferred guest partial clear: five gated profiles, 320 exact guest bytes, stale deferred revision rejected before retry passed\n";
+		return;
+	}
+	std::cout << "Early " << (stencil ? "partial stencil" : partial ? "partial color" : "full")
+		<< " clear recording: six gated strict-context profiles, 384 exact guest bytes, success, timeout, cancellation, revision retry, alias and slot boundaries passed\n";
+}
+
+void full_clear_batch_targets()
+{
+	for (unsigned profile = 0; profile < 5; ++profile)
+	{
+		context ctx(2);
+		auto memory = std::make_shared<memory_fixture>();
+		surface_cache cache(ctx, memory, 8 << 20);
+		const bool depth = profile == 1, spilled = profile == 2, deferred = profile == 3, cancel = profile == 4;
+		const surface_format format = depth ? surface_format{surface_depth::z24s8_float} : surface_format{surface_color::argb8};
+		const auto layout = plan_guest_surface(0x1000,4,4,4,17);
+		std::vector<std::byte> bytes(layout.range.size, std::byte{0xa5});
+		memory->write(layout.range, bytes);
+		const auto target = cache.acquire({0x1000,{4,4,1,format,false},17,{}});
+		const auto prefix = cache.acquire({0x3000,{4,4,1,surface_color::argb8,false},16,{}});
+		const auto companion = cache.acquire({0x4000,{4,4,1,surface_color::argb8,false},16,{}});
+		cache.clear(prefix, 0xf0, 0xff102030, 0, 255, {0,0,4,4});
+		if (spilled)
+		{
+			cache.clear(target, 0xf0, 0xff112233, 0, 255, {0,0,4,4});
+			cache.spill(target);
+		}
+		if (deferred)
+			cache.defer_copy(prefix, {0,0,2,2}, target, 0, 0);
+		const auto before = cache.status(target);
+		const auto stats = cache.transaction_statistics();
+		const auto gate = [ctx.device() newSharedEvent];
+		struct unblock { id<MTLSharedEvent> gate; ~unblock() { gate.signaledValue = 1; } } release{gate};
+		auto batch = cache.batch_draws();
+		cache.draw(std::array{cached_surface_use{prefix,true}},
+			[&](context& commands, auto) { commands.wait_event(gate, 1); });
+		const auto token = ctx.recording_submission();
+		cache.clear(target, depth ? 3 : 0xf0, 0xff234567, 0xffffff2a, 255, {0,0,4,4});
+		cache.clear(companion, 0xf0, 0xff345678, 0, 255, {0,0,4,4});
+		cache.clear(target, depth ? 2 : 0xf0, 0xffaabbcc, 0x35, 255, {1,1,2,2});
+		const auto recording = cache.status(target);
+		require(token.same_batch(ctx.recording_submission()) && cache.transaction_statistics().submitted == stats.submitted &&
+			recording.initialized == before.initialized && recording.spilled == before.spilled &&
+			recording.deferred_copies == before.deferred_copies && recording.content_generation == before.content_generation,
+			"Full clear split the prefix or published provisional target state");
+		batch.submit();
+		cache.set_wait_timeout(std::chrono::milliseconds(1));
+		bool read_waited = false, draw_waited = false, clear_waited = false, miss_waited = false, encoded = false;
+		try { (void)cache.cpu_read(layout.range); } catch (const submission_wait_timeout&) { read_waited = true; }
+		{
+			auto next = cache.batch_draws();
+			require(cache.acquire(cache.description(target)) == target && cache.acquire(cache.description(companion)) == companion,
+				"Descriptor hit could not prepare the next batch during GPU work");
+			cache.clear(target, depth ? 3 : 0xf0, 0, 0, 255, {4,4,1,1});
+			const std::array uses{cached_surface_use{target, true}};
+			try { cache.draw(uses, [&](auto&, auto) { encoded = true; }); } catch (const submission_wait_timeout&) { draw_waited = true; }
+			try { cache.clear(target, depth ? 3 : 0xf0, 0, 0, 255, {0,0,4,4}); } catch (const submission_wait_timeout&) { clear_waited = true; }
+			try { (void)cache.acquire({0x5000,{4,4,1,surface_color::argb8,false},16,{}}); } catch (const submission_wait_timeout&) { miss_waited = true; }
+			next.submit();
+		}
+		cache.set_wait_timeout(std::chrono::seconds(30));
+		const auto pending = cache.status(target);
+		require(read_waited && draw_waited && clear_waited && miss_waited && !encoded && !cache.poll_submitted() && pending.pending &&
+			pending.content_generation == before.content_generation && memory->read_surface(layout).bytes == bytes,
+			"CPU read or next draw bypassed a pending full clear");
+		bool rejected = false;
+		if (cancel)
+		{
+			require(token.cancel_pending(), "Full clear escaped cancellation");
+			try { cache.synchronize(); } catch (const submission_wait_timeout&) { throw; } catch (const std::runtime_error&) { rejected = true; }
+		}
+		else
+		{
+			gate.signaledValue = 1;
+			token.wait();
+			require(cache.poll_submitted() && !cache.status(target).pending, "Completed full clear did not retire during polling");
+		}
+		const auto state = cache.status(target);
+		require(cache.transaction_statistics().submitted == stats.submitted + 1 &&
+			rejected == cancel && state.initialized == !cancel && state.dirty == !cancel && !state.faulted &&
+			!state.spilled && state.deferred_copies == 0 && state.content_generation == before.content_generation + (cancel ? 0u : 2u) &&
+			cache.status(companion).initialized == !cancel && memory->read_surface(layout).bytes == bytes,
+			"Full-clear batch published incomplete authority");
+		if (cancel) { ctx.recover_completed_errors(); continue; }
+		const auto actual = cache.cpu_read(layout.range).bytes;
+		for (unsigned y = 0; y < 4; ++y)
+			for (unsigned x = 0; x < 4; ++x)
+			{
+				const bool partial = x >= 1 && x <= 2 && y >= 1 && y <= 2;
+				const auto value = depth ? (partial ? 0x7f000035u : 0x7f00002au) : (partial ? 0xffaabbccu : 0xff234567u);
+				store(std::span{bytes}.subspan(y * 17 + x * 4, 4), value, 4);
+			}
+		require(actual == bytes, "Full-clear batch changed exact pixels, aspect or padding");
+		cache.flush(companion);
+		std::array<std::byte,64> companion_bytes;
+		for (unsigned i = 0; i < 16; ++i) store(std::span{companion_bytes}.subspan(i * 4, 4), 0xff345678, 4);
+		const auto actual_companion = memory->read({0x4000,64}).bytes;
+		require(std::ranges::equal(actual_companion, companion_bytes), "Full-clear batch changed its second attachment");
+	}
+	std::cout << "Clear batch preparation: descriptor hits and empty clears returned; CPU read, draw, writing clear and descriptor miss waited; four exact attachment profiles and cancellation passed\n";
+}
+
+int main(int argc,char** argv)
 {
 	std::cout.setf(std::ios::unitbuf);
 	@autoreleasepool
 	{
 		try
 		{
+			if(argc==2&&std::string_view(argv[1])=="typed-timeouts"){typed_wait_timeout_completion();return 0;}
+			if(argc==2&&std::string_view(argv[1])=="cold-draw-targets"){draw_target_loads(false);return 0;}
+			if(argc==2&&std::string_view(argv[1])=="prefetched-draw-targets"){prefetched_draw_targets();return 0;}
+			if(argc==2&&std::string_view(argv[1])=="prefetched-clear-targets"){prefetched_draw_targets(true);return 0;}
+			if(argc==2&&std::string_view(argv[1])=="spilled-draw-targets"){draw_target_loads(true);return 0;}
+			if(argc==2&&std::string_view(argv[1])=="deferred-draw-targets"){deferred_draw_targets();return 0;}
+			if(argc==2&&std::string_view(argv[1])=="clear-target-loads"){clear_target_loads();return 0;}
+			if(argc==2&&std::string_view(argv[1])=="deferred-reader-pressure"){deferred_reader_pressure();return 0;}
+			if(argc==2&&std::string_view(argv[1])=="resident-target-reload"){resident_target_reload();return 0;}
+			if(argc==2&&std::string_view(argv[1])=="full-clear-batch-targets"){full_clear_batch_targets();return 0;}
+			if(argc==2&&std::string_view(argv[1])=="overlapping-full-clear"){overlapping_target_recording(overlap_writer::full_clear);return 0;}
+			if(argc==2&&std::string_view(argv[1])=="overlapping-partial-clear")
+			{
+				overlapping_target_recording(overlap_writer::partial_color);
+				overlapping_target_recording(overlap_writer::partial_stencil);
+				return 0;
+			}
+			if(argc==2&&std::string_view(argv[1])=="overlapping-draw-targets"){overlapping_target_recording(overlap_writer::draw);return 0;}
+			if(argc==2&&std::string_view(argv[1])=="overlapping-resident-targets")
+			{
+				overlapping_target_recording(overlap_writer::mixed_draw);
+				overlapping_target_recording(overlap_writer::resident_draw);
+				return 0;
+			}
+			if(argc==2&&std::string_view(argv[1])=="overlapping-spilled-targets")
+			{
+				overlapping_target_recording(overlap_writer::spilled_draw);
+				overlapping_target_recording(overlap_writer::deferred_draw);
+				overlapping_target_recording(overlap_writer::deferred_spill_draw);
+				return 0;
+			}
+			if(argc==2&&std::string_view(argv[1])=="overlapping-deferred-guest-targets")
+			{
+				overlapping_target_recording(overlap_writer::deferred_guest_draw);
+				overlapping_target_recording(overlap_writer::deferred_guest_clear);
+				return 0;
+			}
+			if(argc==2&&std::string_view(argv[1])=="overlapping-native-clear-targets")
+			{
+				overlapping_target_recording(overlap_writer::resident_clear);
+				overlapping_target_recording(overlap_writer::spilled_clear);
+				overlapping_target_recording(overlap_writer::deferred_spill_clear);
+				return 0;
+			}
+			if(argc!=1)throw std::invalid_argument("Unknown native surface-cache test selection");
+			typed_wait_timeout_completion();
+			draw_target_loads(false);
+			prefetched_draw_targets();
+			prefetched_draw_targets(true);
+			draw_target_loads(true);
+			deferred_draw_targets();
+			clear_target_loads();
+			deferred_reader_pressure();
+			resident_target_reload();
+			full_clear_batch_targets();
+			overlapping_target_recording(overlap_writer::full_clear);
+			overlapping_target_recording(overlap_writer::partial_color);
+			overlapping_target_recording(overlap_writer::partial_stencil);
+			overlapping_target_recording(overlap_writer::draw);
+			overlapping_target_recording(overlap_writer::mixed_draw);
+			overlapping_target_recording(overlap_writer::resident_draw);
+			overlapping_target_recording(overlap_writer::spilled_draw);
+			overlapping_target_recording(overlap_writer::deferred_draw);
+			overlapping_target_recording(overlap_writer::deferred_spill_draw);
+			overlapping_target_recording(overlap_writer::deferred_guest_draw);
+			overlapping_target_recording(overlap_writer::deferred_guest_clear);
+			overlapping_target_recording(overlap_writer::resident_clear);
+			overlapping_target_recording(overlap_writer::spilled_clear);
+			overlapping_target_recording(overlap_writer::deferred_spill_clear);
 			atomic_cpu_writers();
 			atomic_publication();
 			backing_lifetime();

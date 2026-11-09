@@ -1,4 +1,5 @@
 #include "M4Display.h"
+#include "M4Frame.h"
 #include "M4GuestCoverage.h"
 #include "M4GuardedGuestMemory.h"
 #include "M4MemoryPressure.h"
@@ -110,6 +111,124 @@ void fill(memory& ram, unsigned offset, unsigned red = 32)
 	for (unsigned y = 0; y < 2; ++y) for (unsigned x = 0; x < 2; ++x)
 		for (unsigned b = 0; b < 4; ++b) ram.bytes[offset + y * 24 + x * 4 + b] = std::byte(std::array{0u,red,64u,128u}[b]);
 	++ram.version;
+}
+void queued_frame_uploads()
+{
+	using namespace metal4;
+	using namespace std::chrono_literals;
+	enum class scenario { mono, fsr, revision, cancelled, stereo, stereo_alias, stereo_native, stereo_native_alias,
+		stereo_mixed, stereo_cancelled };
+	for (const auto test : {scenario::mono, scenario::fsr, scenario::revision, scenario::cancelled,
+		scenario::stereo, scenario::stereo_alias, scenario::stereo_native, scenario::stereo_native_alias,
+		scenario::stereo_mixed, scenario::stereo_cancelled})
+	{
+		const bool stereo = test >= scenario::stereo;
+		const bool native_alias = test == scenario::stereo_native_alias;
+		const bool alias = native_alias || test == scenario::stereo_alias;
+		const bool left_native = native_alias || test == scenario::stereo_native || test == scenario::stereo_mixed;
+		const bool right_native = native_alias || test == scenario::stereo_native;
+		const bool cancelled = test == scenario::cancelled || test == scenario::stereo_cancelled;
+		context ctx(2, 64, 1s, context::recording_overlap::explicit_predecessor);
+		const auto budget = std::make_shared<heap_budget>(ctx, 8u << 20);
+		ctx.set_buffer_budget(budget);
+		const auto ram = std::make_shared<memory>();
+		fill(*ram, 0x100);
+		if (stereo) fill(*ram, 0x200, 96);
+		bool reject_right = false;
+		const auto translate = [&](unsigned offset, unsigned, std::size_t)
+		{
+			if (offset == 0x200 && reject_right) throw std::out_of_range("Injected right-eye translation failure");
+			if (offset == 0x200 && native_alias) return 0x2100u;
+			return 0x1000u + offset;
+		};
+		surface_cache surfaces(ctx, ram, 8u << 20, budget);
+		display_resolver resolver(ctx, ram, translate, budget, 4096);
+		native_frame frame(ctx);
+		display_snapshot source{0x100, 2, 2, 24};
+		if (stereo) source.right_offset = test == scenario::stereo_alias ? 0x100 : 0x200;
+		const auto set_native = [&](unsigned address, std::uint32_t color)
+		{
+			const auto surface = surfaces.acquire({address, {2, 2, 1, surface_color::argb8, false}, 24, {}});
+			surfaces.clear(surface, 0xf0, color, 0, 255, {0, 0, 2, 2});
+		};
+		if (left_native) set_native(0x1100, 0xff204080);
+		if (right_native && !native_alias) set_native(0x1200, 0xff604080);
+		surfaces.synchronize();
+		if (test == scenario::stereo)
+		{
+			reject_right = true;
+			rejects([&] { (void)resolver.prepare_frame(source, surfaces); });
+			require(ram->reads == 1 && !ctx.last_submission() && resolver.statistics().uploads == 0,
+				"Second-eye preparation failure submitted or published the first eye");
+			reject_right = false;
+		}
+		const auto gate = [ctx.device() newSharedEvent];
+		struct release_gate { id<MTLSharedEvent> event; ~release_gate() { event.signaledValue = 1; } } release{gate};
+		const auto upload = resolver.prepare_frame(source, surfaces, std::array{display_upload_dependency{gate, 1}});
+		const auto image = upload.image_for_encoding();
+		require(image.uploads[0] && !image.uploads[0]->ready() && bool(image.right_eye) == stereo &&
+			bool(image.uploads[1]) == stereo && (!stereo || image.uploads[0]->same_batch(*image.uploads[1])) &&
+			resolver.statistics().entries == 0, "Pending display lost an eye, dependency or cache boundary");
+		if (stereo) require((image.texture == image.right_eye->texture) == alias, "Stereo alias reuse changed");
+		const auto vm_uploads = unsigned(!left_native) + unsigned(stereo && !right_native && !alias);
+		require(resolver.statistics().uploads == vm_uploads &&
+			resolver.statistics().native_submissions == unsigned(left_native || right_native), "Stereo repeated an upload or native submission");
+		frame_policy policy{{stereo ? 4u : 2u, 2}, stereo ? 2.0 : 1.0};
+		policy.stretch = stereo;
+		policy.stereo.mode = stereo ? stereo_mode::side_by_side : stereo_mode::disabled;
+		policy.fsr = test == scenario::fsr;
+		const auto width = stereo ? 4u : 2u;
+		auto descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+			width:width height:2 mipmapped:NO];
+		descriptor.storageMode = MTLStorageModePrivate;
+		descriptor.usage = MTLTextureUsageRenderTarget;
+		const auto target = make_texture(ctx, descriptor);
+		const auto output = make_buffer(ctx, width * 8, buffer_storage::shared);
+		std::memset(output.contents, 0x69, output.length);
+		begin_present_commands(ctx, &image);
+		frame.encode(image, target, policy);
+		texture_to_buffer(ctx, target, {0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(width, 2, 1)}, output, 0);
+		const auto work = ctx.submit();
+		require(!work.ready() && !upload.ready() && resolver.statistics().entries == 0,
+			"Frame recording waited for display upload or published it early");
+		if (test == scenario::revision)
+		{
+			fill(*ram, 0x100, 17);
+			rejects([&] { (void)upload.image_for_encoding(); });
+		}
+		if (cancelled)
+			require(upload.cancel_pending(), "Gated display upload was already committed");
+		gate.signaledValue = 1;
+		if (cancelled)
+		{
+			rejects([&] { work.wait(); });
+			rejects([&] { (void)upload.finish(); });
+			require(resolver.statistics().entries == 0 &&
+				std::ranges::all_of(map_buffer(output, 0, width * 8), [](std::byte byte) { return byte == std::byte{0x69}; }),
+				"Cancelled display upload committed its dependent frame or cache entry");
+			continue;
+		}
+		work.wait();
+		const auto pixels = map_buffer(output, 0, width * 8);
+		for (unsigned y = 0; y < 2; ++y)
+			for (unsigned x = 0; x < width; ++x)
+				verify(pixels.subspan((y * width + x) * 4, 4), {128, 64, x >= 2 && !alias ? 96u : 32u, 255});
+		if (test == scenario::revision)
+		{
+			rejects([&] { (void)upload.finish(); });
+			require(resolver.statistics().entries == 0, "Late display VM revision published the frozen upload");
+			const auto fresh = resolver.prepare_frame(source, surfaces).finish();
+			require(fresh.texture != image.texture, "Fresh display captured the stale image");
+		}
+		else
+		{
+			const auto confirmed = upload.finish();
+			require(confirmed.texture == image.texture && !confirmed.uploads[0] &&
+				resolver.statistics().entries == vm_uploads, "Display retirement lost a completed eye or kept a queue dependency");
+		}
+		require(!frame.attached() && ram->writes == 0, "Offscreen display created a surface attachment or wrote VM");
+	}
+	std::cout << "Queued display frames: ten gated two-slot profiles, 208 exact BGRA bytes, stereo VM/native/mixed/aliases, rollback and cancellation\n";
 }
 void job_and_cache_cases()
 {
@@ -756,6 +875,7 @@ int main()
 	{
 		try
 		{
+			queued_frame_uploads();
 			job_and_cache_cases();
 			native_job_cases();
 			native_generation_and_bound_cases();

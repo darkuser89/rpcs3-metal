@@ -29,6 +29,8 @@ void fill_buffer(context& ctx, id<MTLBuffer> buffer, std::size_t offset, std::si
 // callers must not use returned table handles beyond their submission lifetime.
 class bindings final
 {
+	friend class context;
+	friend class vertex_shader;
 
 	struct buffer_binding
 	{

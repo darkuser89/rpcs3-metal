@@ -33,9 +33,25 @@ class surface_depth_transfer final
 {
 	id<MTLDevice> m_device;
 	id<MTLComputePipelineState> m_pipeline;
+	id<MTLComputePipelineState> m_patch_pipeline;
 	void convert(context& ctx, surface_depth format, std::size_t width, std::size_t height,
 				 id<MTLBuffer> guest, surface_byte_region bytes, const depth_transfer_plane& depth,
-				 const depth_transfer_plane& stencil, bool gather) const;
+				 const depth_transfer_plane& stencil, bool gather, id<MTLBuffer> prepared = nil) const;
+
+	friend class guest_texture_resolver;
+	friend class surface_banked_transfer;
+	struct transfer_storage
+	{
+		depth_transfer_plane depth, stencil;
+		id<MTLBuffer> uniforms;
+	};
+	[[nodiscard]] transfer_storage prepare_transfer(context& ctx, surface_depth format, id<MTLBuffer> guest,
+		surface_byte_region bytes, const texture_region& region, bool gather) const;
+	void upload_impl(context& ctx, surface_depth format, id<MTLBuffer> guest, surface_byte_region bytes,
+		id<MTLTexture> texture, const texture_region& region, const transfer_storage* prepared,
+		texture_plane plane = texture_plane::all) const;
+	void download_impl(context& ctx, surface_depth format, id<MTLTexture> texture, const texture_region& region,
+		id<MTLBuffer> guest, surface_byte_region bytes, const transfer_storage* prepared) const;
 
   public:
 	explicit surface_depth_transfer(context& ctx);
@@ -46,8 +62,16 @@ class surface_depth_transfer final
 				const depth_transfer_plane& depth, const depth_transfer_plane& stencil,
 				id<MTLBuffer> guest, surface_byte_region bytes) const;
 	void upload(context& ctx, surface_depth format, id<MTLBuffer> guest, surface_byte_region bytes,
-				id<MTLTexture> texture, const texture_region& region) const;
+				id<MTLTexture> texture, const texture_region& region, texture_plane plane = texture_plane::all) const;
 	void download(context& ctx, surface_depth format, id<MTLTexture> texture, const texture_region& region,
 				  id<MTLBuffer> guest, surface_byte_region bytes) const;
+	// Byte mask uses the same guest offset/pitch as guest. Pixels with no
+	// selected depth byte retain raw native depth; stencil follows its own
+	// byte mask. Any selected depth byte replaces that pixel's depth from
+	// the assembled guest word.
+	// Z24U patch writes choose a representable value that gathers to the
+	// exact requested integer. Ordinary upload keeps its existing rounding.
+	void patch(context& ctx, surface_depth format, id<MTLBuffer> guest, id<MTLBuffer> mask,
+		surface_byte_region bytes, id<MTLTexture> texture, const texture_region& region) const;
 };
 } // namespace metal4

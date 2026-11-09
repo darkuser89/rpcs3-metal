@@ -41,6 +41,25 @@ using null_texture_family = std::array<resolved_fragment_texture, 4>;
 	return image;
 }
 
+[[nodiscard]] inline decoded_texture_state checked_fragment_texture_state(const fragment_texture_registers& words,
+	const texture_cache_state& metadata, const texture_state_overrides& overrides = {})
+{
+	const auto state = decode_fragment_texture_state(words, metadata, overrides);
+	if ((state.coordinates.flags & texture_coordinate_msaa_window) && state.samples == 1)
+		throw std::invalid_argument("Multisample window requires a native multisample image");
+	const bool sample_raster = state.coordinates.flags & texture_coordinate_sample_raster;
+	if ((sample_raster && state.samples != 1) || (!sample_raster && state.samples != 1 && state.samples != 2 && state.samples != 4) ||
+		((sample_raster || state.samples > 1) && (
+		state.policy.dimension != vertex_texture_dimension::two || metadata.actual_mips != 1 ||
+		!supports_direct_msaa_sampling(words, state.redirected))))
+		throw std::invalid_argument("Direct MSAA requires a supported single-level native 2D sampling mode");
+	if (state.redirected && (state.policy.dimension != vertex_texture_dimension::two || metadata.actual_mips != 1 ||
+		(metadata.source_depth_format != 2 && metadata.source_depth_format != 4) ||
+		metadata.depth_float != (metadata.source_depth_format == 4)))
+		throw std::invalid_argument("Redirected texture requires a single-level native 2D D24S8 snapshot");
+	return state;
+}
+
 // The cache resolves addresses/layout/resources using the frozen words,
 // including OFFSET and CONTROL3 pitch. All requested units are prepared into
 // local candidates; a failure publishes neither partial options nor inputs.
@@ -49,7 +68,8 @@ using null_texture_family = std::array<resolved_fragment_texture, 4>;
 template <typename Resolve>
 void apply_fragment_texture_snapshot(const fragment_texture_snapshot& snapshot, Resolve&& resolve,
 									 context& ctx, sampler_cache& samplers, fragment_program_options& options, fragment_inputs& inputs,
-									 const texture_state_overrides& overrides = {}, const null_texture_family* nulls = nullptr)
+									 const texture_state_overrides& overrides = {}, const null_texture_family* nulls = nullptr,
+									 border_texture_preparation* preparation = nullptr)
 {
 	auto candidate_options = options;
 	auto candidate_inputs = inputs;
@@ -67,13 +87,14 @@ void apply_fragment_texture_snapshot(const fragment_texture_snapshot& snapshot, 
 			continue;
 		}
 		const auto resource = resolve(unit, words);
-		const auto state = decode_fragment_texture_state(words, resource.metadata, overrides);
-		if (state.redirected || state.samples != 1)
-			throw std::invalid_argument("Frozen native texture binding needs redirected/MSAA sampling emulation");
+		const auto state = checked_fragment_texture_state(words, resource.metadata, overrides);
 		configure_fragment_texture_state(candidate_options, unit, state);
-		candidate_inputs.set_texture_state(unit, resource.texture, samplers, state);
-		validate_sampled_texture(ctx, candidate_inputs.textures[unit], candidate_inputs.samplers[unit], state.policy.dimension,
-								 candidate_inputs.sampling[unit], state.shadow, state.depth && !state.shadow && !state.redirected);
+		candidate_inputs.set_texture_state(unit, resource.texture, samplers, state, preparation);
+		const auto storage_dimension = state.coordinates.border_atlas[3] & border_atlas_one_dimensional ?
+			vertex_texture_dimension::two : state.policy.dimension;
+		validate_sampled_texture(ctx, candidate_inputs.textures[unit], candidate_inputs.samplers[unit], storage_dimension,
+			candidate_inputs.sampling[unit], state.shadow, state.depth && !state.shadow,
+			state.coordinates.border_atlas[3] & border_atlas_cube, state.samples);
 	}
 	options = std::move(candidate_options);
 	inputs = std::move(candidate_inputs);

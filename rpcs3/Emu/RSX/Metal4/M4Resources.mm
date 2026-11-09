@@ -78,10 +78,7 @@ void copy_buffer(context& ctx, id<MTLBuffer> source, std::size_t source_offset,
 	{
 		throw std::invalid_argument("Metal 4 buffer blits cannot overlap");
 	}
-	ctx.use_resource(source);
-	ctx.use_resource(destination);
-	auto encoder = ctx.compute();
-	ctx.barrier(MTLStageDispatch | MTLStageBlit, MTLStageBlit);
+	auto encoder = ctx.checked_blit({source, source_offset, size}, {destination, destination_offset, size});
 	[encoder copyFromBuffer:source sourceOffset:source_offset toBuffer:destination destinationOffset:destination_offset size:size];
 }
 
@@ -90,9 +87,7 @@ void fill_buffer(context& ctx, id<MTLBuffer> buffer, std::size_t offset, std::si
 	validate_range(buffer, offset, size);
 	if (size == 0)
 		return;
-	ctx.use_resource(buffer);
-	auto encoder = ctx.compute();
-	ctx.barrier(MTLStageDispatch | MTLStageBlit, MTLStageBlit);
+	auto encoder = ctx.checked_blit({}, {buffer, offset, size});
 	[encoder fillBuffer:buffer range:NSMakeRange(offset, size) value:value];
 }
 

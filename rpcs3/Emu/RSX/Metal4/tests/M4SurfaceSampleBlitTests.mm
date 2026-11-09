@@ -1,4 +1,5 @@
 #include "M4SurfaceSampleBlit.h"
+#include "M4HeapBudget.h"
 
 #include <algorithm>
 #include <iostream>
@@ -43,6 +44,7 @@ class fixture
 	sample_transfer samples;
 	surface_color_transfer colors;
 	surface_depth_transfer depths;
+	std::size_t bounded_bytes = 0;
 	explicit fixture(context& ctx) : ctx(ctx), blitter(ctx), samples(ctx), colors(ctx), depths(ctx) {}
 	void upload(surface_format format, id<MTLBuffer> buffer, id<MTLTexture> target, texture_region area)
 	{
@@ -59,23 +61,44 @@ class fixture
 			depths.download(ctx, std::get<surface_depth>(format), source, area, buffer, {});
 	}
 	void check(surface_format sf, surface_format df, unsigned sc, unsigned dc, unsigned flip, bool typeless,
-			   texture_plane plane = texture_plane::all, bool partial = false)
+			   texture_plane plane = texture_plane::all, bool partial = false, bool bounded = false, bool overlap = false, bool gated = false)
 	{
 		const auto sb = surface_guest_bytes(sf), db = surface_guest_bytes(df);
-		const std::size_t sw = partial ? 8 : 16 / sb, sh = partial ? 6 : 3;
-		const std::size_t dw = partial ? 9 : 16 / db + 2, dh = partial ? 7 : 4;
+		const std::size_t sw = bounded ? 512 : partial ? 8 : 16 / sb, sh = bounded ? 256 : partial ? 6 : 3;
+		const std::size_t dw = overlap ? sw : bounded ? 514 : partial ? 9 : 16 / db + 2, dh = overlap ? sh : bounded ? 258 : partial ? 7 : 4;
 		const auto a = grid(sc), b = grid(dc);
-		const auto source = texture(ctx, sf, sw, sh, sc), target = texture(ctx, df, dw, dh, dc);
+		const auto source = texture(ctx, sf, sw, sh, sc), target = overlap ? source : texture(ctx, df, dw, dh, dc);
 		const auto input_image = sc == 1 ? source : texture(ctx, sf, sw * a.x, sh * a.y, 1);
-		const auto output_image = dc == 1 ? target : texture(ctx, df, dw * b.x, dh * b.y, 1);
+		const auto output_image = overlap ? input_image : dc == 1 ? target : texture(ctx, df, dw * b.x, dh * b.y, 1);
 		std::vector<std::byte> original(sw * a.x * sh * a.y * sb), initial(dw * b.x * dh * b.y * db, std::byte{0x44});
 		for (std::size_t i = 0; i < original.size(); ++i)
 			original[i] = static_cast<std::byte>(0x10 + (i * 7 + i / 11) % 0x50);
+		if (bounded && !typeless)
+			if (const auto color = std::get_if<surface_color>(&sf); color &&
+				(*color == surface_color::rgba16f || *color == surface_color::rgba32f || *color == surface_color::r32f))
+			{
+				const unsigned element = *color == surface_color::rgba16f ? 2 : 4;
+				constexpr std::array words{0u, 0x80000000u, 1u, 0x807fffffu, 0x00800000u, 0x7f800000u, 0xff800000u,
+					0x7fc12345u, 0xffc04321u, 0x7f812345u, 0xff804321u, 0x7f7fffffu};
+				const auto fill = [&](auto& bytes, unsigned seed)
+				{
+					for (unsigned i = 0; i < bytes.size() / element; ++i)
+					{
+						const auto word = element == 2 ? (i + seed) & 65535u : words[(i + seed) % words.size()];
+						for (unsigned c = 0; c < element; ++c) bytes[i * element + c] = std::byte(word >> (8 * (element - c - 1)));
+					}
+				};
+				fill(original, 0); fill(initial, 31745);
+			}
+		if (overlap) initial = original;
 		const auto input = make_upload(ctx, original), seed = make_upload(ctx, initial), output = make_buffer(ctx, initial.size(), buffer_storage::shared);
 		texture_region sa, da;
 		sa.size = MTLSizeMake(sw * a.x, sh * a.y, 1);
 		da.size = MTLSizeMake(dw * b.x, dh * b.y, 1);
+		const auto gate = gated ? [ctx.device() newSharedEvent] : nil;
+		struct release { id<MTLSharedEvent> event; ~release() { if (event) event.signaledValue = 1; } } release_gate{gate};
 		ctx.begin();
+		if (gate) ctx.wait_event(gate, 1);
 		upload(sf, input, input_image, sa);
 		upload(df, seed, output_image, da);
 		if (sc > 1)
@@ -92,11 +115,42 @@ class fixture
 			dr.origin = MTLOriginMake(2, 2, 0);
 			dr.size = MTLSizeMake(5, 4, 1);
 		}
-		blitter.nearest(ctx, sf, source, sr, df, target, dr, plane, {bool(flip & 1), bool(flip & 2), false}, typeless);
+		const auto encode = [&]
+		{
+			const auto run = [&](auto& helper) { helper.nearest(ctx, sf, source, sr, df, target, dr, plane, {bool(flip & 1), bool(flip & 2), false}, typeless); };
+			if (gated) { surface_sample_blitter temporary(ctx); run(temporary); }
+			else run(blitter);
+		};
+		if (bounded)
+		{
+			ctx.submit().wait();
+			@autoreleasepool
+			{
+				const auto ledger = ctx.buffer_ledger();
+				const auto before = ledger->statistics();
+				constexpr std::size_t headroom = 128u << 10;
+				require(before.budget - before.reserved_bytes > headroom, "Window blit fixture has no pressure headroom");
+				const auto blocker = ledger->shared_buffer(((before.budget - before.reserved_bytes - headroom) / 16384) * 16384);
+				const auto limited = ledger->statistics();
+				require(blocker && limited.budget - limited.reserved_bytes == headroom,
+					"Window blit fixture did not bound its actual native ledger");
+				ctx.begin(); encode(); ctx.submit().wait();
+			}
+			ctx.begin();
+		}
+		else encode();
 		if (dc > 1)
 			samples.expand(ctx, target, output_image);
 		download(df, output_image, da, output);
-		ctx.submit().wait();
+		const auto work = ctx.submit();
+		if (gate)
+		{
+			bool timed_out = false;
+			try { work.wait(std::chrono::milliseconds(1)); } catch (const submission_wait_timeout&) { timed_out = true; }
+			require(timed_out && !work.ready(), "Sample-window lifetime case has no real pending dependency");
+			gate.signaledValue = 1;
+		}
+		work.wait();
 		auto expected = initial;
 		const auto width = sr.size.width * a.x * sb / db, height = sr.size.height * a.y;
 		for (std::size_t y = 0; y < dr.size.height * b.y; ++y)
@@ -110,6 +164,7 @@ class fixture
 						expected[to + byte] = original[from + byte];
 			}
 		const auto actual = map_buffer(output, 0, output.length);
+		if (bounded) bounded_bytes += actual.size();
 		if (!std::equal(actual.begin(), actual.end(), expected.begin()))
 		{
 			const auto mismatch = std::mismatch(actual.begin(), actual.end(), expected.begin());
@@ -128,6 +183,66 @@ class fixture
 		}
 	}
 };
+void bounded_windows()
+{
+	context ctx(1);
+	auto ledger = std::make_shared<heap_budget>(ctx, 128u << 20);
+	ctx.set_buffer_budget(ledger);
+	fixture f(ctx);
+	const std::array counts{std::array{1u, 4u}, std::array{2u, 4u}, std::array{4u, 2u}, std::array{4u, 1u}};
+	unsigned regular = 0, casts = 0, planes = 0, overlaps = 0;
+	for (const auto format : formats)
+		for (unsigned c = 0; c < counts.size(); ++c)
+			@autoreleasepool
+			{
+				f.check(format, format, counts[c][0], counts[c][1], c, false, texture_plane::all, true, true); ++regular;
+			}
+	const std::array pairs{
+		std::pair{surface_format{surface_color::rgba32f}, surface_format{surface_color::argb8}},
+		std::pair{surface_format{surface_color::rgb565}, surface_format{surface_color::rgba16f}},
+		std::pair{surface_format{surface_depth::z24s8_uint}, surface_format{surface_depth::z24s8_float}},
+		std::pair{surface_format{surface_depth::z24s8_float}, surface_format{surface_color::argb8}},
+		std::pair{surface_format{surface_color::argb8}, surface_format{surface_depth::z24s8_float}},
+		std::pair{surface_format{surface_color::rgba16f}, surface_format{surface_color::gb8}}};
+	for (const auto& [source, target] : pairs)
+		for (const auto& count : counts)
+			for (unsigned flip : {0u, 1u, 2u, 3u})
+				@autoreleasepool
+				{
+					f.check(source, target, count[0], count[1], flip, true, texture_plane::all, true, true); ++casts;
+				}
+	for (const auto format : {surface_depth::z24s8_uint, surface_depth::z24s8_float})
+		for (const auto& count : counts)
+			for (const auto plane : {texture_plane::depth, texture_plane::stencil})
+				@autoreleasepool
+				{
+					f.check(format, format, count[0], count[1], 3, false, plane, true, true); ++planes;
+				}
+	for (const auto format : formats)
+		for (unsigned count : {2u, 4u})
+			for (unsigned flip : {0u, 3u})
+				@autoreleasepool
+				{
+					f.check(format, format, count, count, flip, false, texture_plane::all, true, true, true); ++overlaps;
+				}
+	unsigned pending = 0;
+	for (const auto format : formats)
+		for (unsigned count : {2u, 4u})
+			@autoreleasepool
+			{
+				f.check(format, format, count, count, 3, false, texture_plane::all, true, false, false, true); ++pending;
+			}
+	for (const auto& [source, target] : pairs)
+		for (const auto& count : counts)
+			@autoreleasepool
+			{
+				f.check(source, target, count[0], count[1], 3, true, texture_plane::all, true, false, false, true); ++pending;
+			}
+	ctx.wait_idle();
+	std::cout << "Pending MSAA windows: " << pending << " real event timeouts after blitter destruction preserve private windows and shader/transfer owners, exact resumed output passed\n";
+	std::cout << "Bounded MSAA windows: " << regular << " regular, " << casts << " typeless, " << planes << " selected-aspect, " << overlaps
+		<< " self-overlapping copies; " << f.bounded_bytes << " exact guest bytes across whole targets with 128 KiB headroom, all 18 formats, 1/2/4 samples, scaling/flips, all half patterns and float special words, preserved exterior passed\n";
+}
 void stencil_without_depth(context& ctx)
 {
 	sample_transfer samples(ctx);
@@ -156,13 +271,14 @@ void stencil_without_depth(context& ctx)
 	std::cout << "Stencil-only import/expansion preserves unrelated NaN depth payloads without depth validation\n";
 }
 } // namespace
-int main()
+int main(int argc, char** argv)
 {
 	std::cout.setf(std::ios::unitbuf);
 	@autoreleasepool
 	{
 		try
 		{
+			if (argc == 2 && std::string_view(argv[1]) == "bounded-windows") { bounded_windows(); return 0; }
 			context ctx(1);
 			fixture f(ctx);
 			std::size_t regular = 0, typeless = 0, planes = 0;
@@ -202,6 +318,7 @@ int main()
 					}
 			std::cout << planes << " partial spatial sample blits preserve exterior pixels and unselected depth/stencil aspects\n";
 			stencil_without_depth(ctx);
+			bounded_windows();
 			ctx.wait_idle();
 		}
 		catch (const std::exception& e)

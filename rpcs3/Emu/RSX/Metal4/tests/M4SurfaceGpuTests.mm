@@ -1,4 +1,7 @@
 #include "M4SurfaceColor.h"
+#include "M4SurfaceDepth.h"
+#include "M4Swizzle.h"
+#include "M4Transfer.h"
 #include "M4VertexShader.h"
 #include "M4FragmentShader.h"
 
@@ -36,6 +39,78 @@ constexpr std::array<fixture, 14> formats{{{1,2,2}, {2,2,2}, {3,2,2}, {4,4,4}, {
 void store_be(std::span<std::byte> bytes, std::uint32_t value, unsigned width)
 {
 	for (unsigned i = 0; i < width; ++i) bytes[i] = static_cast<std::byte>(value >> (8 * (width - 1 - i)));
+}
+
+void checked_surface_transfers()
+{
+	using namespace metal4;
+	context ctx{1};
+	surface_color_transfer colors(ctx);
+	surface_depth_transfer depths(ctx);
+	swizzle_engine swizzle(ctx);
+	transfer_engine transfer(ctx);
+	constexpr unsigned side = 4, pixels = side * side, color_bytes = pixels * 4;
+	std::array<std::byte, color_bytes> color_input{};
+	for (unsigned i = 0; i < color_input.size(); ++i)
+		color_input[i] = std::byte((i * 17 + 29) & 255);
+	auto color_desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:side height:side mipmapped:NO];
+	color_desc.storageMode = MTLStorageModePrivate;
+	const auto color = make_texture(ctx, color_desc);
+	const auto input = make_upload(ctx, color_input);
+	const auto packed = make_buffer(ctx, color_bytes, buffer_storage::private_gpu);
+	const auto morton = make_buffer(ctx, color_bytes, buffer_storage::private_gpu);
+	const auto linear = make_buffer(ctx, color_bytes, buffer_storage::private_gpu);
+	const auto output = make_buffer(ctx, color_bytes * 2, buffer_storage::shared);
+	const swizzle_region region{{side, side, 1}, {}, {side, side, 1}};
+	texture_region whole;
+	whole.size = MTLSizeMake(side, side, 1);
+	std::size_t checked = 0;
+	for (auto format : {surface_depth::z16_float, surface_depth::z24s8_float})
+	{
+		const auto codec = describe_surface_depth(format);
+		const auto unit = codec.guest_bytes;
+		std::vector<std::byte> depth_input(pixels * unit);
+		for (unsigned i = 0; i < pixels; ++i)
+			store_be(std::span{depth_input}.subspan(i * unit, unit),
+				unit == 2 ? 0x6000 + i : 0x7e000000u + i * 0x100u + (31 + i), unit);
+		const auto depth_upload = make_upload(ctx, depth_input);
+		const auto depth_packed = make_buffer(ctx, depth_input.size(), buffer_storage::private_gpu);
+		auto depth_desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:codec.format width:side height:side mipmapped:NO];
+		depth_desc.storageMode = MTLStorageModePrivate;
+		depth_desc.usage = MTLTextureUsageRenderTarget;
+		const auto depth = make_texture(ctx, depth_desc);
+		const auto before = ctx.encoding_statistics();
+		ctx.begin();
+		colors.upload(ctx, surface_color::argb8, input, {0, side * 4}, color, whole);
+		depths.upload(ctx, format, depth_upload, {0, side * unit}, depth, whole);
+		const auto uploaded = ctx.encoding_statistics();
+		require(uploaded.checked_dispatches == before.checked_dispatches + 2 &&
+			uploaded.dispatch_barriers_elided == before.dispatch_barriers_elided + 2 &&
+			uploaded.dispatch_barriers == before.dispatch_barriers &&
+			uploaded.dispatch_to_blit_barriers == before.dispatch_to_blit_barriers + 2,
+			"Independent color and depth encodes unexpectedly synchronized before dispatch");
+
+		colors.download(ctx, surface_color::argb8, color, whole, packed, {0, side * 4});
+		depths.download(ctx, format, depth, whole, depth_packed, {0, side * unit});
+		swizzle.convert(ctx, morton, 0, packed, 0, region, 4, 0, 0, true);
+		swizzle.convert(ctx, morton, 0, linear, 0, region, 4, 0, 0, false);
+		transfer.copy(ctx, linear, 0, output, 0, color_bytes, 4);
+		copy_buffer(ctx, depth_packed, 0, output, color_bytes, depth_input.size());
+		ctx.submit().wait();
+		const auto after = ctx.encoding_statistics();
+		require(after.checked_dispatches == before.checked_dispatches + 7 &&
+			after.checked_blit_raw_transitions == before.checked_blit_raw_transitions &&
+			after.blit_to_dispatch_barriers >= before.blit_to_dispatch_barriers + 2 &&
+			after.compute_encoders == before.compute_encoders + 1, "Surface transfer unexpectedly exposed the raw encoder");
+		for (unsigned i = 0; i < color_bytes; ++i)
+			require(map_buffer(output, 0, color_bytes)[i] == color_input[(i & ~3u) + 3 - (i & 3u)],
+				"Color/Morton/endian transfer chain lost byte order");
+		require(std::equal(depth_input.begin(), depth_input.end(), map_buffer(output, color_bytes, depth_input.size()).begin()),
+			"Depth gather lost depth or stencil bytes");
+		checked += color_bytes + depth_input.size();
+	}
+	std::cout << "Native checked surface transfers: two color/depth profiles, fourteen checked dispatches, four independent upload dispatches, "
+		<< checked << " exact bytes through Morton, endian and depth/stencil transfers passed\n";
 }
 
 std::array<float, 4> pixel_fixture(std::span<std::byte> guest, const fixture& f, std::size_t ordinal)
@@ -318,7 +393,7 @@ int main()
 	std::cout.setf(std::ios::unitbuf);
 	@autoreleasepool
 	{
-		try { metal4::context context(1); run(context); draw_formats(context); raw_float_bits_and_subregions(context); }
+		try { checked_surface_transfers(); metal4::context context(1); run(context); draw_formats(context); raw_float_bits_and_subregions(context); }
 		catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 	}
 }

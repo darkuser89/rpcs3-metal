@@ -2,9 +2,16 @@
 
 #include "M4SurfaceMapping.h"
 #include <algorithm>
+#include <stdexcept>
 
 namespace metal4
 {
+class texture_revision_conflict final : public std::runtime_error
+{
+  public:
+	texture_revision_conflict() : std::runtime_error("Guest texture changed during native preparation") {}
+};
+
 // Immutable CPU-only snapshot dependency. Retains watched actual storage
 // and its independent versions,not the cache or mutable native allocation.
 // In particular bank permutation may address bytes outside a shader's

@@ -54,7 +54,7 @@ namespace metal4
 	(void)guest_surface_byte_cursor(source);
 	if (source.range.address || source_segments.empty() || requested.empty() ||
 		texture.dimension != vertex_texture_dimension::two || texture.mips != 1 || texture.layers != 1 || texture.depth != 1 ||
-		texture.stored_border || texture.adjusted_pitch || !texture.codec.block.width || !texture.codec.block.height ||
+		texture.stored_border || !texture.codec.block.width || !texture.codec.block.height ||
 		((texture.codec.block.width != 1 || texture.codec.block.height != 1) && (!allow_cast || texture.swizzled)))
 		return {};
 	const auto source_size = source_segments.back().offset + source_segments.back().size;

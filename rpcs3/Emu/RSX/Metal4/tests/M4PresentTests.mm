@@ -76,7 +76,7 @@ int main()
 			const auto input = make_upload(ctx, std::as_bytes(std::span{pixels}));
 			ctx.begin();
 			buffer_to_texture(ctx, input, 0, source, {0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(4, 4, 1)});
-			ctx.submit().wait();
+			const auto upload = ctx.submit();
 			const auto destination = texture(ctx, MTLPixelFormatBGRA8Unorm, 6, 6);
 			present_image image{source, {0, 0, MTLOriginMake(1, 1, 0), MTLSizeMake(2, 2, 1)}, {1, 1, 4, 4}};
 			for (unsigned flips = 0; flips < 4; ++flips)
@@ -84,7 +84,11 @@ int main()
 				image.flip_x = flips & 1;
 				image.flip_y = flips & 2;
 				ctx.begin();
+				const auto before_present = ctx.encoding_statistics();
 				engine.encode(ctx, image, destination);
+				const auto after_present = ctx.encoding_statistics();
+				require(after_present.fragment_render_barriers == before_present.fragment_render_barriers + 1 &&
+					after_present.full_render_barriers == before_present.full_render_barriers, "Display composition must use a fragment/tile barrier");
 				ctx.submit().wait();
 				const auto actual = download(ctx, destination, 4);
 				for (std::size_t y = 0; y < 6; ++y)
@@ -102,7 +106,9 @@ int main()
 						}
 					}
 			}
+			upload.wait();
 			std::cout << "Presentation nearest crop,all four flips,BGRA and opaque letterbox passed\n";
+			std::cout << "Four display composition fragment/tile barriers passed with a separately submitted source upload\n";
 			image.flip_x = image.flip_y = false;
 			image.filter = present_filter::linear;
 			ctx.begin();

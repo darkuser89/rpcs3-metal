@@ -28,15 +28,17 @@ struct display_cache_statistics
 	std::uint64_t mixed_casts = 0, captured_vm_bytes = 0, captured_vm_ranges = 0;
 	std::uint64_t assembly_casts = 0, assembly_hits = 0;
 };
-// No pending image accessor. finish validates the owned source receipt only
-// after native success, outside CPU/VM exclusion, on its preparing thread.
+// finish validates the owned source receipt after native success, outside
+// CPU/VM exclusion, on its preparing thread.
 class display_upload_job final
 {
 	struct state;
 	std::shared_ptr<state> m_state;
 	display_format m_format;
 	display_upload_job(std::shared_ptr<state> state, display_format format);
+	[[nodiscard]] static present_image owned_image(const state& state, display_format format);
 	friend class display_resolver;
+	friend class display_frame_job;
 	friend struct display_cache_state;
   public:
 	~display_upload_job();
@@ -68,6 +70,9 @@ class display_frame_job final
 	[[nodiscard]] bool cancel_pending() const;
 	// Caller owns the same CPU/VM epoch as the AV snapshot.
 	[[nodiscard]] bool current() const;
+	// Validate both immutable eyes in that epoch. The returned image carries
+	// the submissions needed to encode GPU consumers safely.
+	[[nodiscard]] present_image image_for_encoding() const;
 	[[nodiscard]] present_image finish(std::chrono::milliseconds timeout = std::chrono::seconds(30)) const;
 };
 // Native surface epochs take precedence over CPU backbuffers. VM versions
@@ -90,10 +95,11 @@ class display_resolver final
 	std::shared_ptr<tile_state> m_tiles;
 	std::shared_ptr<display_cache_state> m_cache;
 	guest_texture_resolver m_upload;
+	struct upload_batch;
 	[[nodiscard]] std::shared_ptr<display_upload_job::state> prepare_impl(const display_snapshot& image, surface_cache& surfaces,
-		std::span<const display_upload_dependency> dependencies, bool require_ledger);
+		upload_batch& batch, bool require_ledger);
 	[[nodiscard]] std::shared_ptr<display_upload_job::state> prepare_assembly(const std::shared_ptr<display_source_version>& version,
-		surface_cache& surfaces,const guest_texture_layout& plan,std::span<const display_upload_dependency> dependencies);
+		surface_cache& surfaces,const guest_texture_layout& plan,upload_batch& batch);
 
   public:
 	// Capture/translation callbacks retain their services for outstanding jobs.

@@ -138,8 +138,10 @@ id<MTLHeap> heap_budget::allocate(MTLHeapDescriptor* descriptor)
 	id<MTLHeap> result;
 	with_recovery([&]
 	{
-		if (!descriptor || !descriptor.size || descriptor.storageMode != MTLStorageModePrivate || descriptor.type != MTLHeapTypePlacement || descriptor.hazardTrackingMode != MTLHazardTrackingModeUntracked)
-			throw std::invalid_argument("Shared native budget requires private untracked placement heaps");
+		if (!descriptor || !descriptor.size || descriptor.type != MTLHeapTypePlacement ||
+			descriptor.hazardTrackingMode != MTLHazardTrackingModeUntracked ||
+			(descriptor.storageMode != MTLStorageModePrivate && descriptor.storageMode != MTLStorageModeShared))
+			throw std::invalid_argument("Native budget requires untracked private or shared placement heaps");
 		std::lock_guard lock(m_impl->mutex);
 		m_impl->collect(8);
 		m_impl->check(descriptor.size);
@@ -160,7 +162,13 @@ id<MTLTexture> heap_budget::texture(MTLTextureDescriptor* descriptor)
 	id<MTLTexture> texture;
 	with_recovery([&]
 	{
-		if (!descriptor || !descriptor.width || !descriptor.height || !descriptor.depth || !descriptor.arrayLength || !descriptor.mipmapLevelCount || descriptor.sampleCount != 1 || descriptor.storageMode != MTLStorageModePrivate)
+		const bool multisampled = descriptor.textureType == MTLTextureType2DMultisample;
+		if (!descriptor || !descriptor.width || !descriptor.height || !descriptor.depth || !descriptor.arrayLength ||
+			!descriptor.mipmapLevelCount || (!multisampled && descriptor.sampleCount != 1) ||
+			(multisampled && ((descriptor.sampleCount != 2 && descriptor.sampleCount != 4) ||
+				![m_impl->device supportsTextureSampleCount:descriptor.sampleCount] || descriptor.mipmapLevelCount != 1 ||
+				descriptor.depth != 1 || descriptor.arrayLength != 1 || descriptor.storageMode != MTLStorageModePrivate)) ||
+			(descriptor.storageMode != MTLStorageModePrivate && descriptor.storageMode != MTLStorageModeShared))
 			throw std::invalid_argument("Budgeted texture descriptor is invalid");
 		if (descriptor.mipmapLevelCount > static_cast<NSUInteger>(std::bit_width(std::max({descriptor.width, descriptor.height, descriptor.depth}))))
 			throw std::invalid_argument("Budgeted texture mip count exceeds dimensions");
@@ -172,7 +180,7 @@ id<MTLTexture> heap_budget::texture(MTLTextureDescriptor* descriptor)
 		if (!size.size)
 			throw std::invalid_argument("Native texture heap requirement is invalid");
 		auto hd = [MTLHeapDescriptor new];
-		hd.storageMode = MTLStorageModePrivate;
+		hd.storageMode = copy.storageMode;
 		hd.hazardTrackingMode = MTLHazardTrackingModeUntracked;
 		hd.type = MTLHeapTypePlacement;
 		hd.size = size.size;
@@ -188,28 +196,35 @@ id<MTLBuffer> heap_budget::shared_buffer(std::size_t bytes)
 {
 	return buffer(bytes, MTLStorageModeShared);
 }
+id<MTLBuffer> heap_budget::try_shared_buffer(std::size_t bytes)
+{
+	try { return allocate_buffer_once(bytes, MTLStorageModeShared); }
+	catch (const heap_budget_error&) { return nil; }
+	catch (const native_allocation_error&) { return nil; }
+}
 id<MTLBuffer> heap_budget::buffer(std::size_t bytes, MTLStorageMode storage)
 {
 	id<MTLBuffer> result;
-	with_recovery([&]
-	{
-		if (!bytes || bytes > m_impl->device.maxBufferLength || (storage != MTLStorageModeShared && storage != MTLStorageModePrivate))
-			throw std::invalid_argument("Budgeted buffer size or storage is invalid");
-		std::lock_guard lock(m_impl->mutex);
-		m_impl->collect(8);
-		m_impl->check(bytes);
-		const auto options = storage == MTLStorageModeShared ? MTLResourceStorageModeShared : MTLResourceStorageModePrivate;
-		const auto buffer = [m_impl->device newBufferWithLength:bytes options:options];
-		if (!buffer)
-			throw native_allocation_error(native_allocation_kind::buffer, bytes);
-		const auto size = std::max(buffer.length, buffer.allocatedSize);
-		m_impl->check(size);
-		m_impl->reservations.push_back({buffer, size, false});
-		m_impl->stats.reserved_bytes += size;
-		++m_impl->stats.created;
-		++m_impl->stats.live_buffers;
-		result = buffer;
-	});
+	with_recovery([&] { result = allocate_buffer_once(bytes, storage); });
 	return result;
+}
+id<MTLBuffer> heap_budget::allocate_buffer_once(std::size_t bytes, MTLStorageMode storage)
+{
+	if (!bytes || bytes > m_impl->device.maxBufferLength || (storage != MTLStorageModeShared && storage != MTLStorageModePrivate))
+		throw std::invalid_argument("Budgeted buffer size or storage is invalid");
+	std::lock_guard lock(m_impl->mutex);
+	m_impl->collect(8);
+	m_impl->check(bytes);
+	const auto options = storage == MTLStorageModeShared ? MTLResourceStorageModeShared : MTLResourceStorageModePrivate;
+	const auto buffer = [m_impl->device newBufferWithLength:bytes options:options];
+	if (!buffer)
+		throw native_allocation_error(native_allocation_kind::buffer, bytes);
+	const auto size = std::max(buffer.length, buffer.allocatedSize);
+	m_impl->check(size);
+	m_impl->reservations.push_back({buffer, size, false});
+	m_impl->stats.reserved_bytes += size;
+	++m_impl->stats.created;
+	++m_impl->stats.live_buffers;
+	return buffer;
 }
 } // namespace metal4

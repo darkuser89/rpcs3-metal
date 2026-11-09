@@ -106,7 +106,14 @@ class arm64_fault_channel final
 				return {outcome::cancelled};
 			}
 			m_slot->before = before; m_slot->fault = fault; m_slot->writing = writing;
-			m_slot->state.store(pending, std::memory_order_release);
+			m_slot->state.store(pending, std::memory_order_seq_cst);
+			// Pair the publication with request_close's sweep. If it passed
+			// while this slot was capturing, the producer cancels itself.
+			if (m_core->closed.load(std::memory_order_seq_cst))
+			{
+				unsigned waiting = pending;
+				m_slot->state.compare_exchange_strong(waiting, cancelled, std::memory_order_seq_cst);
+			}
 			unsigned state;
 			while ((state = m_slot->state.load(std::memory_order_acquire)) == pending || state == running) asm volatile("yield");
 			response result{outcome::failed};
@@ -163,6 +170,11 @@ class arm64_fault_channel final
 			auto& value = owner->slots[i];
 			unsigned waiting = pending;
 			if (!value.state.compare_exchange_strong(waiting, running, std::memory_order_acquire)) continue;
+			if (owner->closed.load(std::memory_order_acquire))
+			{
+				value.state.store(cancelled, std::memory_order_release);
+				continue;
+			}
 			const input request{value.before, value.fault, value.writing};
 			unsigned result = failed;
 			try
@@ -176,14 +188,23 @@ class arm64_fault_channel final
 		}
 		return count;
 	}
+	// Can be called while holding producer locks or from an owner callback.
+	// It cancels waiters without waiting for the currently executing operation.
+	void request_close() noexcept
+	{
+		m_core->closed.store(true, std::memory_order_seq_cst);
+		for (std::size_t i = 0; i < m_core->capacity; ++i)
+		{
+			unsigned waiting = pending;
+			m_core->slots[i].state.compare_exchange_strong(waiting, cancelled, std::memory_order_seq_cst);
+		}
+	}
 	void close()
 	{
 		const auto owner = m_core;
 		if (owner->owner == std::this_thread::get_id() && owner->draining.load(std::memory_order_acquire))
 			throw std::logic_error("Native ARM fault owner cannot close its running callback");
-		// Admission and this scan share one sequentially consistent order.
-		// Otherwise close could miss capturing while that producer misses closed.
-		owner->closed.store(true, std::memory_order_seq_cst);
+		request_close();
 		for (std::size_t i = 0; i < owner->capacity; ++i)
 		{
 			auto& value = owner->slots[i];

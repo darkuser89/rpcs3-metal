@@ -24,11 +24,6 @@ class surface_cache;
 struct guest_texture_batch_owner;
 class prepared_surface_snapshot;
 
-class texture_revision_conflict final : public std::runtime_error
-{
-  public:
-	texture_revision_conflict() : std::runtime_error("Guest texture changed during native preparation") {}
-};
 class guest_texture_revision final
 {
 	std::shared_ptr<guest_surface_memory> m_memory;
@@ -47,6 +42,7 @@ class guest_texture_revision final
 		: m_memory(std::move(memory)), m_coverage(std::move(coverage)), m_segments(std::move(segments)), m_translate(std::move(translate)),
 		m_offset(offset), m_storage_bytes(storage_bytes), m_location(location), m_revisions(std::move(revisions)), m_io(std::move(io)) {}
 	friend class guest_texture_cache;
+	friend class versioned_guest_texture_job;
 
   public:
 	// CPU-only. Validate all tickets together inside the final CPU epoch.
@@ -67,6 +63,9 @@ struct versioned_guest_texture
 	resolved_fragment_texture image;
 	guest_texture_revision revision;
 };
+// Draw-owned uploads and their event waits share the dependent recording.
+// An existing independent prefix is retired before these waits are attached.
+enum class texture_upload_path { separate, draw_batch };
 // CPU metadata and receipts may be consumed while native work is pending.
 // Images remain private until successful completion and common validation.
 // The job owns its capture services; cache/context teardown cannot dangle them.
@@ -76,6 +75,12 @@ class versioned_guest_texture_job final
 	std::shared_ptr<state> m_state;
 	explicit versioned_guest_texture_job(std::shared_ptr<state> state);
 	friend class guest_texture_cache;
+	friend class draw_executor;
+	// Private images may only be bound by a draw that records or depends on their upload.
+	[[nodiscard]] std::pair<std::vector<versioned_guest_texture>, std::optional<submission>> draw_images(surface_cache& surfaces) const;
+	void record_draw_uploads(context& ctx) const;
+	friend class versioned_draw_texture_job;
+	[[nodiscard]] bool has_completion() const;
   public:
 	~versioned_guest_texture_job();
 	versioned_guest_texture_job(versioned_guest_texture_job&&) noexcept;
@@ -136,6 +141,7 @@ class guest_texture_upload_job final
 	std::unique_ptr<state> m_state;
 	guest_texture_upload_job(submission work, std::vector<resolved_fragment_texture> images);
 	friend class guest_texture_resolver;
+	friend class versioned_guest_texture_job;
 
   public:
 	~guest_texture_upload_job();
@@ -178,6 +184,7 @@ class guest_texture_resolver final
 		guest_texture_layout plan;
 		std::vector<guest_storage_segment> segments;
 		std::vector<guest_surface_layout> coverage;
+		std::vector<std::size_t> capture_offsets;
 	};
 	struct display_byte_patch
 	{
@@ -226,8 +233,29 @@ class guest_texture_resolver final
 		std::uint64_t native_epoch=0,topology_epoch=0;
 		std::size_t source_bytes=0;
 	};
+	struct prepared_depth_volume_plane
+	{
+		id<MTLBuffer> depth, stencil, output, uniforms;
+	};
+	struct prepared_assembly_slice
+	{
+		id<MTLTexture> image = nil, normalized = nil;
+		id<MTLBuffer> normalize_uniforms = nil, pixel_map = nil;
+		texture_region source;
+		std::function<void()> encode_source;
+		std::optional<prepared_depth_volume_plane> depth;
+	};
+	struct prepared_texture_assembly
+	{
+		id<MTLTexture> texture;
+		std::vector<prepared_assembly_slice> slices;
+	};
 	void prepare_texture_assembly(texture_assembly_input& input);
-	void encode_texture_assembly(const texture_assembly_input& input,id<MTLTexture> texture);
+	[[nodiscard]] prepared_assembly_slice prepare_assembly_source(const texture_assembly_slice& slice);
+	[[nodiscard]] prepared_texture_assembly prepare_draw_assembly(const texture_assembly_input& input);
+	[[nodiscard]] static bool can_record_draw_cast(const native_cast_input& input);
+	void encode_texture_assembly(const texture_assembly_input& input, id<MTLTexture> texture,
+		const prepared_texture_assembly* prepared = nullptr);
 	struct display_buffer_copy { std::uint64_t target, source, ordinal, size; };
 	struct display_assembly_native
 	{
@@ -247,27 +275,49 @@ class guest_texture_resolver final
 		std::size_t raw_bytes=0,linear_bytes=0;
 	};
 	void prepare_display_helpers(bool morton,bool holes,bool assembly,bool banked=false);
-	void encode_display_holes(id<MTLBuffer> target,std::span<const display_byte_patch> patches,std::span<const std::byte> bytes);
+	struct prepared_display_holes
+	{
+		id<MTLBuffer> payload = nil, patches = nil, sizes = nil;
+	};
+	[[nodiscard]] prepared_display_holes prepare_display_holes(std::span<const display_byte_patch> patches, std::span<const std::byte> bytes);
+	void encode_display_holes(id<MTLBuffer> target, std::span<const display_byte_patch> patches, std::span<const std::byte> bytes,
+		const prepared_display_holes* prepared = nullptr);
 	[[nodiscard]] display_assembly_input prepare_display_assembly(const guest_texture_layout& plan,
 		std::span<const std::shared_ptr<prepared_surface_snapshot>> native,std::span<const display_storage_source> sources,
 		const display_storage_assembly& assembly,std::vector<std::byte> vm_bytes);
-	void encode_display_assembly(const display_assembly_input& input,id<MTLTexture> output);
+	struct prepared_display_assembly;
+	[[nodiscard]] prepared_display_assembly prepare_draw_display_assembly(const display_assembly_input& input, id<MTLTexture> output);
+	void encode_display_assembly(const display_assembly_input& input, id<MTLTexture> output,
+		const prepared_display_assembly* prepared = nullptr);
 	void cpu_capture(const std::function<void()>& operation) const;
 	void watch(source& input) const;
 	[[nodiscard]] bool current(const source& input, const std::vector<std::uint64_t>& revisions) const;
 	[[nodiscard]] source prepare(const fragment_texture_registers& words) const;
 	[[nodiscard]] captured_guest_texture capture(const fragment_texture_registers& words, const source& input, std::vector<std::uint64_t>& revisions);
 	[[nodiscard]] id<MTLTexture> allocate(const guest_texture_layout& plan) __attribute__((ns_returns_retained));
-	void encode_upload(const guest_texture_layout& plan, id<MTLBuffer> guest, id<MTLTexture> texture);
-	void encode_vtc(const guest_texture_layout& plan, id<MTLBuffer> guest, id<MTLTexture> texture);
-	void encode_depth_volume(const guest_texture_layout& plan,id<MTLBuffer> guest,id<MTLTexture> texture);
-	void encode_depth_volume_plane(id<MTLTexture> source,const texture_region& region,id<MTLTexture> target,unsigned level,std::size_t z);
+	struct prepared_vm_upload;
+	[[nodiscard]] prepared_vm_upload prepare_vm_upload(const captured_guest_texture& snapshot);
+	[[nodiscard]] prepared_vm_upload prepare_vm_upload(const guest_texture_layout& plan, id<MTLTexture> texture, id<MTLBuffer> source);
+	struct prepared_native_cast;
+	[[nodiscard]] prepared_native_cast prepare_draw_cast(const native_cast_input& input);
+	[[nodiscard]] static texture_region cast_source_region(const native_cast_input& input);
+	void encode_upload(const guest_texture_layout& plan, id<MTLBuffer> guest, id<MTLTexture> texture,
+		const prepared_vm_upload* prepared = nullptr);
+	void encode_buffer_conversion(id<MTLComputePipelineState> pipeline, id<MTLBuffer> source, id<MTLBuffer> destination,
+		const upload_slice& uniforms, std::size_t write_offset, std::size_t write_size, std::size_t threads);
+	void prepare_volume_decoder(bool vtc);
+	[[nodiscard]] id<MTLTexture> allocate_vtc_storage(const guest_texture_layout& plan);
+	void encode_volume_upload(const guest_texture_layout& plan, id<MTLBuffer> guest, id<MTLTexture> texture,
+		const prepared_vm_upload* prepared);
+	[[nodiscard]] prepared_depth_volume_plane prepare_depth_volume_plane(id<MTLTexture> source, const texture_region& region);
+	void encode_depth_volume_plane(id<MTLTexture> source, const texture_region& region, id<MTLTexture> target,
+		const texture_region& destination, const prepared_depth_volume_plane* prepared = nullptr);
 	[[nodiscard]] native_cast_input prepare_cast(const guest_texture_layout& plan, surface_format format,
 		id<MTLTexture> source, texture_cache_state metadata, std::size_t row_offset,clear_rectangle source_rectangle={}) const;
 	[[nodiscard]] native_cast_input prepare_morton_display_cast(const guest_texture_layout& plan, surface_format format,
 		id<MTLTexture> source, const swizzle_region& layout, std::size_t offset,
 		std::vector<display_byte_patch> patches = {}, std::vector<std::byte> bytes = {});
-	void encode_cast(const native_cast_input& input, id<MTLTexture> texture);
+	void encode_cast(const native_cast_input& input, id<MTLTexture> texture, const prepared_native_cast* prepared = nullptr);
 	[[nodiscard]] guest_texture_upload_job enqueue_mixed(std::span<const captured_guest_texture> snapshots,
 		std::span<const native_cast_input> casts, std::span<const guest_texture_upload_dependency> dependencies,
 		std::span<const std::shared_ptr<prepared_surface_snapshot>> native = {});
@@ -358,7 +408,7 @@ class guest_texture_cache final
 	void check_pending_bytes(const pending_textures& pending, std::size_t extra) const;
 	[[nodiscard]] std::optional<resolved_fragment_texture> resolve_assembly(const fragment_texture_registers& words,
 		const guest_texture_resolver::source& input,surface_cache& surfaces,std::shared_ptr<const surface_texture_revision>* receipt,
-		pending_textures* pending,std::optional<pending_image>* pending_index);
+		pending_textures* pending,std::optional<pending_image>* pending_index, const draw_publication& permit);
 	void publish_assembly(const std::shared_ptr<guest_texture_resolver::texture_assembly_input>& assembly,const resolved_fragment_texture& image);
 	[[nodiscard]] std::function<bool()> publication_guard() const;
 	struct cast_entry
@@ -376,9 +426,11 @@ class guest_texture_cache final
 	std::shared_ptr<guest_texture_batch_owner> m_batch_owner;
 	[[nodiscard]] resolved_fragment_texture resolve_impl(const fragment_texture_registers& words, surface_cache* surfaces,
 		std::shared_ptr<const surface_texture_revision>* source_revision = nullptr, const std::function<void()>& after_flush = {},
-		pending_textures* pending = nullptr, std::optional<pending_image>* pending_index = nullptr);
+		pending_textures* pending = nullptr, std::optional<pending_image>* pending_index = nullptr,
+		const draw_publication& permit = {}, bool fragment_shader_reads = false);
 	[[nodiscard]] versioned_guest_texture resolve_versioned_impl(const fragment_texture_registers& words, surface_cache* surfaces,
-		pending_textures* pending = nullptr, std::optional<pending_image>* pending_index = nullptr);
+		pending_textures* pending = nullptr, std::optional<pending_image>* pending_index = nullptr,
+		const draw_publication& permit = {}, bool fragment_shader_reads = false);
 
   public:
 	guest_texture_cache(context& ctx, std::shared_ptr<guest_surface_memory> memory,
@@ -392,7 +444,6 @@ class guest_texture_cache final
 	// Immutable typed transparent-black images;no guest address/VM access.
 	// Creates all four dimensions before publication,outside recording.
 	[[nodiscard]] null_texture_family null_images();
-	[[nodiscard]] bool null_images_ready() const noexcept { return bool(m_null_images[0].texture); }
 	// Single-mip 2D aliases/subregions use bounded immutable native snapshots
 	// before consulting VM tags,including expanded MSAA samples. GPU casts reuse
 	// exact native source identities under per-kind entry and heap-byte limits.
@@ -400,15 +451,16 @@ class guest_texture_cache final
 	// different guest texel widths require linear storage. Other overlaps fail.
 	// Revision-valid clean contiguous native backings preserve precision after
 	// writeback. Disjoint sources flush actual overlaps then gather guest bytes.
-	[[nodiscard]] resolved_fragment_texture resolve(const fragment_texture_registers& words, surface_cache& surfaces);
+	[[nodiscard]] resolved_fragment_texture resolve(const fragment_texture_registers& words, surface_cache& surfaces, const draw_publication& permit = {});
 	// Render-thread preparation outside CPU epochs. The ticket guards the VM
 	// and translation version spanning native snapshot/upload preparation.
 	[[nodiscard]] versioned_guest_texture resolve_versioned(const fragment_texture_registers& words, surface_cache& surfaces);
-	// Captures all sources and submits one mixed native batch, without waiting
-	// for that batch. Up to64 unconsumed jobs per cache; source/image bounds
-	// remain those of enqueue_uploads. Call finish after independent CPU work.
+	// Captures all sources. A draw batch can encode prepared VM uploads and
+	// native snapshots. Other jobs submit one mixed native batch. Completion
+	// and source validation still gate cache publication. Up to 64 jobs per cache.
 	[[nodiscard]] versioned_guest_texture_job prepare_versioned_batch(std::span<const fragment_texture_registers> words,
-		surface_cache& surfaces, std::span<const guest_texture_upload_dependency> dependencies = {});
+		surface_cache& surfaces, std::span<const guest_texture_upload_dependency> dependencies = {}, const draw_publication& permit = {},
+		texture_upload_path path = texture_upload_path::separate, std::uint64_t fragment_shader_reads = 0);
 	// Prepare every immutable surface snapshot and VM source before recording.
 	// Coalesce pending VM versions/casts; submit all misses together, then
 	// validate ALL VM/IO/surface receipts before publishing any new entry.

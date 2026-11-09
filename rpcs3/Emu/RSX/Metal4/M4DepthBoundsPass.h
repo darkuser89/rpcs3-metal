@@ -20,6 +20,7 @@ void configure_depth_bounds_pipeline(render_pipeline_configuration& pipeline, fr
 class depth_bounds_pass final
 {
 	friend class depth_bounds_engine;
+	friend class draw_executor;
 	context& m_context;
 	MTL4RenderPassDescriptor* m_descriptor;
 	id<MTLTexture> m_mirror;
@@ -30,11 +31,17 @@ class depth_bounds_pass final
 	bool m_ended = false;
 
 	depth_bounds_pass(context& ctx, MTL4RenderPassDescriptor* descriptor, id<MTLTexture> mirror, depth_mirror_encoding encoding);
-	void begin_render();
+	void begin_render(const bindings* guest_vertex = nullptr, id<MTLBuffer> geometry = nil, bool conditional = false);
+	// The executor supplies exactly one generated draw with frozen bindings.
+	void draw_guest_geometry(const prepared_geometry& geometry, const render_pipeline_bundle& pipeline,
+		const fragment_shader& fragment, const bindings& vertex, fragment_context state,
+		std::span<const std::byte> code, const fragment_inputs& inputs, raster_state raster,
+		const fragment_shader::constant_binding* constants, const conditional_draw* conditional = nullptr);
 	void draw_geometry_impl(const converted_geometry& geometry, const prepared_geometry* prepared,
 		const render_pipeline_bundle& pipeline, const fragment_shader& fragment, const bindings& vertex, fragment_context state,
 		std::span<const std::byte> code, const fragment_inputs& inputs, raster_state raster,
-		std::size_t instances, std::size_t base_instance, const fragment_shader::constant_binding* constants);
+		std::size_t instances, std::size_t base_instance, const fragment_shader::constant_binding* constants,
+		bool guest = false, const conditional_draw* conditional = nullptr);
 
   public:
 	depth_bounds_pass(const depth_bounds_pass&) = delete;

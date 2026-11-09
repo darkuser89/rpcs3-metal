@@ -27,7 +27,8 @@ public:
 	void download_color(context& ctx, surface_color format, id<MTLTexture> texture, const texture_region& region,
 		id<MTLBuffer> guest, std::size_t offset, const swizzle_region& layout) const;
 	void upload_depth(context& ctx, surface_depth format, id<MTLBuffer> guest, std::size_t offset,
-		const swizzle_region& layout, id<MTLTexture> texture, const texture_region& region) const;
+		const swizzle_region& layout, id<MTLTexture> texture, const texture_region& region,
+		texture_plane plane = texture_plane::all) const;
 	void download_depth(context& ctx, surface_depth format, id<MTLTexture> texture, const texture_region& region,
 		id<MTLBuffer> guest, std::size_t offset, const swizzle_region& layout) const;
 };

@@ -19,6 +19,6 @@ class texture_blitter final
 	// Plain equal-size copies use copy_texture, including its native MSAA path.
 	void nearest(context& ctx, id<MTLTexture> source, const texture_region& source_region,
 				 id<MTLTexture> destination, const texture_region& destination_region,
-				 texture_plane plane = texture_plane::all, std::array<bool, 3> flip = {}) const;
+				 texture_plane plane = texture_plane::all, std::array<bool, 3> flip = {}, nearest_projection projection = {}) const;
 };
 } // namespace metal4

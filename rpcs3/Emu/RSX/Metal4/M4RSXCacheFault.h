@@ -1,5 +1,7 @@
 #pragma once
 
+#include "M4ARM64FaultChannel.h"
+#include "M4DarwinInstruction.h"
 #include "M4RSXVMAccess.h"
 #include "M4SurfaceCache.h"
 #include "M4GuestTexture.h"
@@ -57,6 +59,22 @@ class rsx_cache_fault final
 		arm64_memory_state reply;
 		std::size_t host_pages, watched_pages, published_surfaces, invalidated_textures;
 	};
+	// A lease is issued only when the parked producer's original instruction
+	// has remained immutable since the fault. Retain it through byte commit.
+	using instruction_lease = std::function<std::shared_ptr<const void>(std::uint64_t pc)>;
+	[[nodiscard]] std::optional<completion> complete_parked(const arm64_fault_channel::input& input, const instruction_lease& retain)
+	{
+		if (std::this_thread::get_id() != m_owner || guest_memory_epoch::active() || m_active)
+			throw std::logic_error("Native parked instruction requires its idle render owner outside VM exclusion");
+		if (!retain) return {};
+		const auto lease = retain(input.before.pc);
+		if (!lease) return {};
+		const auto instruction = capture_darwin_instruction(input.before.pc);
+		if (!instruction) return {};
+		const auto request = arm64_memory_request::decode(*instruction, input.before);
+		if (!request || !request->matches_fault(input.fault, input.writing)) return {};
+		return complete(*request, input.fault, input.writing);
+	}
 	// Synchronous,non-reentrant render-owner task from initial permission/
 	// mapping capture through all GPU preparation and exact byte/register reply.
 	// The dispatcher must keep the original CPU parked until it publishes reply.

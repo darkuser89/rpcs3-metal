@@ -89,14 +89,15 @@ present_eye fsr_upscaler::encode(context& ctx,const present_eye& input,frame_ext
 	const auto dispatch = [&](id<MTLComputePipelineState> pipeline,id<MTLTexture> source,id<MTLTexture> target)
 	{
 		bindings resources; resources.set_buffer(0,uniforms.buffer,uniforms.offset); resources.set_texture(0,source); resources.set_texture(1,target);
-		const auto table = resources.snapshot(ctx); ctx.keep_alive(pipeline);
-		ctx.end_encoding(); const auto encoder = ctx.compute();
-		[encoder setComputePipelineState:pipeline]; [encoder setArgumentTable:table];
-		[encoder dispatchThreads:MTLSizeMake(output.width,output.height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
-		ctx.end_encoding();
+		const std::array accesses{
+			context::accessed_resource{source},
+			context::accessed_resource{target, 0, 0, true},
+			context::accessed_resource{uniforms.buffer, uniforms.offset, uniforms.size}};
+		ctx.checked_dispatch(pipeline, resources, accesses, MTLSizeMake(output.width,output.height,1), MTLSizeMake(8,8,1));
 	};
 	dispatch(m_impl->easu,input.texture,work.intermediate); ++m_impl->stats.easu_dispatches;
 	dispatch(m_impl->rcas,work.intermediate,work.output); ++m_impl->stats.rcas_dispatches;
+	ctx.end_encoding();
 	return {work.output,{0,0,MTLOriginMake(0,0,0),MTLSizeMake(output.width,output.height,1)}};
 }
 } // namespace metal4

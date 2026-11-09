@@ -64,30 +64,37 @@ struct texture_storage_run {std::size_t physical,logical,size;};
 [[nodiscard]] inline std::vector<texture_assembly_plane> plan_texture_assembly_planes(const guest_texture_layout& plan,
 	std::span<const guest_storage_segment> segments,std::size_t run_limit=1u<<20)
 {
-	if(plan.stored_border||plan.adjusted_pitch||segments.empty()||plan.subresources.empty())throw std::invalid_argument("RTT assembly lacks supported owned texture storage");
+	if((plan.stored_border&&!supports_stored_border_storage(plan))||segments.empty()||plan.subresources.empty())throw std::invalid_argument("RTT assembly lacks supported owned texture storage");
 	auto storage=guest_byte_coverage({0,plan.storage_bytes});storage.range.address=segments.front().address;validate_guest_segments(storage,segments);
 	std::vector<texture_assembly_plane> result;std::size_t runs=0;
-	for(const auto& s:plan.subresources)
+	for(const auto& level:plan.subresources)
 	{
-		const bool morton=plan.swizzled&&plan.codec.block.width==1;
-		const auto shape=morton?plan_swizzle({{s.columns,s.rows,s.depth},{},{s.columns,s.rows,s.depth}},plan.codec.block.bytes).log2:std::array<std::uint32_t,3>{};
+		const auto s=guest_texture_image_subresource(plan,level);
+		const bool morton=guest_texture_morton_blocks(plan);
+		const auto swizzle = morton ? guest_texture_swizzle_region(plan, s) : swizzle_region{};
+		const auto shape = morton ? plan_swizzle(swizzle, plan.codec.block.bytes).log2 : std::array<std::uint32_t, 3>{};
 		const auto row_bytes=checked_texture_product(s.columns,plan.codec.block.bytes),image_bytes=checked_texture_product(row_bytes,s.rows);
 		const auto address=[&](std::size_t x,std::size_t y,std::size_t z)
 		{
 			if(guest_texture_vtc(plan))return guest_texture_block_offset(plan,s,x,y,z);
-			return checked_texture_sum(s.offset,morton?checked_texture_product(morton_index({x,y,z},shape),plan.codec.block.bytes):
+			return checked_texture_sum(s.offset,morton?checked_texture_product(guest_texture_morton_index(swizzle,shape,x,y,z),plan.codec.block.bytes):
 				checked_texture_sum(checked_texture_product(checked_texture_sum(checked_texture_product(z,s.storage_rows),y),s.row_pitch),checked_texture_product(x,plan.codec.block.bytes)));
 		};
 		for(std::size_t z=0;z<s.depth;++z)
 		{
 			if(result.size()==4096)throw std::length_error("RTT assembly exceeds its slice bound");
 			auto view=plan;view.width=s.width;view.height=s.height;view.depth=view.layers=view.mips=1;view.dimension=vertex_texture_dimension::two;view.swizzled=false;
+			view.stored_border=false;
 			view.storage_bytes=image_bytes;view.offset=static_cast<std::uint32_t>(std::uint64_t(plan.offset)+address(0,0,z));
-			view.subresources={{0,image_bytes,row_bytes,s.width,s.height,1,s.columns,s.rows,s.rows,0,0,0}};
+			// A dense plane already includes the ring. Preserve paired-color lane
+		// selection without asking allocation or upload to add another ring.
+		const unsigned paired_border = plan.codec.block.width == 2 ? s.border : 0;
+		view.subresources={{0,image_bytes,row_bytes,s.width,s.height,1,s.columns,s.rows,s.rows,0,0,paired_border}};
 			texture_assembly_plane plane{std::move(view),{},s.level,s.face,z,static_cast<std::uint32_t>(std::uint64_t(plan.offset)+address(0,0,z))};
 			for(std::size_t y=0;y<s.rows;++y)for(std::size_t x=0;x<s.columns;)
 			{
-				const auto columns=guest_texture_vtc(plan)?1:morton&&((s.rows>1)||(s.depth>1))?std::min<std::size_t>(s.columns-x,s.columns>1?2:1):s.columns-x;
+				const auto columns=guest_texture_vtc(plan)?1:morton&&(shape[1]||shape[2])?
+					std::min(s.columns-x, 2-((x+swizzle.origin[0])&1)):s.columns-x;
 				auto original=address(x,y,z),payload=y*row_bytes+x*plan.codec.block.bytes,remaining=columns*plan.codec.block.bytes;
 				while(remaining)
 				{
@@ -109,6 +116,73 @@ struct texture_storage_run {std::size_t physical,logical,size;};
 	}
 	return result;
 }
+[[nodiscard]] inline std::vector<guest_storage_part> project_stored_border_texture(
+	const guest_texture_layout& plan, std::span<const guest_storage_segment> segments, std::size_t part_limit = 1u << 20)
+{
+	if (!plan.stored_border || !supports_stored_border_storage(plan) || segments.empty() || plan.subresources.empty())
+		throw std::invalid_argument("Stored border projection requires segmented texel storage");
+	auto storage = guest_byte_coverage({0, plan.storage_bytes});
+	storage.range.address = segments.front().address;
+	validate_guest_segments(storage, segments);
+	std::vector<guest_storage_part> result;
+	if (plan.dimension == vertex_texture_dimension::three || plan.dimension == vertex_texture_dimension::cube)
+	{
+		// Project the existing packed RTT planes back into sparse guest
+		// offsets. This avoids reading Morton padding or unused pitch bytes.
+		for (const auto& plane : plan_texture_assembly_planes(plan, segments, part_limit))
+			for (const auto& part : plane.spans)
+				for (std::size_t at = part.offset; at < part.offset + part.size;)
+				{
+					const auto* logical = texture_assembly_segment(plane.logical_spans, at);
+					if (!logical) throw std::logic_error("Stored-border plane projection lacks a guest address");
+					const auto size = std::min(part.offset + part.size, logical->offset + logical->size) - at;
+					if (result.size() >= part_limit) throw std::length_error("Stored-border planes exceed active capture budget");
+					const auto physical = static_cast<std::uint32_t>(part.address + at - part.offset);
+					const auto offset = static_cast<std::size_t>(logical->address - plan.offset) + at - logical->offset;
+					result.push_back({guest_byte_coverage({physical, size}), offset});
+					at += size;
+				}
+		return result;
+	}
+	std::vector<guest_storage_segment> mip_segments;
+	for (const auto& subresource : plan.subresources)
+	{
+		const auto level = guest_texture_image_subresource(plan, subresource);
+		const auto morton = plan.swizzled ? std::optional{guest_texture_swizzle_region(plan, level)} : std::nullopt;
+		const auto pitch = plan.swizzled ? 0 : plan.dimension == vertex_texture_dimension::one ? level.storage_bytes : level.row_pitch;
+		auto image = plan_guest_surface(0, level.columns, level.rows, plan.codec.block.bytes, pitch, morton);
+		const auto end = checked_texture_sum(level.offset, image.range.size);
+		if (image.range.size != level.storage_bytes || end > plan.storage_bytes)
+			throw std::invalid_argument("Stored border mip projection exceeds its storage");
+		mip_segments.clear();
+		for (const auto& segment : segments)
+		{
+			if (segment.offset >= end) break;
+			const auto begin = std::max(level.offset, segment.offset);
+			const auto limit = std::min(end, segment.offset + segment.size);
+			if (begin < limit)
+				mip_segments.push_back({static_cast<std::uint32_t>(segment.address + begin - segment.offset),
+					begin - level.offset, limit - begin});
+		}
+		if (mip_segments.empty()) throw std::invalid_argument("Stored border mip has no backing segments");
+		image.range.address = mip_segments.front().address;
+		for (auto& part : project_guest_segments(image, mip_segments, false, part_limit - result.size()))
+		{
+			part.offset += level.offset;
+			result.push_back(std::move(part));
+		}
+	}
+	return result;
+}
+[[nodiscard]] inline std::vector<guest_surface_layout> stored_border_texture_coverage(
+	const guest_texture_layout& plan, std::span<const guest_storage_segment> segments)
+{
+	std::vector<guest_surface_layout> coverage;
+	for (auto& part : project_stored_border_texture(plan, segments))
+		coverage.push_back(std::move(part.coverage));
+	return coverage;
+}
+
 // Prove a complete native rectangle against the plane's actual active-byte
 // order. Unlike a2D storage-layout guess,this also handles interleaved3D Z.
 // A banked logical RTT alias requires the original caller-supplied anchor;

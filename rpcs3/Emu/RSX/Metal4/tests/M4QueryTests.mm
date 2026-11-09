@@ -1,7 +1,9 @@
 #include "M4Pipeline.h"
 #include "M4Query.h"
+#include "M4RSXReports.h"
 #include "M4Texture.h"
 
+#include <cstring>
 #include <iostream>
 
 namespace
@@ -68,13 +70,15 @@ struct fixture
 		reject_depth = [ctx.device() newDepthStencilStateWithDescriptor:test];
 	}
 	void encode(metal4::query_pool& pool, bool reject = false, bool discard = false,
-		const std::function<void(id<MTLBuffer>, std::size_t)>& before = {})
+		const std::function<void(id<MTLBuffer>, std::size_t)>& before = {},
+		const metal4::conditional_draw* conditional = nullptr)
 	{
 		using namespace metal4;
 		MTL4RenderPassDescriptor* pass = [MTL4RenderPassDescriptor new];
 		pass.colorAttachments[0].texture = color;
 		pass.colorAttachments[0].loadAction = MTLLoadActionClear;
 		pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+		pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 1, 0, 1);
 		pass.depthAttachment.texture = depth;
 		pass.depthAttachment.loadAction = MTLLoadActionClear;
 		pass.depthAttachment.storeAction = MTLStoreActionStore;
@@ -88,7 +92,8 @@ struct fixture
 		commands.configure(discard ? kill : normal, reject ? reject_depth : pass_depth, raster, {}, {});
 		if (visibility)
 			commands.visibility(visibility->mode, visibility->offset);
-		commands.draw(MTLPrimitiveTypeTriangle, 0, 3);
+		if (conditional) commands.draw(*conditional);
+		else commands.draw(MTLPrimitiveTypeTriangle, 0, 3);
 		commands.end();
 	}
 };
@@ -182,18 +187,650 @@ void pending_error_and_sparse_retirement()
 	rejects([&] { failed.wait(); });
 	rejects([&] { (void)pool.consume(0); });
 	ctx.recover_completed_errors(); ctx.begin();
+	const std::uint32_t failed_handle[]{0};
+	rejects([&] { (void)pool.encode_conditional_draw(failed_handle, MTLPrimitiveTypeTriangle, 0, 3); });
 	rejects([&] { draws.encode(pool); }); ctx.cancel();
 	pool.discard(0); pool.begin(0, true); ctx.begin(); draws.encode(pool); ctx.submit().wait(); pool.end(0);
 	require(pool.consume(0) == 16, "Explicit query error discard did not restore counter reuse");
 	std::cout << "Pending batch isolation/exhaustion,2 occupied-handle visits out of2048,and failed-result refusal/discard passed\n";
 }
+void render_to_buffer_blit()
+{
+	using namespace metal4;
+	context ctx{3};
+	fixture draws(ctx);
+	query_pool pool(ctx, 1, 2);
+	const auto readback = make_buffer(ctx, 8, buffer_storage::shared);
+	for (bool separate_batch : {false, true})
+		for (bool discard : {false, true})
+		{
+			ctx.begin();
+			pool.begin(0, true);
+			id<MTLBuffer> counter = nil;
+			std::size_t offset = 0;
+			draws.encode(pool, false, discard, [&](id<MTLBuffer> buffer, std::size_t at)
+			{
+				counter = buffer;
+				offset = at;
+			});
+			pool.end(0);
+			std::optional<submission> producer;
+			if (separate_batch)
+			{
+				producer = ctx.submit();
+				ctx.begin();
+			}
+			const auto before = ctx.encoding_statistics();
+			copy_buffer(ctx, counter, offset, readback, 0, 8);
+			ctx.submit().wait();
+			if (producer) producer->wait();
+			std::uint64_t raw = 0;
+			std::memcpy(&raw, map_buffer(readback, 0, 8).data(), 8);
+			require(raw == (discard ? 0u : 16u) && pool.consume(0) == raw, "Render-to-blit visibility dependency lost a native counter");
+			const auto after = ctx.encoding_statistics();
+			require(after.buffer_blit_queue_barriers == before.buffer_blit_queue_barriers + 1 &&
+				after.buffer_blit_barriers == before.buffer_blit_barriers, "Visibility copy did not use the blit-stage queue barrier");
+		}
+	std::cout << "Native render-to-buffer blits: four exact visibility results, same and separate submission, narrowed consumer stages passed\n";
+}
+void bounded_counter_preclear()
+{
+	using namespace metal4;
+	context ctx;
+	fixture draws(ctx);
+	constexpr unsigned count = 33;
+	query_pool pool(ctx, count, count);
+	for (bool discard : {false, true})
+	{
+		const auto encoders = ctx.encoding_statistics().compute_encoders;
+		const auto initializations = pool.statistics().initializations;
+		ctx.begin();
+		for (unsigned handle = 0; handle < count; ++handle)
+		{
+			pool.begin(handle, true);
+			draws.encode(pool, false, discard);
+			pool.end(handle);
+		}
+		require(ctx.encoding_statistics().compute_encoders == encoders + 3 &&
+			pool.statistics().initializations == initializations + count,
+			"33 contiguous counters did not initialize in three bounded blits");
+		ctx.submit().wait();
+		for (unsigned handle = count; handle > 0; --handle)
+			require(pool.consume(handle - 1) == (discard ? 0u : 16u),
+				"Counter preclear lost a result or reused a stale value in the next recording");
+		require(pool.statistics().leased_counters == 0, "Counter preclear retained unused leases");
+	}
+	std::cout << "Bounded visibility preclear: 66 exact counters across two recordings, three blits per 33, stale values cleared\n";
+}
+
+void conditional_indirect_draw()
+{
+	using namespace metal4;
+	context ctx(3);
+	fixture draws(ctx);
+	query_pool sources(ctx, 3, 5), observed(ctx, 3, 3);
+	const auto gate = [ctx.device() newSharedEvent];
+	struct release { id<MTLSharedEvent> event; ~release() { if (event.signaledValue < 2) event.signaledValue = 2; } } guard{gate};
+	const std::uint32_t both[]{0, 1}, precise[]{0}, boolean[]{1};
+	const auto snapshot = [&](std::span<const std::uint32_t> handles)
+	{
+		const auto command = sources.encode_conditional_draw(handles, MTLPrimitiveTypeTriangle, 0, 3);
+		require(command.has_value(), "Same-recording query did not provide an indirect draw");
+		return *command;
+	};
+	const auto measure = [&](const conditional_draw& command, std::uint32_t handle = 0, bool discard = false)
+	{
+		observed.begin(handle, true);
+		draws.encode(observed, false, discard, {}, &command);
+		observed.end(handle);
+	};
+	const auto colors = make_buffer(ctx, 3 * 256, buffer_storage::shared);
+	const auto read_color = [&](unsigned index) { texture_to_buffer(ctx, draws.color, {}, colors, index * 256, 256); };
+	const std::uint64_t initial = 0xfffffff0ull;
+	const auto seed = make_upload(ctx, std::as_bytes(std::span{&initial, 1}));
+	ctx.begin();
+	ctx.wait_event(gate, 1);
+	sources.begin(0, true);
+	draws.encode(sources, false, false, [&](id<MTLBuffer> buffer, std::size_t offset) { copy_buffer(ctx, seed, 0, buffer, offset, 8); });
+	sources.end(0);
+	sources.begin(1, false);
+	draws.encode(sources, false, true);
+	sources.end(1);
+	const auto zero = snapshot(both);
+	sources.discard(1);
+	sources.begin(1, false);
+	draws.encode(sources);
+	sources.end(1);
+	const auto visible = snapshot(both);
+	measure(zero);
+	read_color(0);
+	measure(visible, 1);
+	read_color(1);
+	measure(visible, 2, true);
+	read_color(2);
+	const auto recorded = ctx.submit();
+	require(!recorded.ready(), "Gated conditional work completed prematurely");
+	gate.signaledValue = 1;
+	recorded.wait();
+	require(observed.consume(0) == 0 && observed.consume(1) == 16 && observed.consume(2) == 0,
+		"Conditional draws did not preserve zero/nonzero snapshot across handle reuse");
+	const std::array<std::uint8_t, 4> clear_pixel{0, 255, 0, 255}, drawn_pixel{255, 255, 255, 255};
+	require(std::memcmp(map_buffer(colors, 0, 4).data(), clear_pixel.data(), 4) == 0 &&
+		std::memcmp(map_buffer(colors, 256, 4).data(), drawn_pixel.data(), 4) == 0 &&
+		std::memcmp(map_buffer(colors, 512, 4).data(), clear_pixel.data(), 4) == 0,
+		"Indirect draws changed clear/discard results");
+	require(sources.consume(0) == 0 && sources.consume(1) == 1, "GPU reduction altered the CPU reports");
+	ctx.begin();
+	rejects([&] { measure(visible); });
+	observed.discard(0);
+	ctx.cancel();
+
+	// The same queue can record a second segment while a producer awaits its
+	// gate. Confirm fallback before release, then snapshot the completed and
+	// still-recording segments without consuming either.
+	sources.begin(0, true);
+	ctx.begin();
+	ctx.wait_event(gate, 2);
+	draws.encode(sources);
+	const auto pending = ctx.submit();
+	ctx.begin();
+	require(!sources.encode_conditional_draw(precise, MTLPrimitiveTypeTriangle, 0, 3),
+		"An unresolved foreign recording supplied an indirect command");
+	draws.encode(sources, false, false, [&](id<MTLBuffer> buffer, std::size_t offset)
+	{
+		const std::uint64_t wrap = 0xffffffe0ull;
+		const auto value = make_upload(ctx, std::as_bytes(std::span{&wrap, 1}));
+		copy_buffer(ctx, value, 0, buffer, offset, 8);
+	});
+	sources.end(0);
+	gate.signaledValue = 2;
+	pending.wait();
+	measure(snapshot(precise));
+	ctx.submit().wait();
+	require(observed.consume(0) == 0 && sources.consume(0) == 0,
+		"Conditional reduction failed to wrap the sum across multiple segments");
+
+	for (const bool prefix : {false, true})
+	{
+		sources.begin(1, false);
+		if (prefix) { ctx.begin(); draws.encode(sources); ctx.submit().wait(); }
+		ctx.begin(); draws.encode(sources); ctx.cancel();
+		sources.end(1);
+		ctx.begin(); measure(snapshot(boolean)); ctx.submit().wait();
+		require(observed.consume(0) == (prefix ? 16 : 0) && sources.consume(1) == std::uint32_t(prefix),
+			"GPU reduction mishandled a cancelled counter epoch");
+	}
+
+	query_pool retired(ctx, 2, 1);
+	ctx.begin(); retired.begin(0, true); draws.encode(retired); retired.end(0); ctx.submit().wait();
+	ctx.begin(); retired.begin(1, false); draws.encode(retired, false, true); retired.end(1);
+	const auto accumulated = retired.encode_conditional_draw(precise, MTLPrimitiveTypeTriangle, 0, 3);
+	require(accumulated.has_value(), "Retired prefix could not be encoded");
+	measure(*accumulated); ctx.submit().wait();
+	require(observed.consume(0) == 16 && retired.consume(0) == 16 && retired.consume(1) == 0,
+		"Reallocated native counter replaced an already retired report prefix");
+	std::cout << "Native conditional indirect draws: zero/nonzero, clear/discard, reuse, multi-segment wrap, retired/cancelled prefixes and pending fallback passed\n";
+}
+
+void conditional_report_draw()
+{
+	using namespace metal4;
+	context ctx;
+	fixture draws(ctx);
+	query_pool sources(ctx, 3, 3), observed(ctx, 10, 10);
+	const auto geometry = prepared_geometry::prepare(ctx, plan_indexed_references(
+		{list_topology::triangles, {{0, 0}, {1, 1}, {2, 2}}, std::nullopt}));
+	const auto measure = [&](const report_query_snapshot& report, std::uint32_t target)
+	{
+		const auto command = sources.encode_report_conditional_draw(report, geometry);
+		require(command.has_value(), "Available report did not produce a conditional draw");
+		observed.begin(target, true);
+		draws.encode(observed, false, false, {}, &*command);
+		observed.end(target);
+	};
+	constexpr std::uint32_t negative_sixteen = 0xfffffff0u;
+	const std::uint64_t counter_value = std::uint64_t(negative_sixteen) - 16;
+	const auto seed = make_upload(ctx, std::as_bytes(std::span{&counter_value, 1}));
+	ctx.begin();
+	sources.begin(0, true);
+	draws.encode(sources, false, false, [&](id<MTLBuffer> buffer, std::size_t offset) { copy_buffer(ctx, seed, 0, buffer, offset, 8); });
+	sources.end(0);
+	sources.begin(1, true);
+	draws.encode(sources);
+	sources.end(1);
+	sources.begin(2, false);
+	draws.encode(sources);
+	sources.end(2);
+	const report_query_source pair[]{{0}, {1}}, first[]{{0}}, consumed[]{{1, negative_sixteen}},
+		boolean_consumed[]{{2, 0xffffffffu}};
+	std::array<rsx::reports::occlusion_query_info, 5> query_records{};
+	for (std::uint32_t i = 0; i < query_records.size(); ++i)
+	{
+		query_records[i].driver_handle = i;
+		query_records[i].sync_tag = i + 1;
+		query_records[i].num_draws = 1;
+		query_records[i].pending = true;
+	}
+	constexpr std::uint32_t target_address = 0x2000;
+	std::array<rsx::reports::queued_report_write, 5> writers{};
+	const auto claim = [&](unsigned position, unsigned query, std::uint32_t slot, std::uint32_t address, std::uint32_t type)
+	{
+		writers[position].query = &query_records[query];
+		writers[position].counter_tag = slot;
+		writers[position].sink = vm::cast(address);
+		writers[position].type = type;
+	};
+	claim(0, 0, 1, 0x1000, CELL_GCM_ZCULL_STATS3);
+	claim(1, 3, 0, 0x1010, CELL_GCM_ZPASS_PIXEL_CNT);
+	claim(2, 4, 1, 0x1020, CELL_GCM_ZCULL_STATS2);
+	claim(3, 1, 1, target_address, CELL_GCM_ZPASS_PIXEL_CNT);
+	claim(4, 2, 1, 0x2010, CELL_GCM_ZPASS_PIXEL_CNT);
+	std::array<rsx::reports::query_stat_counter, 2> stats{};
+	stats[1].result = 9;
+	query_records[1].result = std::uint32_t{0} - 9;
+	const auto capture = [&] { return detail::capture_report_condition(writers, stats, target_address, 2, true, sources.capacity()); };
+	const auto captured = capture();
+	require(captured && captured->retired == 9 && captured->sources.size() == 2 &&
+		captured->sources[0].handle == 0 && captured->sources[1].handle == 1 &&
+		captured->sources[1].consumed == std::uint32_t{0} - 9,
+		"RSX report selection used the wrong slot, retirement order or prefix");
+	query_records[1].result = 0;
+	stats[1].result = 1;
+	measure(captured->snapshot(), 0); // The captured prefixes and two native values cancel modulo uint32.
+	writers[3].forwarder = &writers[4];
+	require(!capture(), "Forwarded report used GPU counters instead of its guest-memory value");
+	writers[3].forwarder = nullptr;
+	query_records[1].pending = false;
+	require(!capture(), "Retired report reused a live handle without an epoch");
+	query_records[1].pending = true;
+	query_records[1].driver_handle = 0;
+	require(!capture(), "RSX report accepted a duplicate driver handle");
+	query_records[1].driver_handle = 1;
+	writers[1].sink = {};
+	require(!capture(), "RSX report bypassed an unclaimed queue entry");
+	measure({pair, 0, false}, 1); // Boolean report stops at the first hit.
+	measure({first, 16, true}, 2);
+	measure({first, 17, true}, 3);
+	measure({consumed, 0, true}, 4);
+	measure({consumed, 1, true}, 5);
+	measure({boolean_consumed, 0, false}, 6);
+	measure({{}, 0, true}, 7);
+	measure({{}, 3, true}, 8);
+	measure({first, 16, false}, 9);
+	ctx.submit().wait();
+	const std::uint32_t expected[]{0, 16, 0, 16, 0, 16, 0, 0, 16, 16};
+	for (std::uint32_t i = 0; i < std::size(expected); ++i)
+		require(observed.consume(i) == expected[i], "Metal 4 report reduction changed the conditional result");
+	require(sources.consume(0) == negative_sixteen && sources.consume(1) == 16 && sources.consume(2) == 1,
+		"GPU report aggregation consumed or modified the CPU query results");
+
+	const auto gate = [ctx.device() newSharedEvent];
+	struct release { id<MTLSharedEvent> event; ~release() { event.signaledValue = 1; } } guard{gate};
+	ctx.begin(); ctx.wait_event(gate, 1);
+	sources.begin(0, true); draws.encode(sources); sources.end(0);
+	const auto producer = ctx.submit();
+	ctx.begin();
+	require(!sources.encode_report_conditional_draw({first, 16, true}, geometry),
+		"Precise report accepted an unresolved foreign producer");
+	measure({first, 16, false}, 0);
+	const auto consumer = ctx.submit();
+	gate.signaledValue = 1;
+	producer.wait();
+	consumer.wait();
+	require(observed.consume(0) == 16 && sources.consume(0) == 16, "Known Boolean report hit depended on a later query");
+
+	const auto error = make_buffer(ctx, sizeof(std::uint32_t), buffer_storage::shared);
+	*static_cast<std::uint32_t*>(error.contents) = 1;
+	ctx.begin();
+	sources.begin(1, true); draws.encode(sources); sources.end(1);
+	ctx.require_gpu_success(error, 0, @"Intentional conditional report producer failure");
+	const auto failed = ctx.submit();
+	rejects([&] { failed.wait(); });
+	ctx.recover_completed_errors();
+	ctx.begin();
+	require(!sources.encode_report_conditional_draw({pair, 0, false}, geometry),
+		"Failed Boolean producer bypassed the scheduler fallback");
+	rejects([&] { (void)sources.encode_report_conditional_draw({pair, 0, true}, geometry); });
+	measure({pair, 1, false}, 0);
+	ctx.submit().wait();
+	require(observed.consume(0) == 16, "Known Boolean report hit inherited an irrelevant producer failure");
+	std::cout << "Native conditional report sums: 10 exact GPU outcomes, RSX queue selection, prefixes, uint32 wrap, Boolean stop and pending/error policy passed\n";
+}
+
+void retained_report_predicate()
+{
+	using namespace metal4;
+	context ctx(3);
+	fixture draws(ctx);
+	query_pool sources(ctx, 1, 1), observed(ctx, 3, 3);
+	const auto geometry = prepared_geometry::prepare(ctx, plan_indexed_references(
+		{list_topology::triangles, {{0, 0}, {1, 1}, {2, 2}}, std::nullopt}));
+	const auto measure = [&](const report_predicate& predicate, std::uint32_t target)
+	{
+		const auto command = sources.encode_predicated_draw(predicate, geometry);
+		observed.begin(target, true);
+		draws.encode(observed, false, false, {}, &command);
+		observed.end(target);
+	};
+	const auto gate = [ctx.device() newSharedEvent];
+	struct release { id<MTLSharedEvent> event; ~release() { if (!event.signaledValue) event.signaledValue = 1; } } guard{gate};
+	const report_query_source handle[]{{0}};
+	ctx.begin();
+	ctx.wait_event(gate, 1);
+	sources.begin(0, true); draws.encode(sources); sources.end(0);
+	const auto positive = sources.capture_report_predicate({handle, 0, true});
+	const auto negative = sources.capture_report_predicate({{}, 0, true});
+	require(positive && negative, "Recording could not capture both native report values");
+	measure(*positive, 0);
+	const auto producer = ctx.submit();
+	ctx.begin();
+	measure(*positive, 1);
+	measure(*negative, 2);
+	const auto consumer = ctx.submit();
+	require(!producer.ready() && !consumer.ready(), "An unreleased report dependency completed prematurely");
+	gate.signaledValue = 1;
+	producer.wait();
+	consumer.wait();
+	require(observed.consume(0) == 16 && observed.consume(1) == 16 && observed.consume(2) == 0,
+		"Same/next-recording predicates did not produce exact visibility");
+
+	sources.discard(0);
+	ctx.begin();
+	sources.begin(0, true); draws.encode(sources, true); sources.end(0);
+	const auto replaced = sources.capture_report_predicate({handle, 0, true});
+	require(replaced.has_value(), "Reused report handle could not be captured");
+	measure(*positive, 0);
+	measure(*replaced, 1);
+	ctx.submit().wait();
+	require(observed.consume(0) == 16 && observed.consume(1) == 0 && sources.consume(0) == 0,
+		"Recycling the only native counter changed an earlier predicate");
+
+	context foreign;
+	query_pool foreign_sources(foreign, 1, 1);
+	foreign.begin();
+	rejects([&] { (void)foreign_sources.encode_predicated_draw(*positive, geometry); });
+	foreign.cancel();
+
+	const auto untouched = make_buffer(ctx, 4, buffer_storage::shared);
+	const auto status = make_buffer(ctx, 4, buffer_storage::shared);
+	*static_cast<std::uint32_t*>(untouched.contents) = 0;
+	*static_cast<std::uint32_t*>(status.contents) = 1;
+	for (bool gpu_failure : {false, true})
+	{
+		const auto failure_gate = [ctx.device() newSharedEvent];
+		release unblock{failure_gate};
+		ctx.begin();
+		ctx.wait_event(failure_gate, 1);
+		const auto predicate = sources.capture_report_predicate({{}, 1, true});
+		require(predicate.has_value(), "Known report prefix was not captured");
+		if (gpu_failure) ctx.require_gpu_success(status, 0, @"Intentional predicate GPU failure");
+		const auto rejected_producer = ctx.submit();
+		ctx.begin();
+		measure(*predicate, 0);
+		fill_buffer(ctx, untouched, 0, 4, 255);
+		const auto rejected_consumer = ctx.submit();
+		if (!gpu_failure) require(rejected_producer.cancel_pending(), "Predicate producer committed before cancellation");
+		failure_gate.signaledValue = 1;
+		rejects([&] { rejected_producer.wait(); });
+		rejects([&] { rejected_consumer.wait(); });
+		require(rejected_consumer.cancelled() && *static_cast<const std::uint32_t*>(untouched.contents) == 0,
+			"Failed report producer allowed dependent GPU work");
+		require(observed.consume(0) == 0, "Rejected predicate produced visibility");
+		ctx.recover_completed_errors();
+		ctx.begin();
+		rejects([&] { (void)sources.encode_predicated_draw(*predicate, geometry); });
+		ctx.cancel();
+	}
+	std::cout << "Native retained report predicates: same and pending recordings, query-slot reuse, foreign queue refusal and cancellation/error propagation passed\n";
+}
+
+void pending_report_segments()
+{
+	using namespace metal4;
+	context ctx(3);
+	fixture draws(ctx);
+	query_pool sources(ctx, 2, 4), observed(ctx, 1, 1);
+	const auto geometry = prepared_geometry::prepare(ctx, plan_indexed_references(
+		{list_topology::triangles, {{0, 0}, {1, 1}, {2, 2}}, std::nullopt}));
+	const report_query_source first[]{{0}}, both[]{{0}, {1}};
+	const auto capture = [&](const report_query_snapshot& report)
+	{
+		const auto predicate = sources.capture_report_predicate(report);
+		require(predicate.has_value(), "Pending report failed to capture a native predicate");
+		const auto draw = sources.encode_predicated_draw(*predicate, geometry);
+		observed.begin(0, true);
+		draws.encode(observed, false, false, {}, &draw);
+		observed.end(0);
+	};
+	struct gate_guard
+	{
+		id<MTLSharedEvent> event;
+		~gate_guard() { if (!event.signaledValue) event.signaledValue = 1; }
+		void open() { event.signaledValue = 1; }
+	};
+	{
+		gate_guard gate{[ctx.device() newSharedEvent]};
+		ctx.begin(); ctx.wait_event(gate.event, 1);
+		sources.begin(1, true); draws.encode(sources); sources.end(1);
+		sources.begin(0, true); draws.encode(sources);
+		const auto producer = ctx.submit();
+		ctx.begin(); draws.encode(sources); sources.end(0);
+		capture({both, 0, true});
+		const auto consumer = ctx.submit();
+		require(!producer.ready() && !consumer.ready(), "Pending and current query segments were published early");
+		gate.open();
+		producer.wait(); consumer.wait();
+		require(sources.consume(0) == 32 && sources.consume(1) == 16 && observed.consume(0) == 16,
+			"Pending and current query segments did not reduce together");
+	}
+	for (bool prefix : {false, true})
+	{
+		std::size_t previous_offset = 0;
+		ctx.begin(); sources.begin(0, true);
+		draws.encode(sources, false, false, [&](id<MTLBuffer>, std::size_t offset) { previous_offset = offset; });
+		ctx.submit().wait();
+		if (!prefix)
+		{
+			sources.discard(0);
+			sources.begin(0, true);
+		}
+		gate_guard gate{[ctx.device() newSharedEvent]};
+		ctx.begin(); ctx.wait_event(gate.event, 1);
+		draws.encode(sources, false, false, [&](id<MTLBuffer>, std::size_t offset)
+			{ require(offset == previous_offset, "Cancellation fixture did not reuse the known nonzero native counter"); });
+		sources.end(0);
+		const auto producer = ctx.submit();
+		ctx.begin(); capture({first, 0, true}); const auto consumer = ctx.submit();
+		require(producer.cancel_pending(), "Visibility producer committed before cancellation");
+		gate.open();
+		rejects([&] { producer.wait(); });
+		consumer.wait();
+		const auto expected = prefix ? 16u : 0u;
+		require(sources.consume(0) == expected && observed.consume(0) == expected,
+			"Cancelled producer lost its committed prefix or exposed a stale counter");
+		ctx.recover_completed_errors();
+	}
+
+	const auto error = make_buffer(ctx, 4, buffer_storage::shared);
+	const auto readback = make_buffer(ctx, 256, buffer_storage::shared);
+	*static_cast<std::uint32_t*>(error.contents) = 1;
+	for (bool precise : {false, true})
+	{
+		ctx.begin(); sources.begin(0, true); draws.encode(sources); sources.end(0); ctx.submit().wait();
+		gate_guard gate{[ctx.device() newSharedEvent]};
+		ctx.begin(); ctx.wait_event(gate.event, 1);
+		sources.begin(1, true); draws.encode(sources); sources.end(1);
+		ctx.require_gpu_success(error, 0, @"Intentional pending source failure");
+		const auto producer = ctx.submit();
+		ctx.begin(); capture({both, 0, precise});
+		texture_to_buffer(ctx, draws.color, {}, readback, 0, 256);
+		const auto consumer = ctx.submit();
+		gate.open();
+		rejects([&] { producer.wait(); });
+		if (precise)
+		{
+			rejects([&] { consumer.wait(); });
+			const std::array<std::uint8_t, 4> clear{0, 255, 0, 255};
+			require(std::memcmp(map_buffer(readback, 0, 4).data(), clear.data(), 4) == 0,
+				"Relevant report producer error permitted color output");
+			observed.discard(0);
+			ctx.recover_completed_errors();
+			ctx.begin();
+			const auto failed_snapshot = sources.capture_report_predicate({both, 0, true});
+			require(failed_snapshot.has_value(), "Completed query error lost the ordered GPU validation path");
+			const auto failed_capture = ctx.submit();
+			rejects([&] { failed_capture.wait(); });
+		}
+		else
+		{
+			consumer.wait();
+			require(observed.consume(0) == 16, "Boolean hit was invalidated by an irrelevant later producer error");
+		}
+		require(sources.consume(0) == 16, "Pending capture consumed the independent CPU counter");
+		sources.discard(1);
+		ctx.recover_completed_errors();
+	}
+	std::cout << "Native pending report sources: mixed recordings, stale counter suppression, committed prefix and ordered failure handling passed\n";
+}
+
+void submitted_report_predicates()
+{
+	using namespace metal4;
+	using namespace std::chrono_literals;
+	context ctx(2, 64, 5s, context::recording_overlap::explicit_predecessor);
+	fixture draws(ctx);
+	query_pool sources(ctx, 1, 1), observed(ctx, 1, 1);
+	const auto geometry = prepared_geometry::prepare(ctx, plan_indexed_references(
+		{list_topology::triangles, {{0, 0}, {1, 1}, {2, 2}}, std::nullopt}));
+	const report_query_source source[]{{0}};
+	require(!ctx.last_submission(), "Empty queue reported a predecessor");
+	for (unsigned profile = 0; profile < 3; ++profile)
+	{
+		const bool visible = profile != 0, cancelled = profile == 2;
+		const auto event = [ctx.device() newSharedEvent];
+		struct release { id<MTLSharedEvent> event; ~release() { event.signaledValue = 1; } } release_gate{event};
+		ctx.begin();
+		ctx.wait_event(event, 1);
+		sources.begin(0, true);
+		draws.encode(sources, !visible);
+		sources.end(0);
+		const auto producer = ctx.submit();
+		const auto predicate = sources.submit_report_predicate({source, 0, true});
+		const auto reduction = ctx.last_submission();
+		require(predicate && reduction && !reduction->same_batch(producer) && !producer.ready() && !reduction->ready(),
+			"Report reduction blocked on the producer or completed before its event");
+		bool waited = false;
+		try { reduction->wait(1ms); }
+		catch (const submission_wait_timeout&) { waited = true; }
+		require(waited, "Report was visible before the ordered reduction");
+		if (cancelled) require(producer.cancel_pending(), "Could not cancel gated report producer");
+		event.signaledValue = 1;
+		if (cancelled)
+		{
+			rejects([&] { producer.wait(5s); });
+			rejects([&] { reduction->wait(5s); });
+			require(reduction->ready() && producer.cancelled(), "Report cancellation did not settle both submissions");
+			sources.discard(0);
+			ctx.recover_completed_errors();
+		}
+		else
+		{
+			reduction->wait(5s);
+			ctx.begin();
+			const auto draw = sources.encode_predicated_draw(*predicate, geometry);
+			observed.begin(0, true);
+			draws.encode(observed, false, false, {}, &draw);
+			observed.end(0);
+			ctx.submit().wait(5s);
+			const auto expected = visible ? 16u : 0u;
+			require(sources.consume(0) == expected && observed.consume(0) == expected,
+				"Deferred report reduction returned the wrong count or predicate");
+		}
+	}
+	std::cout << "Submitted report predicates: reduction returned before the gated producer; exact zero and sixteen counts and cancellation propagated\n";
+}
+
+void cpu_known_report_predicates()
+{
+	using namespace metal4;
+	using namespace std::chrono_literals;
+	context ctx(2, 64, 5s, context::recording_overlap::explicit_predecessor);
+	fixture draws(ctx);
+	query_pool sources(ctx, 2, 1), observed(ctx, 1, 1);
+	const auto geometry = prepared_geometry::prepare(ctx, plan_indexed_references(
+		{list_topology::triangles, {{0, 0}, {1, 1}, {2, 2}}, std::nullopt}));
+	const auto verify = [&](const report_predicate& predicate, unsigned expected)
+	{
+		ctx.begin();
+		const auto draw = sources.encode_predicated_draw(predicate, geometry);
+		observed.begin(0, true);
+		draws.encode(observed, false, false, {}, &draw);
+		observed.end(0);
+		ctx.submit().wait(5s);
+		require(observed.consume(0) == expected, "CPU-known report changed GPU draw visibility");
+	};
+	const auto zero = sources.submit_report_predicate({{}, 0, true});
+	require(zero && !ctx.last_submission(), "Empty CPU-known report submitted GPU work");
+	verify(*zero, 0);
+
+	ctx.begin();
+	sources.begin(0, true);
+	draws.encode(sources);
+	sources.end(0);
+	ctx.submit().wait(5s);
+	const auto event = [ctx.device() newSharedEvent];
+	struct release { id<MTLSharedEvent> event; ~release() { event.signaledValue = 1; } } release_gate{event};
+	ctx.begin();
+	ctx.wait_event(event, 1);
+	sources.begin(1, true);
+	draws.encode(sources); // Reclaims source 0 into its CPU accumulator.
+	sources.end(1);
+	const auto producer = ctx.submit();
+	const auto before = ctx.encoding_statistics().compute_encoders;
+	const report_query_source accumulated[]{{0, 0}}, wrapped[]{{0, std::uint32_t{0} - 16}}, live[]{{1, 0}};
+	const auto hit = sources.submit_report_predicate({accumulated, 0, true});
+	const auto wrap_zero = sources.submit_report_predicate({wrapped, 0, true});
+	const auto wrap_one = sources.submit_report_predicate({wrapped, 1, true});
+	const auto retired_hit = sources.submit_report_predicate({live, 1, false});
+	const auto latest = ctx.last_submission();
+	require(hit && wrap_zero && wrap_one && retired_hit && latest && latest->same_batch(producer) &&
+		!producer.ready() && ctx.encoding_statistics().compute_encoders == before,
+		"CPU-known report waited or recorded a redundant reduction");
+	event.signaledValue = 1;
+	producer.wait(5s);
+	verify(*hit, 16);
+	verify(*wrap_zero, 0);
+	verify(*wrap_one, 16);
+	verify(*retired_hit, 16);
+	require(sources.consume(0) == 16 && sources.consume(1) == 16, "CPU-known report consumed source counters");
+	std::cout << "CPU-known reports: five exact GPU draw outcomes without reduction submissions; gated predecessor, uint32 wrap and retired boolean hit preserved\n";
+}
 } // namespace
-int main()
+int main(int argc, char** argv)
 {
 	@autoreleasepool
 	{
 		try
 		{
+			if (argc == 2 && std::string_view(argv[1]) == "--conditional-only")
+			{
+				conditional_indirect_draw();
+				conditional_report_draw();
+				retained_report_predicate();
+				pending_report_segments();
+				submitted_report_predicates();
+				cpu_known_report_predicates();
+				return 0;
+			}
+			require(argc == 1, "Unknown native query test selector");
+			render_to_buffer_blit();
+			bounded_counter_preclear();
+			conditional_indirect_draw();
+			conditional_report_draw();
+			retained_report_predicate();
+			pending_report_segments();
+			submitted_report_predicates();
+			cpu_known_report_predicates();
 			using namespace metal4;
 			intervals_and_boundaries();
 			pending_error_and_sparse_retirement();
@@ -338,7 +975,12 @@ int main()
 			delayed->begin(0, true);
 			ctx.begin();
 			ctx.wait_event(gate, 1);
-			draws.encode(*delayed);
+			// Match DrawExecutor's draw scope so Metal validation temporaries
+			// cannot keep the counter alive beyond submission completion.
+			@autoreleasepool
+			{
+				draws.encode(*delayed);
+			}
 			const auto pending = ctx.submit();
 			delayed->end(0);
 			require(!delayed->ready(0), "Pending GPU query appeared ready");
@@ -362,7 +1004,6 @@ int main()
 			}
 			gate.signaledValue = 1;
 			pending.wait();
-			// wait() publishes only after completion-owned leases are released.
 			require(budget->statistics().reserved_bytes == 0, "Completed discarded query retained counter reservation");
 			query_pool reusable(ctx, 1, 1, budget);
 			require(budget->statistics().live_buffers == 1, "Completed counter budget cannot be reused");

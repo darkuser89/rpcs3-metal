@@ -9,29 +9,81 @@
 
 #include <limits>
 #include <algorithm>
+#include <mutex>
 #include <stdexcept>
 
 namespace metal4
 {
+struct vertex_shader::flat_pipeline_state
+{
+	explicit flat_pipeline_state(const compiler& compiler, id<MTLLibrary> library, std::optional<compiler_job> prepared)
+		: compile(compiler), descriptor([MTL4ComputePipelineDescriptor new]), job(std::move(prepared))
+	{
+		descriptor.computeFunctionDescriptor = library_function(library, @"rpcs3_rsx_flat_colors");
+	}
+
+	std::optional<compiler> compile;
+	MTL4ComputePipelineDescriptor* descriptor;
+	std::mutex mutex;
+	std::optional<compiler_job> job;
+	id<MTLComputePipelineState> pipeline = nil;
+};
+
 vertex_shader::vertex_shader(const compiler& compiler,
 							 std::span<const std::array<std::uint32_t, 4>> instructions, const vertex_program_options& options)
 	: vertex_shader(compiler, generate_vertex_program(instructions, options), options)
 {
+	if (m_flat_pipeline) (void)flat_pipeline();
 }
 
-vertex_shader::vertex_shader(const compiler& compiler, const generated_vertex_program& program, const vertex_program_options& options, id<MTLLibrary> prepared)
-	: m_dimensions(options.textures), m_border_mask(options.border_textures), m_packed_inputs(options.packed_inputs),m_flat_result_inputs(options.flat_result_inputs)
+vertex_shader::vertex_shader(const compiler& compiler, const generated_vertex_program& program, const vertex_program_options& options, id<MTLLibrary> prepared,
+	std::optional<compiler_job> flat)
+	: m_dimensions(options.textures), m_border_mask(options.border_textures), m_packed_inputs(options.packed_inputs)
 {
 	m_texture_mask = program.texture_mask;
 	m_library = prepared ? prepared : compiler.library(program.source, @"RPCS3 native RSX vertex program");
 	if (m_library.device != compiler.device() || ![m_library.functionNames containsObject:@"rpcs3_rsx_vertex"])
 		throw std::invalid_argument("Native prepared vertex library has a different device or entry");
-	if (m_flat_result_inputs)
+	if (options.flat_result_inputs)
+		m_flat_pipeline = std::make_shared<flat_pipeline_state>(compiler, m_library, std::move(flat));
+}
+
+std::size_t vertex_shader::host_bytes(const vertex_program_options& options) noexcept
+{
+	return sizeof(vertex_shader) + (options.flat_result_inputs ? sizeof(flat_pipeline_state) : 0);
+}
+
+void vertex_shader::prewarm_flat_pipeline() const
+{
+	if (!m_flat_pipeline) return;
+	auto& flat = *m_flat_pipeline;
+	std::lock_guard lock(flat.mutex);
+	if (!flat.pipeline && !flat.job)
+		flat.job = flat.compile->tasks().compute(flat.descriptor);
+}
+
+id<MTLComputePipelineState> vertex_shader::flat_pipeline() const
+{
+	auto& flat = *m_flat_pipeline;
+	std::lock_guard lock(flat.mutex);
+	if (!flat.pipeline)
 	{
-		auto descriptor=[MTL4ComputePipelineDescriptor new];
-		descriptor.computeFunctionDescriptor=library_function(m_library,@"rpcs3_rsx_flat_colors");
-		m_flat_pipeline=compiler.compute(descriptor);
+		if (!flat.job) flat.job = flat.compile->tasks().compute(flat.descriptor, std::chrono::seconds(30));
+		if (!flat.job) throw std::runtime_error("Timed out admitting native Flat Color pipeline compilation");
+		try { flat.pipeline = flat.job->compute(); }
+		catch (...)
+		{
+			// Retry failed compilations, while keeping a timed-out job alive.
+			if (flat.job->ready())
+				try { (void)flat.job->compute(std::chrono::milliseconds(0)); }
+				catch (...) { flat.job.reset(); }
+			throw;
+		}
+		flat.job.reset();
+		flat.descriptor = nil;
+		flat.compile.reset();
 	}
+	return flat.pipeline;
 }
 
 MTL4LibraryFunctionDescriptor* vertex_shader::function() const
@@ -42,7 +94,7 @@ MTL4LibraryFunctionDescriptor* vertex_shader::function() const
 bindings vertex_shader::prepare(context& ctx, vertex_context state,
 								const converted_geometry& geometry, const vertex_inputs& inputs, prepared_flat_colors* flat) const
 {
-	if (m_flat_result_inputs != bool(flat)) throw std::invalid_argument("Native flat result binding contract differs from shader ABI");
+	if (bool(m_flat_pipeline) != bool(flat)) throw std::invalid_argument("Native flat result binding contract differs from shader ABI");
 	if (flat)
 	{
 		flat->validate(ctx,geometry);
@@ -98,6 +150,7 @@ bindings vertex_shader::prepare(context& ctx, vertex_context state,
 		result.set_texture(i, texture);
 		result.set_sampler(i, sampler);
 	}
+	const auto flat_compute = flat && !flat->source_ids().empty() && state.predicate ? flat_pipeline() : nil;
 	// Even unused pointer arguments receive a valid allocation. A zero register
 	// count still prevents shader reads; the dummy doesn't extend its bounds.
 	const std::array<std::byte, 16> zero{};
@@ -130,14 +183,22 @@ bindings vertex_shader::prepare(context& ctx, vertex_context state,
 	result.set_buffer(3, sampling.buffer, sampling.offset);
 	if (flat)
 	{
-		if (state.flat_count && state.predicate)
+		if (flat_compute)
 		{
-			const auto table=result.snapshot(ctx);
+			// The flat kernel reads the same vertex bindings and writes only its
+			// prepared result buffer. Samplers do not carry writable storage.
+			std::array<context::accessed_resource, context::max_dispatch_accesses> accesses{};
+			std::size_t used = 0;
+			for (const auto& binding : result.m_buffers)
+				if (binding.buffer)
+					accesses.at(used++) = {binding.buffer, binding.offset, binding.buffer.length - binding.offset,
+						binding.buffer == flat->results()};
+			for (const auto& texture : result.m_textures)
+				if (texture)
+					accesses.at(used++) = {texture};
+			ctx.checked_dispatch(flat_compute, result, std::span{accesses}.first(used), MTLSizeMake(state.flat_count, 1, 1),
+				MTLSizeMake(std::min<NSUInteger>(state.flat_count, flat_compute.maxTotalThreadsPerThreadgroup), 1, 1));
 			flat->consume();
-			ctx.end_encoding();
-			const auto encoder=ctx.compute(); ctx.keep_alive(m_flat_pipeline);
-			[encoder setComputePipelineState:m_flat_pipeline]; [encoder setArgumentTable:table];
-			[encoder dispatchThreads:MTLSizeMake(state.flat_count,1,1) threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(state.flat_count,m_flat_pipeline.maxTotalThreadsPerThreadgroup),1,1)];
 			ctx.end_encoding();
 		}
 		else flat->consume();
@@ -147,8 +208,14 @@ bindings vertex_shader::prepare(context& ctx, vertex_context state,
 
 std::vector<upload_requirement> vertex_shader::uploads(const vertex_inputs& inputs,const prepared_flat_colors* flat) const
 {
+	return plan_uploads(inputs, bool(m_flat_pipeline), flat);
+}
+
+std::vector<upload_requirement> vertex_shader::plan_uploads(const vertex_inputs& inputs,
+	bool flat_result_inputs, const prepared_flat_colors* flat)
+{
 	std::vector<upload_requirement> result;
-	if ((inputs.packed ? (!inputs.packed->persistent || !inputs.packed->transient || !inputs.constants) : (!inputs.attributes || !inputs.constants)) || (m_flat_result_inputs && (!flat || flat->source_ids().empty()))) result.push_back({16, 16});
+	if ((inputs.packed ? (!inputs.packed->persistent || !inputs.packed->transient || !inputs.constants) : (!inputs.attributes || !inputs.constants)) || (flat_result_inputs && (!flat || flat->source_ids().empty()))) result.push_back({16, 16});
 	if (inputs.packed) result.push_back({sizeof(vertex_fetch_parameters),256});
 	result.push_back({sizeof(vertex_context), 256});
 	result.push_back({sizeof(inputs.sampling), 16});

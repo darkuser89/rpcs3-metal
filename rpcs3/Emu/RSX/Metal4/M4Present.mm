@@ -1,6 +1,7 @@
 #include "M4Present.h"
 #include "M4PresentKernels.h"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
@@ -121,11 +122,28 @@ id<MTLRenderPipelineState> presenter::pipeline(MTLPixelFormat format)
 	return result;
 }
 
+void present_image::depend_on_uploads(context& ctx) const
+{
+	for (const auto& upload : uploads)
+		if (upload) ctx.depend_on_predecessor(*upload);
+}
+
+void begin_present_commands(context& ctx, const present_image* image)
+{
+	const auto last = ctx.last_submission();
+	const bool follows_upload = last && image && std::ranges::any_of(image->uploads, [&](const auto& upload)
+	{
+		return upload && upload->same_batch(*last);
+	});
+	ctx.begin(follows_upload ? &*last : nullptr);
+}
+
 void presenter::encode(context& ctx, const present_image& image, id<MTLTexture> destination)
 {
 	@autoreleasepool
 	{
 		validate(ctx, image, destination);
+		image.depend_on_uploads(ctx);
 		const auto state = pipeline(destination.pixelFormat);
 		parameters params{{float(image.region.origin.x), float(image.region.origin.y)},
 								{float(image.region.size.width), float(image.region.size.height)},
@@ -145,7 +163,7 @@ void presenter::encode(context& ctx, const present_image& image, id<MTLTexture> 
 		params.destination_origin[0] = float(image.destination.x); params.destination_origin[1] = float(image.destination.y);
 		params.destination_extent[0] = float(image.destination.width); params.destination_extent[1] = float(image.destination.height);
 		const auto upload = ctx.upload(std::as_bytes(std::span{&params, 1}));
-		bindings vertex, fragment;
+		bindings fragment;
 		fragment.set_buffer(0, upload.buffer, upload.offset);
 		fragment.set_texture(0, image.texture);
 		fragment.set_texture(1, right.texture);
@@ -159,10 +177,7 @@ void presenter::encode(context& ctx, const present_image& image, id<MTLTexture> 
 		const auto& rect = image.destination;
 		raster.viewport = {double(rect.x), double(rect.y), double(rect.width), double(rect.height), 0, 1};
 		raster.scissor = rect;
-		render_commands commands(ctx, pass);
-		commands.configure(state, nil, raster, vertex, fragment);
-		commands.draw(MTLPrimitiveTypeTriangle, 0, 3);
-		commands.end();
+		render_commands::draw_fragment_triangle(ctx, pass, state, nil, raster, fragment);
 	}
 }
 
@@ -178,7 +193,7 @@ std::optional<submission> presenter::present(context& ctx, const present_image& 
 			return std::nullopt;
 		validate(ctx, image, drawable.texture);
 		(void)pipeline(drawable.texture.pixelFormat);
-		ctx.begin();
+		begin_present_commands(ctx, &image);
 		try
 		{
 			ctx.target_drawable(drawable);
@@ -206,8 +221,7 @@ void presenter::encode_black(context& ctx, id<MTLTexture> destination) const
 		pass.colorAttachments[0].loadAction = MTLLoadActionClear;
 		pass.colorAttachments[0].storeAction = MTLStoreActionStore;
 		pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
-		(void)ctx.render(pass);
-		ctx.end_encoding();
+		render_commands::materialize_attachments(ctx, pass);
 	}
 }
 } // namespace metal4

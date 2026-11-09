@@ -30,6 +30,20 @@ class surface_color_transfer final
 	id<MTLDevice> m_device;
 	id<MTLComputePipelineState> m_pipeline;
 
+	friend class guest_texture_resolver;
+	struct download_storage
+	{
+		id<MTLBuffer> native, uniforms;
+		std::size_t pitch;
+	};
+	[[nodiscard]] download_storage prepare_download(context& ctx, surface_color format, const texture_region& region,
+		id<MTLBuffer> guest, const surface_byte_region& output) const;
+	void download_impl(context& ctx, surface_color format, id<MTLTexture> texture, const texture_region& region,
+		id<MTLBuffer> guest, const surface_byte_region& output, const download_storage* prepared) const;
+	void convert_impl(context& ctx, surface_color format, std::size_t width, std::size_t height,
+		id<MTLBuffer> source, const surface_byte_region& input, id<MTLBuffer> destination,
+		const surface_byte_region& output, id<MTLBuffer> prepared) const;
+
 public:
 	explicit surface_color_transfer(context& ctx);
 	// Bit-exact reversible conversion between guest BE pixels and native LE

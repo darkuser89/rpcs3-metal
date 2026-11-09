@@ -1,4 +1,5 @@
 #include "M4ScaledImage.h"
+#include "M4TransferPublication.h"
 #include "M4ScaledImageKernels.h"
 
 namespace metal4
@@ -113,15 +114,13 @@ void scaled_image_compute::encode(context& ctx, const scaled_image_plan& plan, i
 	resources.set_buffer(0, source);
 	resources.set_buffer(1, destination);
 	resources.set_buffer(2, uniforms.buffer, uniforms.offset);
-	const auto table = resources.snapshot(ctx);
-	ctx.keep_alive(m_pipeline);
-	const auto encoder = ctx.compute();
-	ctx.barrier(MTLStageDispatch | MTLStageBlit, MTLStageDispatch);
-	[encoder setComputePipelineState:m_pipeline];
-	[encoder setArgumentTable:table];
+	const std::array accesses{
+		context::accessed_resource{source, 0, plan.source.range.size},
+		context::accessed_resource{destination, 0, plan.destination.range.size, true},
+		context::accessed_resource{uniforms.buffer, uniforms.offset, uniforms.size}};
 	const NSUInteger x = std::min<NSUInteger>(16, m_pipeline.maxTotalThreadsPerThreadgroup);
-	[encoder dispatchThreads:MTLSizeMake(plan.destination.width, plan.destination.height, 1)
-		threadsPerThreadgroup:MTLSizeMake(x, std::min<NSUInteger>(16, m_pipeline.maxTotalThreadsPerThreadgroup / x), 1)];
+	ctx.checked_dispatch(m_pipeline, resources, accesses, MTLSizeMake(plan.destination.width, plan.destination.height, 1),
+		MTLSizeMake(x, std::min<NSUInteger>(16, m_pipeline.maxTotalThreadsPerThreadgroup / x), 1));
 }
 void scaled_image_compute::gather(context& ctx,id<MTLBuffer> source,id<MTLBuffer> destination,
 	std::span<const display_storage_copy> copies,std::size_t input) const
@@ -130,20 +129,33 @@ void scaled_image_compute::gather(context& ctx,id<MTLBuffer> source,id<MTLBuffer
 	if(ctx.device()!=m_device||!source||!destination||source.device!=m_device||destination.device!=m_device||source==destination||copies.size()>(1u<<20))
 		throw std::invalid_argument("Native scaled-image gather requires bounded buffers on its own device");
 	std::vector<copy> selected;std::uint64_t total=0;
+	std::size_t source_begin = source.length, source_end = 0;
+	std::size_t target_begin = destination.length, target_end = 0;
 	for(const auto& part:copies)if(part.input==input)
 	{
 		if(!part.size||part.source>source.length||part.size>source.length-part.source||part.target>destination.length||part.size>destination.length-part.target)
 			throw std::out_of_range("Native scaled-image gather exceeds buffer extent");
 		selected.push_back({part.target,part.source,total,part.size});total+=part.size;
+		source_begin = std::min(source_begin, part.source);
+		source_end = std::max(source_end, part.source + part.size);
+		target_begin = std::min(target_begin, part.target);
+		target_end = std::max(target_end, part.target + part.size);
 	}
 	if(selected.empty()||total>m_limit||total>std::numeric_limits<std::uint32_t>::max())throw std::invalid_argument("Native scaled-image gather lacks bounded disjoint bytes");
 	const auto records=ctx.upload(std::as_bytes(std::span{selected}),256);
 	const std::array<std::uint64_t,2> shape{total,selected.size()};const auto sizes=ctx.upload(std::as_bytes(std::span{shape}),256);
 	bindings resources;resources.set_buffer(0,source);resources.set_buffer(1,destination);resources.set_buffer(2,records.buffer,records.offset);resources.set_buffer(3,sizes.buffer,sizes.offset);
-	const auto table=resources.snapshot(ctx);ctx.keep_alive(m_gather);const auto encoder=ctx.compute();ctx.barrier(MTLStageDispatch|MTLStageBlit,MTLStageDispatch);
-	[encoder setComputePipelineState:m_gather];[encoder setArgumentTable:table];
-	[encoder dispatchThreads:MTLSizeMake(total,1,1) threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(256,m_gather.maxTotalThreadsPerThreadgroup),1,1)];
+	const std::array accesses{
+		context::accessed_resource{source, source_begin, source_end - source_begin},
+		context::accessed_resource{destination, target_begin, target_end - target_begin, true},
+		context::accessed_resource{records.buffer, records.offset, records.size},
+		context::accessed_resource{sizes.buffer, sizes.offset, sizes.size}};
+	ctx.checked_dispatch(m_gather, resources, accesses, total);
 }
+struct native_scale_publication
+{
+	bool alive = true, published = false;
+};
 struct scaled_image_transfer::pending
 {
 	std::optional<submission> work;
@@ -152,76 +164,176 @@ struct scaled_image_transfer::pending
 	std::size_t output_bytes;
 	id<MTLBuffer> output;
 	std::function<void()> validate_metadata;
-	std::shared_ptr<bool> native_owner={};
+	std::shared_ptr<native_scale_publication> native_owner={};
 	cached_surface_ref native_target={};
 };
 scaled_image_transfer::scaled_image_transfer(context& ctx, surface_cache& surfaces, guest_texture_cache& textures,
-											 std::shared_ptr<guest_surface_memory> memory, cpu_capture_dispatch capture, std::size_t limit)
-	: m_context(ctx), m_surfaces(surfaces), m_textures(textures), m_memory(std::move(memory)), m_capture(std::move(capture)), m_compute(ctx, limit), m_colors(ctx), m_samples(ctx), m_limit(limit)
+											 std::shared_ptr<guest_surface_memory> memory, cpu_capture_dispatch capture, std::size_t limit, std::size_t writer_limit)
+	: m_context(ctx), m_surfaces(surfaces), m_textures(textures), m_memory(std::move(memory)), m_capture(std::move(capture)), m_compute(ctx, limit), m_colors(ctx), m_samples(ctx), m_limit(limit), m_writer_limit(writer_limit)
 {
-	if (!m_memory || !m_capture)
+	if (!m_memory || !m_capture || !m_writer_limit || m_writer_limit > scaled_image_max_writers)
 		throw std::invalid_argument("Native scaled-image requires coherent memory and a CPU capture epoch");
 	m_surfaces.validate_texture_adapter(ctx, *m_memory);
 	m_textures.validate_surface_adapter(ctx, m_surfaces);
 }
 scaled_image_transfer::~scaled_image_transfer()
 {
-	if(m_pending&&m_pending->native_owner)*m_pending->native_owner=false;
+	if(m_pending&&m_pending->native_owner)m_pending->native_owner->alive=false;
 }
 void scaled_image_transfer::encode_native(const scaled_image_plan& plan,std::span<const clear_rectangle> regions,
-	context& ctx,std::span<const id<MTLTexture>> images,std::span<const cached_surface_description> inputs,std::span<const display_storage_copy> copies,
-	std::span<const std::byte> input_bytes,std::span<const display_storage_copy> input_patches)
+	context& ctx,std::span<const id<MTLTexture>> images,std::span<const cached_surface_description> inputs,std::span<const std::vector<scaled_image_input_region>> input_regions,
+	std::span<const std::byte> input_bytes,std::span<const display_storage_copy> input_patches,
+	std::span<const scaled_image_output_region> output_regions,
+	std::span<const scaled_image_output_byte_region> output_byte_regions,
+	std::span<const surface_format> output_formats,std::size_t output_count,
+	std::span<const std::vector<surface_cache::scaled_image_input_view>> input_views)
 {
-	std::vector<id<MTLTexture>> linear(images.begin(),images.end());
-	for(unsigned side=0;side<images.size();++side)if(images[side].sampleCount>1)
-	{
-		const auto size=sample_expanded_size(images[side].width,images[side].height,static_cast<unsigned>(images[side].sampleCount));
-		auto descriptor=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:images[side].pixelFormat width:size[0] height:size[1] mipmapped:NO];
-		descriptor.storageMode=MTLStorageModePrivate;descriptor.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead|MTLTextureUsagePixelFormatView;
-		linear[side]=make_texture(ctx,descriptor);
-		// Import writes the whole expanded sample raster. Preserve native pixels
-		// outside a cropped destination too,without ever reading guest storage.
-		m_samples.expand(ctx,images[side],linear[side]);
-	}
 	auto canonical=plan;canonical.source=plan_guest_surface(0,plan.source.width,plan.source.height,plan.source.pixel_bytes);
 	canonical.destination=plan_guest_surface(0,plan.destination.width,plan.destination.height,plan.destination.pixel_bytes);
 	canonical.source_tile.reset();canonical.destination_tile.reset();canonical.source_segments.clear();canonical.destination_segments.clear();
-	const auto source=make_buffer(ctx,canonical.source.range.size,buffer_storage::private_gpu),target=make_buffer(ctx,canonical.destination.range.size,buffer_storage::private_gpu);
+	if (!output_count || output_count > m_writer_limit || images.size() < output_count)
+		throw std::logic_error("Scaled output lost its distinct native writers");
+	const bool ram_only = images.size() == output_count;
+	if (ram_only)
+	{
+		std::size_t packed = 0;
+		for (const auto& patch : input_patches)
+		{
+			if (patch.target != packed || patch.source != packed || patch.size > canonical.source.range.size - packed)
+				throw std::logic_error("RAM-only scaled input is not densely packed");
+			packed += patch.size;
+		}
+		if (!inputs.empty() || packed != canonical.source.range.size || packed != input_bytes.size())
+			throw std::logic_error("RAM-only scaled input lacks a complete snapshot");
+	}
+	const auto source = ram_only ? make_upload(ctx,input_bytes) : make_buffer(ctx,canonical.source.range.size,buffer_storage::private_gpu);
+	// Pitched codec windows validate complete rows, including the final
+	// row padding after a horizontal subrectangle. No padding is sampled.
+	const auto target_bytes = checked_texture_sum(canonical.destination.range.size,
+		output_regions.empty() ? 0 : (canonical.destination.width - 1) * canonical.destination.pixel_bytes);
+	const auto target = make_buffer(ctx,target_bytes,buffer_storage::private_gpu);
 	texture_region input,output;input.origin=MTLOriginMake(regions[0].x,regions[0].y,0);input.size=MTLSizeMake(regions[0].width,regions[0].height,1);
 	output.origin=MTLOriginMake(regions[1].x,regions[1].y,0);output.size=MTLSizeMake(regions[1].width,regions[1].height,1);
 	const auto sf=plan.source_format==scaled_image_format::rgb565?surface_color::rgb565:surface_color::argb8;
 	const auto df=plan.destination_format==scaled_image_format::rgb565?surface_color::rgb565:surface_color::argb8;
-	if(inputs.empty())m_colors.download(ctx,sf,linear[0],input,source,{});
+	const auto selected_input=[&](id<MTLTexture> image,texture_region& region)
+	{
+		if(image.sampleCount==1)return image;
+		auto descriptor=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:image.pixelFormat width:region.size.width height:region.size.height mipmapped:NO];
+		descriptor.storageMode=MTLStorageModePrivate;descriptor.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead|MTLTextureUsagePixelFormatView;
+		const auto cropped=make_texture(ctx,descriptor);
+		m_samples.expand_region(ctx,image,cropped,{region.origin.x,region.origin.y});
+		region.origin=MTLOriginMake(0,0,0);return cropped;
+	};
+	if(!ram_only&&inputs.empty())
+	{
+		auto image=images[0];
+		if (!input_views.empty() && !input_views[0].empty())
+		{
+			if (input_views[0].size()!=1)throw std::logic_error("Direct scaled input lost its one native window");
+			const auto& view=input_views[0][0];image=view.image;
+			input.origin=MTLOriginMake(view.pixels.x,view.pixels.y,0);
+			input.size=MTLSizeMake(view.pixels.width,view.pixels.height,1);
+		}
+		image=selected_input(image,input);m_colors.download(ctx,sf,image,input,source,{});
+	}
 	else for(std::size_t i=0;i<inputs.size();++i)
 	{
 		const auto& d=inputs[i];
-		const auto geometry=plan_guest_surface(d.tile?d.tile->address:0,linear[i].width,linear[i].height,surface_guest_bytes(d.allocation.format),d.row_pitch,d.morton);
-		const auto tight=geometry.width*geometry.pixel_bytes;
-		const auto raw=make_buffer(ctx,d.tile?d.tile->size:d.morton?geometry.range.size:tight*geometry.height,buffer_storage::private_gpu);
-		texture_region whole;whole.size=MTLSizeMake(linear[i].width,linear[i].height,1);
-		if(const auto* color=std::get_if<surface_color>(&d.allocation.format))
+		const auto windowed=!input_views.empty()&&!input_views[i].empty();
+		if(windowed&&input_views[i].size()!=input_regions[i].size())throw std::logic_error("Packed scaled input lost its native windows");
+		for(std::size_t j=0;j<input_regions[i].size();++j)
 		{
-			if(d.tile){auto g=geometry;g.range={d.tile->address,d.tile->size};m_banked->download_color(ctx,*color,linear[i],whole,raw,g,*d.tile);}
-			else if(d.morton)m_swizzle->download_color(ctx,*color,linear[i],whole,raw,0,*d.morton);
-			else m_colors.download(ctx,*color,linear[i],whole,raw,{});
+			const auto& part=input_regions[i][j];
+			const auto raw=make_buffer(ctx,part.bytes,buffer_storage::private_gpu);
+			const auto pixels=windowed?input_views[i][j].pixels:part.pixels;
+			texture_region region;region.origin=MTLOriginMake(pixels.x,pixels.y,0);
+			region.size=MTLSizeMake(pixels.width,pixels.height,1);
+			const auto image=selected_input(windowed?input_views[i][j].image:images[i],region);
+			if(const auto* color=std::get_if<surface_color>(&d.allocation.format))m_colors.download(ctx,*color,image,region,raw,{});
+			else m_depth->download(ctx,std::get<surface_depth>(d.allocation.format),image,region,raw,{});
+			m_compute.gather(ctx,raw,source,part.copies,0);
 		}
-		else
-		{
-			const auto depth=std::get<surface_depth>(d.allocation.format);
-			if(d.tile){auto g=geometry;g.range={d.tile->address,d.tile->size};m_banked->download_depth(ctx,depth,linear[i],whole,raw,g,*d.tile);}
-			else if(d.morton)m_swizzle->download_depth(ctx,depth,linear[i],whole,raw,0,*d.morton);
-			else m_depth->download(ctx,depth,linear[i],whole,raw,{});
-		}
-		auto packed_copies=std::vector<display_storage_copy>(copies.begin(),copies.end());
-		if(!d.tile&&!d.morton)for(auto& copy:packed_copies)if(copy.input==i)copy.source=(copy.source/geometry.row_pitch)*tight+copy.source%geometry.row_pitch;
-		m_compute.gather(ctx,raw,source,packed_copies,i);
 	}
-	if(!input_bytes.empty())m_compute.gather(ctx,make_upload(ctx,input_bytes),source,input_patches,0);
-	m_compute.encode(ctx,canonical,source,target);m_colors.upload(ctx,df,target,{},linear.back(),output);
-	if(images.back().sampleCount>1)m_samples.import(ctx,linear.back(),images.back());
+	if(!ram_only&&!input_bytes.empty())m_compute.gather(ctx,make_upload(ctx,input_bytes),source,input_patches,0);
+	m_compute.encode(ctx,canonical,source,target);
+	if (!output_byte_regions.empty())
+	{
+		if (output_formats.size() != output_count)
+			throw std::logic_error("Scaled byte windows lost their native output formats");
+		for (const auto& part : output_byte_regions)
+		{
+			if (part.output >= output_count || !part.bytes || part.bytes > m_limit)
+				throw std::logic_error("Scaled byte window exceeds its native writer or scratch budget");
+			const auto image = images[images.size() - output_count + part.output];
+			const auto format = output_formats[part.output];
+			const auto origin = std::array<std::size_t, 2>{part.native.x, part.native.y};
+			texture_region region;
+			region.origin = MTLOriginMake(origin[0], origin[1], 0);
+			region.size = MTLSizeMake(part.native.width, part.native.height, 1);
+			const auto selected = selected_input(image, region);
+			const auto raw = make_buffer(ctx, part.bytes, buffer_storage::private_gpu);
+			const auto* color = std::get_if<surface_color>(&format);
+			if (part.preserve_background)
+			{
+				if (color) m_colors.download(ctx, *color, selected, region, raw, {});
+				else m_depth->download(ctx, std::get<surface_depth>(format), selected, region, raw, {});
+			}
+			m_compute.gather(ctx, target, raw, part.copies, 0);
+			if (color) m_colors.upload(ctx, *color, raw, {}, selected, region);
+			else
+			{
+				const auto mask = make_buffer(ctx, part.bytes, buffer_storage::private_gpu);
+				fill_buffer(ctx, mask, 0, part.bytes, 0);
+				for (const auto& copy : part.copies) fill_buffer(ctx, mask, copy.target, copy.size, 1);
+				m_depth->patch(ctx, std::get<surface_depth>(format), raw, mask, {}, selected, region);
+			}
+			if (selected != image) m_samples.import_region(ctx, selected, image, origin);
+		}
+		return;
+	}
+	for (std::size_t i = 0; i < (output_regions.empty() ? 1 : output_regions.size()); ++i)
+	{
+		const auto index = output_regions.empty() ? 0 : output_regions[i].output;
+		if (index >= output_count) throw std::logic_error("Scaled window selects another native writer");
+		const auto image = images[images.size() - output_count + index];
+		auto selected = output;
+		surface_byte_region bytes{};
+		if (!output_regions.empty())
+		{
+			const auto& part = output_regions[i].packed;
+			const auto& native = output_regions[i].native;
+			selected.origin = MTLOriginMake(native.x, native.y, 0);
+			selected.size = MTLSizeMake(native.width, native.height, 1);
+			bytes = {(part.y * canonical.destination.width + part.x) * canonical.destination.pixel_bytes,
+				canonical.destination.width * canonical.destination.pixel_bytes};
+		}
+		if (image.sampleCount > 1)
+		{
+			auto descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:image.pixelFormat width:selected.size.width height:selected.size.height mipmapped:NO];
+			descriptor.storageMode = MTLStorageModePrivate;
+			descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+			const auto cropped = make_texture(ctx, descriptor);
+			const auto origin = std::array<std::size_t, 2>{selected.origin.x, selected.origin.y};
+			selected.origin = MTLOriginMake(0, 0, 0);
+			m_colors.upload(ctx, df, target, bytes, cropped, selected);
+			m_samples.import_region(ctx, cropped, image, origin);
+		}
+		else m_colors.upload(ctx, df, target, bytes, image, selected);
+	}
 }
 void scaled_image_transfer::execute(scaled_image_plan plan, std::chrono::milliseconds timeout, const std::function<void(context&)>& dependencies,
 									std::function<void()> validate_metadata)
+{
+	execute_impl(std::move(plan), timeout, dependencies, std::move(validate_metadata), false);
+}
+void scaled_image_transfer::enqueue(scaled_image_plan plan, std::chrono::milliseconds timeout, const std::function<void(context&)>& dependencies,
+	std::function<void()> validate_metadata)
+{
+	execute_impl(std::move(plan), timeout, dependencies, std::move(validate_metadata), true);
+}
+void scaled_image_transfer::execute_impl(scaled_image_plan plan, std::chrono::milliseconds timeout, const std::function<void(context&)>& dependencies,
+	std::function<void()> validate_metadata, bool defer_native_completion)
 {
 	@autoreleasepool
 	{
@@ -231,38 +343,51 @@ void scaled_image_transfer::execute(scaled_image_plan plan, std::chrono::millise
 		synchronize(timeout);
 		if (validate_metadata)
 			checked_cpu_capture(m_capture, validate_metadata);
-		if(const auto endpoints=m_surfaces.prepare_scaled_image(plan,timeout))
+		if(const auto endpoints=m_surfaces.prepare_scaled_image(plan,timeout,m_writer_limit,m_limit))
 		{
-			for(const auto& d:endpoints->descriptions)
+			std::vector<std::vector<scaled_image_input_region>> input_regions;
+			if (!m_depth && std::ranges::any_of(endpoints->output_formats, [](const auto& format)
+				{ return std::holds_alternative<surface_depth>(format); }))
+				m_depth = std::make_unique<surface_depth_transfer>(m_context);
+			for(std::size_t i=0;i<endpoints->descriptions.size();++i)
 			{
+				const auto& d=endpoints->descriptions[i];
 				if(std::holds_alternative<surface_depth>(d.allocation.format)&&!m_depth)m_depth=std::make_unique<surface_depth_transfer>(m_context);
 				const auto size=d.allocation.samples==1?std::array{d.allocation.width,d.allocation.height}:sample_expanded_size(d.allocation.width,d.allocation.height,d.allocation.samples);
 				const auto geometry=plan_guest_surface(0,size[0],size[1],surface_guest_bytes(d.allocation.format),d.row_pitch,d.morton);
-				if((d.tile?d.tile->size:geometry.range.size)>m_limit)throw std::length_error("Native scaled-image assembly source exceeds snapshot budget");
-				if(d.tile&&!m_banked)m_banked=std::make_unique<surface_banked_transfer>(m_context);
-				if(!d.tile&&d.morton&&!m_swizzle)m_swizzle=std::make_unique<surface_swizzle_transfer>(m_context);
+				input_regions.push_back(plan_scaled_image_input_regions({geometry,{},false,0,d.tile},endpoints->assembly.copies,i,m_limit));
 			}
-			auto owner=std::make_shared<bool>(true);
+			auto owner=std::make_shared<native_scale_publication>();
+			std::vector<std::vector<clear_rectangle>> input_windows;
+			if(endpoints->surfaces[0])input_windows.push_back({endpoints->regions[0]});
+			else for(const auto& regions:input_regions)
+			{
+				auto& windows=input_windows.emplace_back();
+				for(const auto& part:regions)windows.push_back(part.pixels);
+			}
 			m_pending=std::make_unique<pending>(pending{std::nullopt,{},storage_ranges(plan.destination,plan.destination_segments),0,nil,validate_metadata,owner,endpoints->surfaces[1]});
 			try
 			{
-				m_surfaces.draw_scaled_image(*endpoints,[&](context& commands,auto images)
+				m_surfaces.draw_scaled_image(*endpoints,input_windows,[&](context& commands,auto images,auto input_views)
+				{
+					encode_native(plan,endpoints->regions,commands,images,endpoints->descriptions,input_regions,endpoints->input_bytes,endpoints->input_patches,endpoints->output_regions,endpoints->output_byte_regions,endpoints->output_formats,endpoints->outputs.empty()?1:endpoints->outputs.size(),input_views);
+				},[owner,validate=std::move(validate_metadata)]
+				{
+					if(!owner->alive)throw std::runtime_error("Abandoned native scaled-image output cannot publish");
+					if(validate)validate();
+				},timeout,[&](context& commands)
 				{
 					m_pending->work=commands.recording_submission();
 					if(dependencies)dependencies(commands);
-					encode_native(plan,endpoints->regions,commands,images,endpoints->descriptions,endpoints->assembly.copies,endpoints->input_bytes,endpoints->input_patches);
-				},[owner,validate=std::move(validate_metadata)]
-				{
-					if(!*owner)throw std::runtime_error("Abandoned native scaled-image output cannot publish");
-					if(validate)validate();
-				},timeout);
+				},defer_native_completion,[owner]{owner->published=true;});
 			}
 			catch(...)
 			{
 				if(!m_pending->work||(!m_surfaces.status(m_pending->native_target).pending&&m_pending->work->ready()))m_pending.reset();
 				throw;
 			}
-			synchronize(timeout);return;
+			if (!defer_native_completion) synchronize(timeout);
+			return;
 		}
 		const auto source_ranges = storage_ranges(plan.source, plan.source_segments);
 		auto destination_ranges = storage_ranges(plan.destination, plan.destination_segments);
@@ -297,6 +422,33 @@ void scaled_image_transfer::execute(scaled_image_plan plan, std::chrono::millise
 		synchronize(timeout);
 	}
 }
+void scaled_image_transfer::retire_native()
+{
+	auto completed=std::move(m_pending);
+	// An ordinary surface/texture observer can retire this transaction before
+	// its owner is polled. GPU success alone does not prove metadata publication.
+	if (!completed->native_owner->published)
+		throw std::runtime_error("Native scaled-image output was rejected before owner retirement");
+	for(const auto range:completed->ranges)m_textures.invalidate(range);
+	++m_native_completed;
+}
+bool scaled_image_transfer::poll()
+{
+	if (!m_pending) return true;
+	if (!m_pending->native_owner || !m_pending->work->ready()) return false;
+	try
+	{
+		if (!m_surfaces.poll_submitted()) return false;
+		m_pending->work->wait(std::chrono::milliseconds::zero());
+	}
+	catch (...)
+	{
+		if (!m_surfaces.status(m_pending->native_target).pending && m_pending->work->ready()) m_pending.reset();
+		throw;
+	}
+	retire_native();
+	return true;
+}
 void scaled_image_transfer::synchronize(std::chrono::milliseconds timeout)
 {
 	@autoreleasepool
@@ -309,9 +461,7 @@ void scaled_image_transfer::synchronize(std::chrono::milliseconds timeout)
 		{
 			try{m_surfaces.synchronize(timeout);m_pending->work->wait(timeout);}
 			catch(...){if(!m_surfaces.status(m_pending->native_target).pending&&m_pending->work->ready())m_pending.reset();throw;}
-			auto completed=std::move(m_pending);
-			for(const auto range:completed->ranges)m_textures.invalidate(range);
-			++m_native_completed;return;
+			retire_native();return;
 		}
 		try
 		{
@@ -323,21 +473,23 @@ void scaled_image_transfer::synchronize(std::chrono::milliseconds timeout)
 				m_pending.reset();
 			throw;
 		}
-		auto completed = std::move(m_pending);
-		if (completed->validate_metadata)
-			checked_cpu_capture(m_capture, completed->validate_metadata);
-		const auto bytes = map_buffer(completed->output, 0, completed->output_bytes);
-		std::vector<guest_surface_write> writes;
-		for (const auto& part : completed->destination)
-			writes.push_back({part.coverage, part.revision, bytes.subspan(part.offset, part.coverage.range.size)});
-		m_surfaces.cpu_write(completed->ranges, [&]
+		publish_completed_transfer(m_pending,m_capture,[&](auto& completed,const cpu_capture_dispatch& capture)
 		{
-			if (completed->validate_metadata) completed->validate_metadata();
+		if (completed.validate_metadata)
+			checked_cpu_capture(capture, completed.validate_metadata);
+		const auto bytes = map_buffer(completed.output, 0, completed.output_bytes);
+		std::vector<guest_surface_write> writes;
+		for (const auto& part : completed.destination)
+			writes.push_back({part.coverage, part.revision, bytes.subspan(part.offset, part.coverage.range.size)});
+		m_surfaces.cpu_write(completed.ranges, [&]
+		{
+			if (completed.validate_metadata) completed.validate_metadata();
 			if (!m_memory->compare_write_many(writes)) throw texture_revision_conflict();
-		}, m_capture);
-		for (const auto range : completed->ranges)
+		}, capture);
+		for (const auto range : completed.ranges)
 			m_textures.invalidate(range);
 		++m_vm_completed;
+		});
 	}
 }
 } // namespace metal4

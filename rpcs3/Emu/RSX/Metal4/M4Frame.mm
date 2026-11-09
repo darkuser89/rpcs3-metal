@@ -1,11 +1,13 @@
 #include "M4Frame.h"
 #include "M4FSR.h"
+#include "M4HeapBudget.h"
 #include "M4MainRunLoop.h"
 
 #import <AppKit/NSView.h>
 #import <AppKit/NSWindow.h>
 #import <QuartzCore/CATransaction.h>
 
+#include <cstring>
 #include <deque>
 #include <dispatch/dispatch.h>
 #include <mutex>
@@ -20,6 +22,38 @@ void require_main()
 		throw std::logic_error("Metal4 frame geometry/attachment requires the main thread");
 }
 } // namespace
+
+frame_capture_job::frame_capture_job(frame_extent extent, std::size_t row_pitch, id<MTLBuffer> readback, submission work)
+	: m_extent(extent), m_row_pitch(row_pitch), m_readback(readback), m_work(std::move(work))
+{
+}
+
+bool frame_capture_job::ready() const
+{
+	return m_readback && m_work.ready();
+}
+
+bool frame_capture_job::discard_if_ready()
+{
+	if (!ready()) return false;
+	m_readback = nil;
+	m_work.wait();
+	return true;
+}
+
+std::optional<captured_frame> frame_capture_job::take_if_ready()
+{
+	if (!ready()) return {};
+	m_work.wait();
+	const auto source = map_buffer(m_readback, 0, m_row_pitch * m_extent.height);
+	const auto packed_pitch = std::size_t(m_extent.width) * 4;
+	captured_frame result{m_extent, std::vector<std::uint8_t>(packed_pitch * m_extent.height)};
+	for (std::size_t row = 0; row < m_extent.height; ++row)
+		std::memcpy(result.bgra.data() + row * packed_pitch, source.data() + row * m_row_pitch, packed_pitch);
+	m_readback = nil;
+	return result;
+}
+
 struct native_frame::impl
 {
 	// The observer only locks a weak geometry owner. It never retains or
@@ -109,6 +143,7 @@ struct native_frame::impl
 	std::unique_ptr<main_run_loop_observer> observer;
 	std::deque<submission> pending;
 	std::unique_ptr<fsr_upscaler> fsr;
+	std::unique_ptr<overlay_renderer> overlays;
 };
 native_frame::native_frame(context& ctx) : m_impl(std::make_unique<impl>()), m_context(ctx), m_presenter(ctx)
 {
@@ -232,53 +267,154 @@ CAMetalLayer* native_frame::layer() const
 	std::lock_guard lock(m_impl->gui->mutex);
 	return m_impl->gui->layer;
 }
-void native_frame::encode(const std::optional<present_image>& image, id<MTLTexture> target, const frame_policy& policy)
+std::optional<present_image> native_frame::prepare_image(const std::optional<present_image>& image,
+	id<MTLTexture> target, const frame_policy& policy)
+{
+	validate_frame_policy(policy);
+	if (!policy.fsr || !image) (void)reclaim_fsr();
+	if (!target || target.device != m_context.device() || target.textureType != MTLTextureType2D || target.sampleCount != 1 ||
+		!(target.usage & MTLTextureUsageRenderTarget))
+		throw std::invalid_argument("Invalid native frame target");
+	if (image)
+	{
+		(void)validate_texture_region(m_context, image->texture, image->region);
+		if (image->region.size.width > UINT32_MAX || image->region.size.height > UINT32_MAX)
+			throw std::out_of_range("Native frame source extent exceeds integer planning domain");
+		const auto rect = plan_frame_rectangle({static_cast<std::uint32_t>(image->region.size.width), static_cast<std::uint32_t>(image->region.size.height)},
+											   {static_cast<std::uint32_t>(target.width), static_cast<std::uint32_t>(target.height)}, policy);
+		if (rect.width && rect.height)
+		{
+			auto prepared = *image;
+			prepared.destination = {rect.x, rect.y, rect.width, rect.height};
+			prepared.filter = policy.linear ? present_filter::linear : present_filter::nearest;
+			prepared.gamma = policy.gamma;
+			prepared.limited_rgb = policy.limited_rgb;
+			prepared.stereo = policy.stereo;
+			// Validate both original eyes and destination aliases before any
+			// scaling can replace the original source allocation identities.
+			m_presenter.validate(m_context, prepared, target);
+			prepared.depend_on_uploads(m_context);
+			prepared.uploads = {};
+			if (policy.fsr)
+			{
+				if (!m_impl->fsr) m_impl->fsr = std::make_unique<fsr_upscaler>(m_context);
+				const auto output = fsr_eye_extent({rect.width, rect.height}, policy.stereo.mode);
+				const auto left = m_impl->fsr->encode(m_context, {prepared.texture, prepared.region}, output, policy.fsr_sharpness);
+				prepared.texture = left.texture; prepared.region = left.region;
+				if (policy.stereo.mode != stereo_mode::disabled)
+					prepared.right_eye = m_impl->fsr->encode(m_context, *prepared.right_eye, output, policy.fsr_sharpness, 1);
+				else (void)m_impl->fsr->clear_eye(1);
+				prepared.filter = present_filter::linear;
+			}
+			return prepared;
+		}
+	}
+	return {};
+}
+
+void native_frame::encode_prepared(const std::optional<present_image>& image, id<MTLTexture> target)
+{
+	if (image)
+		m_presenter.encode(m_context, *image, target);
+	else
+		m_presenter.encode_black(m_context, target);
+}
+
+overlay_renderer::prepared_frame native_frame::prepare_overlays(const overlay_frame& frame,
+	const std::optional<present_image>& image, id<MTLTexture> target)
+{
+	if (frame.draws.empty()) return {};
+	if (!m_impl->overlays) m_impl->overlays = std::make_unique<overlay_renderer>(m_context);
+	overlay_renderer::prepared_frame prepared;
+	try { prepared = m_impl->overlays->prepare(m_context, frame); }
+	catch (const heap_budget_error&) { return {}; }
+	catch (const native_allocation_error&) { return {}; }
+	if (prepared.needs_backbuffer) prepared.backbuffer = make_overlay_backbuffer(image, target);
+	return prepared;
+}
+
+id<MTLTexture> native_frame::make_overlay_backbuffer(const std::optional<present_image>& image, id<MTLTexture> target)
+{
+	constexpr std::size_t budget = 64u << 20;
+	const auto format = target.pixelFormat;
+	const unsigned pixel_bytes = format == MTLPixelFormatRGBA16Float ? 8 : 4;
+	if (target.width > budget / pixel_bytes || target.height > budget / (target.width * pixel_bytes)) return nil;
+	const auto descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+		width:target.width height:target.height mipmapped:NO];
+	descriptor.storageMode = MTLStorageModePrivate;
+	descriptor.hazardTrackingMode = MTLHazardTrackingModeUntracked;
+	descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	const auto allocation = [m_context.device() heapTextureSizeAndAlignWithDescriptor:descriptor];
+	if (!allocation.size || allocation.size > budget) return nil;
+	id<MTLTexture> backbuffer;
+	try
+	{
+		const auto ledger = m_context.buffer_ledger();
+		backbuffer = ledger ? ledger->texture(descriptor) : make_texture(m_context, descriptor);
+	}
+	catch (const heap_budget_error&) { return nil; }
+	catch (const native_allocation_error&) { return nil; }
+	encode_prepared(image, backbuffer);
+	return backbuffer;
+}
+
+bool native_frame::reclaim_overlay_image()
+{
+	return m_impl->overlays && m_impl->overlays->reclaim_one_image();
+}
+
+void native_frame::encode_overlays(const overlay_renderer::prepared_frame& frame,
+	const std::optional<present_image>& image, id<MTLTexture> target)
+{
+	if (frame.draws.empty()) return;
+	const auto content = image ? image->destination : MTLScissorRect{0, 0, target.width, target.height};
+	m_impl->overlays->encode(m_context, frame, target, content);
+}
+
+void native_frame::encode(const std::optional<present_image>& image, id<MTLTexture> target, const frame_policy& policy,
+	const overlay_frame& overlays)
 {
 	@autoreleasepool
 	{
-		validate_frame_policy(policy);
-		if (!policy.fsr || !image) (void)reclaim_fsr();
-		if (!target || target.device != m_context.device() || target.textureType != MTLTextureType2D || target.sampleCount != 1 ||
-			!(target.usage & MTLTextureUsageRenderTarget))
-			throw std::invalid_argument("Invalid native frame target");
-		if (image)
-		{
-			(void)validate_texture_region(m_context, image->texture, image->region);
-			if (image->region.size.width > UINT32_MAX || image->region.size.height > UINT32_MAX)
-				throw std::out_of_range("Native frame source extent exceeds integer planning domain");
-			const auto rect = plan_frame_rectangle({static_cast<std::uint32_t>(image->region.size.width), static_cast<std::uint32_t>(image->region.size.height)},
-												   {static_cast<std::uint32_t>(target.width), static_cast<std::uint32_t>(target.height)}, policy);
-			if (rect.width && rect.height)
-			{
-				auto prepared = *image;
-				prepared.destination = {rect.x, rect.y, rect.width, rect.height};
-				prepared.filter = policy.linear ? present_filter::linear : present_filter::nearest;
-				prepared.gamma = policy.gamma;
-				prepared.limited_rgb = policy.limited_rgb;
-				prepared.stereo = policy.stereo;
-				// Validate both original eyes and destination aliases before any
-				// scaling can replace the original source allocation identities.
-				m_presenter.validate(m_context, prepared, target);
-				if (policy.fsr)
-				{
-					if (!m_impl->fsr) m_impl->fsr = std::make_unique<fsr_upscaler>(m_context);
-					const auto output = fsr_eye_extent({rect.width, rect.height}, policy.stereo.mode);
-					const auto left = m_impl->fsr->encode(m_context, {prepared.texture, prepared.region}, output, policy.fsr_sharpness);
-					prepared.texture = left.texture; prepared.region = left.region;
-					if (policy.stereo.mode != stereo_mode::disabled)
-						prepared.right_eye = m_impl->fsr->encode(m_context, *prepared.right_eye, output, policy.fsr_sharpness, 1);
-					else (void)m_impl->fsr->clear_eye(1);
-					prepared.filter = present_filter::linear;
-				}
-				m_presenter.encode(m_context, prepared, target);
-				return;
-			}
-		}
-		m_presenter.encode_black(m_context, target);
+		const auto prepared = prepare_image(image, target, policy);
+		const auto composition = prepare_overlays(overlays, prepared, target);
+		encode_prepared(prepared, target);
+		encode_overlays(composition, prepared, target);
 	}
 }
-std::optional<native_frame::acquisition_ticket> native_frame::prepare_acquisition(bool vsync)
+std::optional<frame_capture_job> native_frame::encode_capture(const std::optional<present_image>& image,
+	frame_extent extent, MTLPixelFormat format, const overlay_renderer::prepared_frame* overlays)
 {
+	constexpr std::size_t budget = 64u << 20;
+	const auto limit = max_2d_texture_dimension(m_context.device());
+	if (!extent.width || !extent.height || extent.width > limit || extent.height > limit ||
+		(format != MTLPixelFormatBGRA8Unorm && format != MTLPixelFormatBGRA8Unorm_sRGB)) return {};
+	const auto row_pitch = (std::size_t(extent.width) * 4 + 255) & ~std::size_t(255);
+	if (extent.height > budget / row_pitch) return {};
+	const auto work = m_context.recording_submission();
+	const auto descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+		width:extent.width height:extent.height mipmapped:NO];
+	descriptor.storageMode = MTLStorageModePrivate;
+	descriptor.usage = MTLTextureUsageRenderTarget;
+	id<MTLTexture> target;
+	id<MTLBuffer> readback;
+	try
+	{
+		const auto ledger = m_context.buffer_ledger();
+		target = ledger ? ledger->texture(descriptor) : make_texture(m_context, descriptor);
+		readback = make_buffer(m_context, row_pitch * extent.height, buffer_storage::shared);
+	}
+	catch (const heap_budget_error&) { return {}; }
+	catch (const native_allocation_error&) { return {}; }
+	encode_prepared(image, target);
+	if (overlays) encode_overlays(*overlays, image, target);
+	texture_to_buffer(m_context, target, {0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(extent.width, extent.height, 1)}, readback, 0, row_pitch);
+	return frame_capture_job(extent, row_pitch, readback, work);
+}
+
+std::optional<native_frame::acquisition_ticket> native_frame::prepare_acquisition(frame_pacing pacing)
+{
+	const bool vsync = frame_display_sync(pacing);
 	std::lock_guard lock(m_impl->gui->mutex);
 	auto& gui = *m_impl->gui;
 	if (gui.error) std::rethrow_exception(gui.error);
@@ -299,12 +435,14 @@ bool native_frame::current_acquisition(const acquisition_ticket& ticket) const
 	return gui.alive && gui.attached && gui.view && gui.visible && gui.extent.width && gui.extent.height &&
 		ticket.layer == gui.layer && ticket.epoch == gui.stats.epoch;
 }
-bool native_frame::present(const std::optional<present_image>& image, const frame_policy& policy)
+bool native_frame::present(const std::optional<present_image>& image, const frame_policy& policy,
+	std::optional<frame_capture_job>* capture, const std::function<overlay_frame(frame_extent)>& overlays,
+	bool capture_overlays)
 {
 	@autoreleasepool
 	{
 		validate_frame_policy(policy);
-		const auto ticket = prepare_acquisition(policy.vsync);
+		const auto ticket = prepare_acquisition(policy.pacing);
 		if (!ticket) return false;
 		while (!m_impl->pending.empty() && m_impl->pending.front().ready())
 		{
@@ -320,12 +458,22 @@ bool native_frame::present(const std::optional<present_image>& image, const fram
 		if (!drawable)
 			return false;
 		if (!current_acquisition(*ticket)) return false;
-		m_context.begin();
+		const frame_extent size{static_cast<std::uint32_t>(drawable.texture.width), static_cast<std::uint32_t>(drawable.texture.height)};
+		const auto overlay_snapshot = overlays ? overlays(size) : overlay_frame{};
+		if (overlays && !current_acquisition(*ticket)) return false;
+		begin_present_commands(m_context, image ? &*image : nullptr);
 		try
 		{
 			m_context.target_drawable(drawable);
-			encode(image, drawable.texture, policy);
+			const auto prepared = prepare_image(image, drawable.texture, policy);
+			const auto composition = prepare_overlays(overlay_snapshot, prepared, drawable.texture);
+			encode_prepared(prepared, drawable.texture);
+			encode_overlays(composition, prepared, drawable.texture);
+			std::optional<frame_capture_job> readback;
+			if (capture && !*capture)
+				readback = encode_capture(prepared, size, drawable.texture.pixelFormat, capture_overlays ? &composition : nullptr);
 			m_impl->pending.push_back(m_context.submit());
+			if (readback) *capture = std::move(readback);
 			return true;
 		}
 		catch (...)

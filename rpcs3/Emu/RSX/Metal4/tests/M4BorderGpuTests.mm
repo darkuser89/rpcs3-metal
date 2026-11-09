@@ -6,7 +6,9 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstring>
 #include <iostream>
+#include <string_view>
 
 namespace
 {
@@ -90,7 +92,12 @@ struct fixture
 	}
 	void zero_mips(id<MTLTexture> image)
 	{
+		const auto before = ctx.encoding_statistics();
 		const auto coverage = cache.border_coverage(image);
+		const auto after = ctx.encoding_statistics();
+		require(after.checked_dispatches == before.checked_dispatches + 3 &&
+			after.dispatch_barriers == before.dispatch_barriers,
+			"Independent zeroed coverage mips must use checked dispatch without intra-pass waits");
 		require(cache.border_coverage(image) == coverage, "Equal source shape did not reuse coverage image");
 		for (unsigned level = 0; level < 3; ++level)
 			for (unsigned face = 0; face < (image.textureType == MTLTextureTypeCube ? 6 : 1); ++face)
@@ -108,6 +115,7 @@ struct fixture
 						for (unsigned x = 0; x < w * 4; ++x)
 							require(static_cast<const unsigned char*>(output.contents)[dz * 256 * h + y * 256 + x] == 0, "Coverage mip/face was not zero initialized");
 			}
+		std::cout << "Three checked zero coverage mips preserve all texels without intra-pass waits\n";
 	}
 	void draw(vertex_texture_dimension dimension, id<MTLTexture> image, unsigned op, unsigned unit, color coords, bool linear, bool remap, float lod_bias = 0, bool mipmaps = false, unsigned anisotropy = 1, bool mixed = false)
 	{
@@ -198,7 +206,14 @@ struct fixture
 		for (bool remap : {false, true})
 		{
 			const std::array<unsigned, 4> channels = remap ? std::array<unsigned, 4>{1, 0, 4, 5} : std::array<unsigned, 4>{0, 1, 2, 3};
+			const auto before = ctx.encoding_statistics();
 			const auto converted = cache.border_color_view(image, channels);
+			const auto after = ctx.encoding_statistics();
+			require(after.compute_encoders == before.compute_encoders + 1 &&
+				after.checked_dispatches == before.checked_dispatches + 3 &&
+				after.dispatch_queue_barriers == before.dispatch_queue_barriers + 1 &&
+				after.dispatch_barriers == before.dispatch_barriers,
+				"Independent border snapshot mips must share an encoder without intra-pass waits");
 			require(cache.border_color_view(image, channels) == converted, "Immutable color snapshot was not cached");
 			for (unsigned level = 0; level < 3; ++level)
 			{
@@ -220,6 +235,7 @@ struct fixture
 							require(std::abs(static_cast<const float*>(output.contents)[y * 64 + x * 4 + c] - expected[c]) < 2e-6f, "Float color snapshot changed UNORM texels/mips/view remap");
 			}
 		}
+		std::cout << "Six checked border snapshot mips preserve color and remapping without intra-pass waits\n";
 	}
 	void vertex_and_lifetime(id<MTLTexture> image)
 	{
@@ -287,8 +303,89 @@ struct fixture
 				}
 		std::cout << "Native custom vertex border on unit3 positions exact point;pending GPU retains coverage after sampler/cache/input/shader destruction passed\n";
 	}
+	void cold_helper_batch()
+	{
+		const auto input = source(vertex_texture_dimension::cube);
+		sampler_cache batch_cache(ctx, 4, ledger);
+		const auto depth_source = [&](MTLPixelFormat format)
+		{
+			auto descriptor = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:format size:4 mipmapped:YES];
+			descriptor.storageMode = MTLStorageModePrivate;
+			descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+			return make_texture(ctx, descriptor);
+		};
+		const auto depth16 = depth_source(MTLPixelFormatDepth16Unorm);
+		const auto depth32 = depth_source(MTLPixelFormatDepth32Float);
+		const auto collect = [&](border_texture_preparation& work)
+		{
+			return std::array<id<MTLTexture>, 4>{batch_cache.border_coverage(input, &work),
+				batch_cache.border_color_view(input, {1,0,3,2}, &work),
+				batch_cache.border_shadow_view(depth16, .5f, &work), batch_cache.border_shadow_view(depth32, .375f, &work)};
+		};
+		ctx.begin();
+		const auto cancelled = ctx.recording_submission();
+		border_texture_preparation abandoned;
+		const auto old = collect(abandoned);
+		require(cancelled.same_batch(ctx.recording_submission()), "Cold border allocation replaced the caller's recording");
+		abandoned.encode(ctx);
+		ctx.cancel();
+		require(cancelled.cancelled(), "Cancelled helper recording did not report cancellation");
+
+		ctx.begin();
+		const auto recording = ctx.recording_submission();
+		border_texture_preparation preparation;
+		const auto before = ctx.encoding_statistics();
+		const auto images = collect(preparation);
+		for (std::size_t i = 0; i < old.size(); ++i)
+			require(images[i] != old[i], "Cancelled border helper was reused as initialized");
+		require(recording.same_batch(ctx.recording_submission()) && ctx.encoding_statistics().checked_dispatches == before.checked_dispatches,
+			"Cold border helper encoded or submitted while admitting storage");
+		preparation.encode(ctx);
+		const auto initialized = ctx.encoding_statistics().checked_dispatches;
+		border_texture_preparation repeated;
+		require(collect(repeated) == images, "Same recording replaced an encoded border helper");
+		repeated.encode(ctx);
+		require(initialized == before.checked_dispatches + 6 && ctx.encoding_statistics().checked_dispatches == initialized,
+			"Checked coverage and color dispatches repeated within one recording");
+		for (unsigned kind = 0; kind < images.size(); ++kind)
+			for (unsigned mip = 0; mip < 3; ++mip)
+				for (unsigned face = 0; face < 6; ++face)
+				{
+					texture_region region;
+					region.level = mip;
+					region.slice = face;
+					region.size = MTLSizeMake(1, 1, 1);
+					const auto offset = (kind * 18 + mip * 6 + face) * 32;
+					const auto pixel_bytes = kind == 1 ? 16u : kind == 2 ? 2u : 4u;
+					texture_to_buffer(ctx, images[kind], region, output, offset, pixel_bytes, 0,
+						kind < 2 ? texture_plane::all : texture_plane::depth);
+				}
+		const auto completed = ctx.submit();
+		require(completed.same_batch(recording), "Helper initialization and reads used separate submissions");
+		completed.wait();
+		for (unsigned mip = 0; mip < 3; ++mip)
+			for (unsigned face = 0; face < 6; ++face)
+			{
+				const auto texel = mip_color(mip);
+				const auto* base = static_cast<const std::byte*>(output.contents) + (mip * 6 + face) * 32;
+				const auto read = [&](unsigned kind, auto wanted)
+				{
+					decltype(wanted) value;
+					std::memcpy(&value, base + kind * 18 * 32, sizeof(value));
+					require(value == wanted, "Staged border helper contents differ after retry");
+				};
+				read(0, 0.f);
+				read(1, color{texel[1], texel[0], texel[3], texel[2]});
+				read(2, std::uint16_t{32768});
+				read(3, .375f);
+			}
+		border_texture_preparation warm;
+		require(collect(warm) == images, "Successful helper images were not reused across recordings");
+		std::cout << "Cold border helper batch: 72 exact cube face/mip samples for coverage, float color, D16 and D32; cancellation and same-recording reuse passed\n";
+	}
 	void all()
 	{
+		cold_helper_batch();
 		for (auto dimension : {vertex_texture_dimension::one, vertex_texture_dimension::two, vertex_texture_dimension::three, vertex_texture_dimension::cube})
 		{
 			const auto image = source(dimension);
@@ -330,14 +427,15 @@ struct fixture
 	}
 };
 } // namespace
-int main()
+int main(int argc, char** argv)
 {
 	@autoreleasepool
 	{
 		try
 		{
 			fixture f;
-			f.all();
+			if (argc == 2 && std::string_view(argv[1]) == "--cold-helpers-only") f.cold_helper_batch();
+			else { require(argc == 1, "Unknown border test selector"); f.all(); }
 		}
 		catch (const std::exception& e)
 		{

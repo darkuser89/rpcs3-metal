@@ -58,6 +58,8 @@ struct surface_texture_region
 {
 	clear_rectangle pixels;
 	std::size_t guest_row_offset = 0;
+	// Eligible shader request. The cache still requires a whole native surface.
+	bool native_multisample = false;
 };
 // Map active guest bytes to native source pixels without reading VM.
 // Linear block targets address guest block columns/rows,including complete
@@ -69,7 +71,7 @@ struct surface_texture_region
 	surface_format format, const guest_texture_layout& texture, guest_surface_range range, bool allow_cast = false, bool allow_partial_pixels = false)
 {
 	if (texture.dimension != vertex_texture_dimension::two || texture.mips != 1 || texture.layers != 1 || texture.depth != 1 ||
-		texture.stored_border || texture.adjusted_pitch || !texture.codec.block.width || !texture.codec.block.height ||
+		texture.stored_border || !texture.codec.block.width || !texture.codec.block.height ||
 		((texture.codec.block.width != 1 || texture.codec.block.height != 1) && (!allow_cast || texture.swizzled)) ||
 		range.size != texture.storage_bytes || bool(source.morton) != texture.swizzled || (allow_partial_pixels && !allow_cast) ||
 		(!allow_cast && source.pixel_bytes != texture.codec.block.bytes) ||

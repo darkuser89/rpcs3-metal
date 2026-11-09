@@ -438,12 +438,20 @@ void render_test(metal4::context& ctx)
 	request.attribute_mask = 1;
 	request.attributes[0] = {16u | (1u << 8) | (2u << 24) | (4u << 27), 1u << 29};
 	vertex_inputs vertex_data;
-	vertex_data.attributes = fetch.decode(ctx, request, guest_stream, nil);
+	const auto native_stream = make_buffer(ctx, packed_vertices.size(), buffer_storage::private_gpu);
+	copy_buffer(ctx, guest_stream, 0, native_stream, 0, packed_vertices.size());
+	const auto before_fetch = ctx.encoding_statistics();
+	vertex_data.attributes = fetch.decode(ctx, request, native_stream, nil);
+	const auto after_fetch = ctx.encoding_statistics();
+	require(after_fetch.checked_dispatches == before_fetch.checked_dispatches + 1 &&
+		after_fetch.blit_to_dispatch_barriers == before_fetch.blit_to_dispatch_barriers + 1 &&
+		after_fetch.compute_encoders == before_fetch.compute_encoders,
+		"Vertex fetch must wait for its stream blit within the same compute encoder");
 	vertex_context vertex_state;
 	vertex_state.vertex_count = 3;
 	const auto vertex_bindings = vertex.prepare(ctx, vertex_state, geometry, vertex_data);
 	const auto fragment_bindings = fragment.prepare(ctx, {}, fragment_code, {});
-	std::cout << "Native fetch and shader bindings encoded\n";
+	std::cout << "Native fetch and shader bindings encoded after a checked blit-to-dispatch dependency\n";
 	MTL4RenderPassDescriptor* pass = [MTL4RenderPassDescriptor new];
 	pass.colorAttachments[0].texture = target;
 	pass.colorAttachments[0].loadAction = MTLLoadActionClear;

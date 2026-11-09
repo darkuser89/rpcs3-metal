@@ -5,14 +5,15 @@
 
 #include <iostream>
 #include <tuple>
+#include <source_location>
 
 namespace
 {
 using namespace metal4;
-void require(bool value)
+void require(bool value, const std::source_location location = std::source_location::current())
 {
 	if (!value)
-		throw std::runtime_error("Guest/native surface-region address oracle disagreed");
+		throw std::runtime_error("Guest/native surface-region address oracle disagreed at line " + std::to_string(location.line()));
 }
 std::size_t morton(std::size_t x, std::size_t y, std::size_t z, std::array<std::size_t, 3> dimensions)
 {
@@ -267,7 +268,7 @@ void texture_assembly_cases()
 			for(auto span:plane.spans){require(span.offset==cursor);for(unsigned i=0;i<span.size;++i)actual[cursor+i]=span.address+i;cursor+=span.size;}require(cursor==actual.size());
 			for(unsigned y=0;y<s.rows;++y)for(unsigned x=0;x<s.columns;++x)for(unsigned lane=0;lane<codec.block.bytes;++lane)
 			{
-				const auto raw=s.offset+(dimension==3&&codec.block.width==4&&z<(s.depth&~std::size_t(3))?(z/4)*4*s.row_pitch*s.storage_rows+4*(y*s.row_pitch+x*codec.block.bytes)+(z%4)*codec.block.bytes:!linear&&codec.block.width==1?morton(x,y,z,{s.columns,s.rows,s.depth})*codec.block.bytes:z*s.row_pitch*s.storage_rows+y*s.row_pitch+x*codec.block.bytes)+lane;
+				const auto raw=s.offset+(dimension==3&&codec.block.width==4&&z<(s.depth&~std::size_t(3))?(z/4)*4*s.row_pitch*s.storage_rows+4*(y*s.row_pitch+x*codec.block.bytes)+(z%4)*codec.block.bytes:!linear&&codec.block.height==1?morton(x,y,z,{s.columns,s.rows,s.depth})*codec.block.bytes:z*s.row_pitch*s.storage_rows+y*s.row_pitch+x*codec.block.bytes)+lane;
 				const auto part=std::find_if(segments.begin(),segments.end(),[&](auto p){return raw>=p.offset&&raw-p.offset<p.size;});require(part!=segments.end());const auto ea=part->address+raw-part->offset;
 				require(actual[(y*s.columns+x)*codec.block.bytes+lane]==ea&&!active[raw]);active[raw]=true;++bytes;
 				const auto payload=(y*s.columns+x)*codec.block.bytes+lane;const auto* logical=texture_assembly_segment(plane.logical_spans,payload);require(logical&&std::uint64_t(logical->address)+payload-logical->offset==std::uint64_t(plan.offset)+raw);
@@ -290,6 +291,525 @@ void texture_assembly_cases()
 	require(mapped&&mapped->pixels.x==1&&mapped->pixels.y==0&&mapped->pixels.width==3&&mapped->pixels.height==3&&mapped->guest_row_offset==3);
 	std::cout<<"RTT assembly plane oracle:"<<profiles<<" layouts/"<<planes<<" planes/"<<bytes<<" bytes,27formats/1D-2D-3D-cube/linear-Morton/mips/oddpitch/top32-bit splitsegments;allactive bytes inoriginal guestorder,no padding/facemip/Zgap captures,interleaved3D native rectangles andwrong laterEA/odd-source-pitch-prefix proofs passed;zero VMpixel access\n";
 }
+void stored_border_projection_cases()
+{
+	std::size_t profiles = 0, adjusted = 0, checked = 0;
+	for (unsigned format : {0x81u, 0x85u, 0x91u, 0x92u, 0x9au, 0x9bu})
+		for (unsigned base_width : {1u, 4u, 7u})
+			for (unsigned height : {1u, 5u})
+				for (unsigned padding : {0u, 1u, 5u})
+				for (unsigned mode : {0u, 1u, 2u})
+				{
+					if (mode == 2 && (height != 1 || padding))
+						continue;
+					fragment_texture_registers r;
+					r.offset = 0x200;
+					r.format = (1u << 16) | ((format | 0x20) << 8) | (2u << 4) | 2;
+					r.control0 = 1u << 31;
+					const unsigned declared_width = mode == 1 ? base_width + 6 : base_width;
+					const unsigned declared_height = mode == 2 ? 5 : height;
+					r.image_rect = (declared_width << 16) | declared_height;
+					const unsigned bpp = describe_guest_texture_format(format).block.bytes;
+					const unsigned pitch = (base_width + 2) * bpp + padding;
+					const unsigned width = mode == 1 ? base_width + padding / bpp : base_width;
+					const unsigned row = (width + 2) * bpp;
+					r.control3 = mode == 2 ? 0 : pitch;
+					const auto plan = plan_guest_texture(r);
+					require(plan.adjusted_pitch == (mode != 0) && plan.width == width && plan.height == height &&
+						plan.subresources.front().row_pitch == pitch && plan.storage_bytes == pitch * (height + 2));
+					const unsigned first = row - 1;
+					const unsigned second = row + (pitch > row ? 1 : 0);
+					const std::array segments{
+						guest_storage_segment{0xffffffffu - first + 1, 0, first},
+						guest_storage_segment{0x10000, first, second - first},
+						guest_storage_segment{0x20000, second, plan.storage_bytes - second}};
+					const auto planes = plan_texture_assembly_planes(plan, segments);
+					require(planes.size() == 1);
+					const auto& p = planes.front();
+					require(!p.view.stored_border && p.view.width == width + 2 && p.view.height == height + 2);
+					std::vector<std::uint32_t> physical;
+					for (const auto span : p.spans)
+					{
+						require(span.offset == physical.size());
+						for (std::size_t i = 0; i < span.size; ++i) physical.push_back(span.address + i);
+					}
+					std::vector<std::uint32_t> watch;
+					for (const auto& coverage : stored_border_texture_coverage(plan, segments))
+					{
+						guest_surface_byte_cursor cursor(coverage);
+						while (const auto run = cursor.next())
+							for (std::size_t i = 0; i < run->size; ++i) watch.push_back(run->address + i);
+					}
+					require(physical == watch && physical.size() == row * (height + 2));
+					for (unsigned y = 0; y < height + 2; ++y)
+						for (unsigned byte = 0; byte < row; ++byte)
+						{
+							const auto raw = y * pitch + byte;
+							const auto ea = raw < first ? 0xffffffffu - first + 1 + raw :
+								raw < second ? 0x10000u + raw - first : 0x20000u + raw - second;
+							const auto packed = y * row + byte;
+							require(physical.at(packed) == ea);
+							const auto* logical = texture_assembly_segment(p.logical_spans, packed);
+							require(logical && logical->address + packed - logical->offset == r.offset + raw);
+							++checked;
+						}
+					++profiles;
+					adjusted += mode != 0;
+				}
+	std::cout << "Linear stored border address oracle: " << profiles << " segmented layouts including " << adjusted << " adjusted pitches, "
+		<< checked << " active byte addresses and watches, no padding or VM reads\n";
+}
+void morton_border_projection_cases()
+{
+	std::size_t profiles = 0, checked = 0;
+	for (const auto& [width, height] : {std::pair{1u, 1u}, {15u, 3u}, {5u, 14u}, {16u, 17u}})
+		for (const unsigned format : {0x81u, 0x85u, 0x91u, 0x9bu})
+		{
+			const auto bpp = describe_guest_texture_format(format).block.bytes;
+			fragment_texture_registers r{};
+			r.offset = 0x200;
+			r.format = (1u << 16) | (format << 8) | (2u << 4) | 2;
+			r.control0 = 1u << 31;
+			r.image_rect = (width << 16) | height;
+			const auto plan = plan_guest_texture(r);
+			const auto image = guest_texture_image_subresource(plan, plan.subresources.front());
+			const auto sx = std::bit_ceil(width + 8), sy = std::bit_ceil(height + 8);
+			require(plan.storage_bytes == sx * sy * bpp);
+			const auto mid = 15 * bpp + 1; // Morton (3,3), then one byte into the first ring texel.
+			const auto cut = mid + 13;
+			const std::array segments{guest_storage_segment{0x1000, 0, mid},
+				guest_storage_segment{0x20000, mid, cut - mid},
+				guest_storage_segment{0x40000, cut, plan.storage_bytes - cut}};
+			std::vector<std::uint32_t> expected((width + 2) * (height + 2) * bpp);
+			std::vector<bool> active(plan.storage_bytes);
+			const auto address = [&](std::size_t raw)
+			{
+				if (raw < mid) return 0x1000u + raw;
+				if (raw < cut) return 0x20000u + raw - mid;
+				return 0x40000u + raw - cut;
+			};
+			for (unsigned ordinal = 0; ordinal < sx * sy; ++ordinal)
+			{
+				unsigned x = 0, y = 0, code = ordinal;
+				for (unsigned bit = 1; bit < std::max(sx, sy); bit <<= 1)
+				{
+					if (bit < sx) { x |= (code & 1) * bit; code >>= 1; }
+					if (bit < sy) { y |= (code & 1) * bit; code >>= 1; }
+				}
+				if (x < 3 || x >= width + 5 || y < 3 || y >= height + 5) continue;
+				if (guest_texture_block_offset(plan, image, x - 3, y - 3, 0) != ordinal * bpp)
+					throw std::runtime_error("Morton stored border block offset omitted its storage origin");
+				for (unsigned byte = 0; byte < bpp; ++byte)
+				{
+					const auto raw = ordinal * bpp + byte;
+					active[raw] = true;
+					expected[((y - 3) * (width + 2) + x - 3) * bpp + byte] = static_cast<std::uint32_t>(address(raw));
+				}
+			}
+			const auto planes = plan_texture_assembly_planes(plan, segments);
+			require(planes.size() == 1 && planes[0].view.width == width + 2 && planes[0].view.height == height + 2);
+			std::size_t cursor = 0;
+			for (const auto& span : planes[0].spans)
+			{
+				require(span.offset == cursor);
+				for (unsigned i = 0; i < span.size; ++i) require(expected.at(cursor++) == span.address + i);
+			}
+			require(cursor == expected.size());
+			std::vector<bool> captured(active.size());
+			for (const auto& part : project_stored_border_texture(plan, segments))
+				for (std::size_t i = 0; i < part.coverage.range.size; ++i)
+				{
+					const auto offset = part.offset + i;
+					require(!captured.at(offset) && address(offset) == part.coverage.range.address + i);
+					captured[offset] = true;
+				}
+			require(captured == active);
+			checked += cursor;
+			++profiles;
+		}
+	std::cout << "Morton stored border address oracle: " << profiles << " segmented layouts, "
+		<< checked << " active byte addresses for capture and native assembly\n";
+}
+void stored_border_mip_projection_cases(bool one_dimensional = false)
+{
+	std::size_t profiles = 0, levels = 0, bytes = 0, guards = 0;
+	for (const auto [base_width, base_height] : {std::pair{5u, 3u}, {17u, 9u}, {3u, 19u}, {32u, 1u}})
+		for (const unsigned format : {0x81u, 0x85u, 0x91u, 0x9bu})
+			for (const unsigned mode : {0u, 1u, 2u})
+			{
+				const bool swizzled = mode == 2;
+				const auto bpp = describe_guest_texture_format(format).block.bytes;
+				fragment_texture_registers r{};
+				r.offset = 0x200;
+				r.format = (15u << 16) | ((format | (swizzled ? 0u : 0x20u)) << 8) | ((one_dimensional ? 1u : 2u) << 4) | 2u;
+				r.control0 = 1u << 31;
+				r.image_rect = ((base_width + (mode == 1 ? 4u : 0u)) << 16) | base_height;
+				const auto pitch = (base_width + 2) * bpp + (bpp > 1 ? 1u : 0u);
+				r.control3 = static_cast<std::uint32_t>(pitch);
+				const auto plan = plan_guest_texture(r);
+				const auto logical_height = one_dimensional ? 1u : base_height;
+				require(plan.width == base_width && plan.height == logical_height && plan.adjusted_pitch == (mode == 1));
+				require(plan.mips == std::bit_width(std::max(base_width, logical_height)) && uses_stored_border_mip_atlas(plan));
+				const auto next = plan.subresources.at(1).offset;
+				std::vector cuts{std::size_t{0}, std::size_t{1}, next - 1, next + 1, plan.storage_bytes - 1, plan.storage_bytes};
+				if (one_dimensional)
+				{
+					const auto middle = swizzled ? morton(3, 4, 0, {std::bit_ceil(std::size_t(base_width) + 8), 16, 1}) * bpp : pitch;
+					cuts.insert(cuts.begin() + 2, middle + 1);
+				}
+				std::vector<guest_storage_segment> segments;
+				for (std::size_t i = 0; i + 1 < cuts.size(); ++i)
+					segments.push_back({static_cast<std::uint32_t>(0x10000 + 0x20000 * i), cuts[i], cuts[i + 1] - cuts[i]});
+				const auto address = [&](std::size_t offset)
+				{
+					const auto index = std::upper_bound(cuts.begin(), cuts.end(), offset) - cuts.begin() - 1;
+					return static_cast<std::uint32_t>(0x10000 + 0x20000 * index + offset - cuts[index]);
+				};
+				const auto planes = plan_texture_assembly_planes(plan, segments);
+				require(planes.size() == plan.mips);
+				std::vector<bool> expected_active(plan.storage_bytes), observed_active(plan.storage_bytes);
+				std::size_t origin = 0;
+				for (std::size_t mip = 0; mip < plan.mips; ++mip)
+				{
+					const auto width = std::max<std::size_t>(1, base_width >> mip);
+					const auto height = std::max<std::size_t>(1, logical_height >> mip);
+					const auto sx = std::bit_ceil(width + 8), sy = std::bit_ceil(height + 8);
+					const auto& plane = planes[mip];
+					const auto rows = one_dimensional ? 1 : height + 2;
+					require(plane.level == mip && plane.view.width == width + 2 && plane.view.height == rows);
+					for (std::size_t y = 0; y < rows; ++y)
+						for (std::size_t x = 0; x < width + 2; ++x)
+						{
+							const auto source_row = y + std::size_t(one_dimensional);
+							const auto texel = swizzled ? morton(x + 3, source_row + 3, 0, {sx, sy, 1}) * bpp :
+								source_row * pitch + x * bpp;
+							for (std::size_t byte = 0; byte < bpp; ++byte)
+							{
+								const auto raw = origin + texel + byte, packed = (y * (width + 2) + x) * bpp + byte;
+								const auto* physical = texture_assembly_segment(plane.spans, packed);
+								const auto* logical = texture_assembly_segment(plane.logical_spans, packed);
+								require(physical && physical->address + packed - physical->offset == address(raw));
+								require(logical && logical->address + packed - logical->offset == r.offset + raw);
+								require(!expected_active.at(raw));
+								expected_active[raw] = true;
+								++bytes;
+							}
+						}
+					origin += swizzled ? sx * sy * bpp : pitch * (height + 2);
+					++levels;
+				}
+				require(origin == plan.storage_bytes);
+				const auto parts = project_stored_border_texture(plan, segments);
+				for (const auto& part : parts)
+				{
+					if (one_dimensional) require(guest_surface_active_bytes(part.coverage) == part.coverage.range.size);
+					guest_surface_byte_cursor cursor(part.coverage);
+					while (const auto run = cursor.next())
+						for (std::size_t i = 0; i < run->size; ++i)
+						{
+							const auto raw = part.offset + run->address - part.coverage.range.address + i;
+							require(!observed_active.at(raw) && run->address + i == address(raw));
+							observed_active[raw] = true;
+						}
+				}
+				require(observed_active == expected_active);
+				try { (void)project_stored_border_texture(plan, segments, parts.size() - 1); }
+				catch (const std::length_error&) { ++guards; }
+				++profiles;
+			}
+	require(guards == profiles);
+	std::cout << (one_dimensional ? "Stored 1D border projection: " : "Stored-border mip projection: ") << profiles << " linear and Morton layouts, " << levels << " levels, " << bytes
+		<< " exact active byte addresses for capture and RTT, " << guards << " global budget guards passed\n";
+}
+
+void cube_border_projection_cases()
+{
+	std::size_t profiles = 0, planes_checked = 0, bytes_checked = 0;
+	for (const unsigned format : {0x81u, 0x85u, 0x92u, 0x9bu})
+		for (const bool linear : {false, true})
+			for (const unsigned side : {1u, 5u, 11u})
+			{
+				fragment_texture_registers words;
+				words.offset = 0x200;
+				words.format = (8u << 16) | ((format | (linear ? 0x20u : 0u)) << 8) | (2u << 4) | 6u;
+				words.control0 = 1u << 31;
+				words.image_rect = (side << 16) | side;
+				const auto bpp = describe_guest_texture_format(format).block.bytes;
+				const auto pitch = (side + 2) * bpp + 1;
+				words.control3 = pitch;
+				const auto plan = plan_guest_texture(words);
+				const auto second_face = plan.subresources.at(plan.mips).offset;
+				const auto start = linear ? 0 : morton(3, 3, 0, {std::bit_ceil(side + 8u), std::bit_ceil(side + 8u), 1}) * bpp;
+				const std::array cuts{std::size_t{0}, start + 1, second_face + start + 1, plan.storage_bytes};
+				const std::array bases{0x600000u, 0x800000u, 0x400000u};
+				std::vector<guest_storage_segment> segments;
+				for (std::size_t i = 0; i < bases.size(); ++i)
+					segments.push_back({bases[i], cuts[i], cuts[i + 1] - cuts[i]});
+				const auto physical = [&](std::size_t raw)
+				{
+					const auto i = std::upper_bound(cuts.begin(), cuts.end(), raw) - cuts.begin() - 1;
+					return bases.at(i) + raw - cuts.at(i);
+				};
+				const auto planes = plan_texture_assembly_planes(plan, segments);
+				std::vector<bool> expected(plan.storage_bytes), observed(plan.storage_bytes);
+				std::size_t base = 0, index = 0;
+				for (unsigned face = 0; face < 6; ++face)
+				{
+					for (unsigned mip = 0; mip < plan.mips; ++mip)
+					{
+						const auto w = std::max(1u, side >> mip), padded = std::bit_ceil(w + 8);
+						const auto& plane = planes.at(index++);
+						require(plane.face == face && plane.level == mip && plane.view.width == w + 2 && plane.view.height == w + 2);
+						for (unsigned y = 0; y < w + 2; ++y)
+							for (unsigned x = 0; x < w + 2; ++x)
+								for (unsigned byte = 0; byte < bpp; ++byte)
+								{
+									const auto raw = base + byte + (linear ? y * pitch + x * bpp : morton(x + 3, y + 3, 0, {padded, padded, 1}) * bpp);
+									const auto dense = ((y * (w + 2) + x) * bpp) + byte;
+									const auto* span = texture_assembly_segment(plane.spans, dense);
+									require(span && span->address + dense - span->offset == physical(raw));
+									require(!expected.at(raw));
+									expected[raw] = true;
+									++bytes_checked;
+								}
+						base += linear ? pitch * (w + 2) : padded * padded * bpp;
+						++planes_checked;
+					}
+					if (!linear && face < 5) base = (base + 127) & ~std::size_t(127);
+				}
+				require(base == plan.storage_bytes && index == planes.size());
+				for (const auto& part : project_stored_border_texture(plan, segments))
+					for (std::size_t i = 0; i < part.coverage.range.size; ++i)
+					{
+						const auto raw = part.offset + i;
+						require(!observed.at(raw) && physical(raw) == part.coverage.range.address + i);
+						observed[raw] = true;
+					}
+				require(observed == expected);
+				++profiles;
+			}
+	std::cout << "Stored cube border projection: " << profiles << " segmented layouts, " << planes_checked
+		<< " face-mip planes, " << bytes_checked << " exact guest byte addresses passed\n";
+}
+
+void volume_border_projection_cases()
+{
+	std::size_t profiles = 0, planes_checked = 0, bytes_checked = 0;
+	for (const unsigned format : {0x81u, 0x85u, 0x92u, 0x9bu})
+		for (const bool linear : {false, true})
+			for (const auto [width, height, depth] : {std::array{5u, 4u, 4u}, {3u, 7u, 2u}, {7u, 2u, 1u}})
+			{
+				fragment_texture_registers words;
+				words.offset = 0x200;
+				words.format = (8u << 16) | ((format | (linear ? 0x20u : 0u)) << 8) | (3u << 4) | 2u;
+				words.control0 = 1u << 31;
+				words.image_rect = (width << 16) | height;
+				const auto bpp = describe_guest_texture_format(format).block.bytes;
+				const auto pitch = (width + 2) * bpp + 1;
+				words.control3 = (depth << 20) | pitch;
+				const auto plan = plan_guest_texture(words);
+				const auto middle = linear ? pitch : morton(3, 4, 0, {std::bit_ceil(width + 8u), std::bit_ceil(height + 8u), depth}) * bpp;
+				const std::array cuts{std::size_t{0}, middle + 1, plan.storage_bytes / 2, plan.storage_bytes};
+				const std::array bases{0x600000u, 0x800000u, 0x400000u};
+				std::vector<guest_storage_segment> segments;
+				for (std::size_t i = 0; i < bases.size(); ++i)
+					segments.push_back({bases[i], cuts[i], cuts[i + 1] - cuts[i]});
+				const auto physical = [&](std::size_t raw)
+				{
+					const auto i = std::upper_bound(cuts.begin(), cuts.end(), raw) - cuts.begin() - 1;
+					return bases.at(i) + raw - cuts.at(i);
+				};
+				const auto planes = plan_texture_assembly_planes(plan, segments);
+				std::vector<bool> expected(plan.storage_bytes), observed(plan.storage_bytes);
+				std::size_t base = 0, index = 0;
+				for (unsigned mip = 0; mip < plan.mips; ++mip)
+				{
+					const auto w = std::max(1u, width >> mip), h = std::max(1u, height >> mip), d = std::max(1u, depth >> mip);
+					const std::array<std::size_t, 3> shape{std::bit_ceil(w + 8), std::bit_ceil(h + 8), d};
+					for (unsigned z = 0; z < d; ++z)
+					{
+						const auto& plane = planes.at(index++);
+						require(plane.z == z && plane.level == mip && plane.view.width == w + 2 && plane.view.height == h + 2);
+						for (unsigned y = 0; y < h + 2; ++y)
+							for (unsigned x = 0; x < w + 2; ++x)
+								for (unsigned byte = 0; byte < bpp; ++byte)
+								{
+									const auto raw = base + byte + (linear ? (z * (h + 2) + y) * pitch + x * bpp :
+										morton(x + 3, y + 3, z, shape) * bpp);
+									const auto dense = ((y * (w + 2) + x) * bpp) + byte;
+									const auto* span = texture_assembly_segment(plane.spans, dense);
+									require(span && span->address + dense - span->offset == physical(raw));
+									expected.at(raw) = true;
+									++bytes_checked;
+								}
+						++planes_checked;
+					}
+					base += d * (linear ? pitch * (h + 2) : shape[0] * shape[1] * bpp);
+				}
+				require(base == plan.storage_bytes && index == planes.size());
+				for (const auto& part : project_stored_border_texture(plan, segments))
+					for (std::size_t i = 0; i < part.coverage.range.size; ++i)
+					{
+						const auto raw = part.offset + i;
+						require(!observed.at(raw) && physical(raw) == part.coverage.range.address + i);
+						observed[raw] = true;
+					}
+				require(observed == expected);
+				++profiles;
+			}
+	std::cout << "Stored volume border projection: " << profiles << " segmented layouts, " << planes_checked
+		<< " XY mip planes, " << bytes_checked << " exact guest byte addresses passed\n";
+}
+
+void paired_border_projection_cases()
+{
+	std::size_t profiles = 0, rows = 0, bytes = 0;
+	for (const auto format : {0x8du, 0x8eu})
+		for (const bool one : {false, true})
+			for (const auto width : {1u, 4u, 5u, 15u})
+				for (const auto pad : {0u, 1u})
+				{
+					fragment_texture_registers words;
+					words.offset = 0x200;
+					words.format = (8u << 16) | ((format | 0x20u) << 8) | ((one ? 1u : 2u) << 4) | 2u;
+					words.control0 = 1u << 31;
+					words.image_rect = (width << 16) | 3u;
+					const std::size_t pitch = ((width + 1) / 2 + 2) * 4 + pad;
+					words.control3 = pitch;
+					const auto plan = plan_guest_texture(words);
+					const auto cut = (one ? pitch : 0) + 1;
+					const std::array segments{guest_storage_segment{0x10000, 0, cut},
+						guest_storage_segment{0x20000, cut, plan.storage_bytes - cut}};
+					const auto physical = [&](std::size_t offset) { return offset < cut ? 0x10000 + offset : 0x20000 + offset - cut; };
+					const auto planes = plan_texture_assembly_planes(plan, segments);
+					require(planes.size() == plan.mips);
+					std::vector<bool> expected(plan.storage_bytes), observed(plan.storage_bytes);
+					std::size_t base = 0;
+					for (unsigned mip = 0; mip < plan.mips; ++mip)
+					{
+						const auto w = std::max(1u, width >> mip), h = one ? 1u : std::max(1u, 3u >> mip);
+						const auto row_bytes = ((w + 1) / 2 + 2) * 4;
+						const auto& plane = planes[mip];
+						require(plane.view.width == w + 2 && plane.view.height == (one ? 1 : h + 2));
+						require(!plane.view.stored_border && plane.view.subresources[0].border == 1);
+						for (unsigned y = 0; y < plane.view.height; ++y)
+							for (unsigned byte = 0; byte < row_bytes; ++byte)
+							{
+								const auto packed = y * row_bytes + byte;
+								const auto raw = base + (y + unsigned(one)) * pitch + byte;
+								const auto* span = texture_assembly_segment(plane.spans, packed);
+								require(span && span->address + packed - span->offset == physical(raw));
+								expected.at(raw) = true;
+								++bytes;
+							}
+						rows += plane.view.height;
+						base += (h + 2) * pitch;
+					}
+					require(base == plan.storage_bytes);
+					for (const auto& part : project_stored_border_texture(plan, segments))
+					{
+						guest_surface_byte_cursor cursor(part.coverage);
+						while (const auto run = cursor.next())
+							for (std::size_t i = 0; i < run->size; ++i)
+							{
+								const auto raw = part.offset + run->address - part.coverage.range.address + i;
+								require(!observed.at(raw) && physical(raw) == run->address + i);
+								observed[raw] = true;
+							}
+					}
+					require(observed == expected);
+					++profiles;
+				}
+	std::cout << "Paired border projection: " << profiles << " segmented layouts, " << rows
+		<< " mip rows, " << bytes << " exact active block bytes for capture and RTT passed\n";
+}
+
+void morton_paired_projection_cases()
+{
+	std::size_t profiles = 0, planes_checked = 0, bytes_checked = 0, guards = 0;
+	for (const auto format : {0x8du, 0x8eu})
+		for (const auto dimension : {vertex_texture_dimension::one, vertex_texture_dimension::two, vertex_texture_dimension::three, vertex_texture_dimension::cube})
+			for (const bool border : {false, true})
+				for (unsigned shape = 0; shape < 5; ++shape)
+				{
+					if (!border && dimension == vertex_texture_dimension::cube && shape == 4) continue;
+					const unsigned width = border ? std::array{1u, 4u, 5u, 15u, 3u}[shape] : std::array{1u, 4u, 8u, 16u, 3u}[shape];
+					const unsigned height = dimension == vertex_texture_dimension::one ? 1 : dimension == vertex_texture_dimension::cube ? width : 4;
+					const unsigned depth = dimension == vertex_texture_dimension::three ? 4 : 1;
+					fragment_texture_registers words;
+					words.offset = 0x200;
+					words.format = (4u << 16) | (format << 8) | ((dimension == vertex_texture_dimension::one ? 1u : dimension == vertex_texture_dimension::three ? 3u : 2u) << 4) |
+						(dimension == vertex_texture_dimension::cube ? 4u : 0u) | (border ? 0u : 8u) | 2u;
+					words.control0 = 1u << 31; words.image_rect = width << 16 | height; words.control3 = depth << 20;
+					const auto plan = plan_guest_texture(words);
+					std::vector<guest_storage_segment> segments;
+					const auto cut = std::min<std::size_t>(13, plan.storage_bytes);
+					segments.push_back({0xfffffff3, 0, cut});
+					if (cut < plan.storage_bytes) segments.push_back({0x20000, cut, plan.storage_bytes - cut});
+					const auto physical = [&](std::size_t at) { return at < cut ? 0xfffffff3u + at : 0x20000u + at - cut; };
+					const auto planes = plan_texture_assembly_planes(plan, segments);
+					std::vector<bool> expected(plan.storage_bytes), observed(plan.storage_bytes);
+					std::size_t base = 0, index = 0;
+					for (unsigned face = 0; face < plan.layers; ++face)
+					{
+						for (unsigned mip = 0; mip < plan.mips; ++mip)
+						{
+							const auto w = std::max(1u, width >> mip), h = std::max(1u, height >> mip), d = std::max(1u, depth >> mip);
+							const auto columns = (w + 1) / 2 + (border ? 2 : 0), rows = dimension == vertex_texture_dimension::one ? 1 : h + (border ? 2 : 0);
+							const std::array<std::size_t, 3> storage{border ? std::bit_ceil((w + 1) / 2 + 8) : (w + 1) / 2,
+								border ? std::bit_ceil(h + 8) : h, d};
+							const auto& subresource = plan.subresources.at(face * plan.mips + mip);
+							require(subresource.offset == base && subresource.storage_bytes == storage[0] * storage[1] * storage[2] * 4);
+							for (unsigned z = 0; z < d; ++z)
+							{
+								const auto& plane = planes.at(index++);
+								require(plane.level == mip && plane.face == face && plane.z == z && plane.view.width == w + (border ? 2 : 0) && plane.view.height == rows);
+								for (unsigned y = 0; y < rows; ++y)
+									for (unsigned x = 0; x < columns; ++x)
+									{
+										const auto raw = base + 4 * morton(x + (border ? 3 : 0), y + (border ? dimension == vertex_texture_dimension::one ? 4 : 3 : 0), z, storage);
+										const auto image = guest_texture_image_subresource(plan, subresource);
+										if (guest_texture_block_offset(plan, image, x, y, z) != raw)
+											throw std::runtime_error("Paired Morton block offset does not match independent address");
+										for (unsigned c = 0; c < 4; ++c)
+										{
+											const auto packed = (y * columns + x) * 4 + c;
+											const auto* span = texture_assembly_segment(plane.spans, packed);
+											if (!span || std::uint64_t(span->address) + packed - span->offset != physical(raw + c))
+												throw std::runtime_error("Paired Morton span mismatch: profile " + std::to_string(profiles) + ", x " + std::to_string(x) + ", y " + std::to_string(y) + ", z " + std::to_string(z) + ", raw " + std::to_string(raw + c) + ", wanted EA " + std::to_string(physical(raw + c)) + ", actual EA " + std::to_string(span ? std::uint64_t(span->address) + packed - span->offset : 0));
+											const auto* logical = texture_assembly_segment(plane.logical_spans, packed);
+											require(logical && std::uint64_t(logical->address) + packed - logical->offset == plan.offset + raw + c);
+											require(!expected.at(raw + c)); expected[raw + c] = true; ++bytes_checked;
+										}
+									}
+								++planes_checked;
+							}
+							base += storage[0] * storage[1] * storage[2] * 4;
+						}
+						if (face + 1 < plan.layers) base = (base + 127) & ~std::size_t(127);
+					}
+					if (border)
+					{
+						for (const auto& part : project_stored_border_texture(plan, segments))
+						{
+							guest_surface_byte_cursor cursor(part.coverage);
+							while (const auto run = cursor.next())
+								for (std::size_t c = 0; c < run->size; ++c)
+								{
+									const auto at = part.offset + run->address - part.coverage.range.address + c;
+									require(!observed.at(at) && physical(at) == run->address + c); observed[at] = true;
+								}
+						}
+						require(observed == expected);
+					}
+					require(index == planes.size() && base == plan.storage_bytes);
+					bool refused = false; try { (void)plan_texture_assembly_planes(plan, segments, 0); } catch (const std::length_error&) { refused = true; }
+					require(refused); ++guards; ++profiles;
+				}
+	std::cout << "Paired Morton projection: " << profiles << " ordinary/stored-border layouts, " << planes_checked << " mip/face/Z planes, " << bytes_checked
+		<< " independent active-byte addresses, " << guards << " run-budget guards; 1D/2D/3D/cube, odd widths, split top-EA blocks and untouched padding passed\n";
+}
+
 void vtc_projection_cases()
 {
 	std::size_t profiles=0,planes=0,blocks=0,bytes=0;unsigned guards=0;
@@ -601,11 +1121,24 @@ void segmented_cases()
 	std::cout << "Native segmented texture regions:" << count << " eleven-format linear/Morton topEA/midpixel/midrow crop proofs,logical anchors,wrong active mapping rejection,duplicate-physical ambiguity and padding-only divergence passed without VM pixel access\n";
 }
 } // namespace
-int main()
+int main(int argc, char** argv)
 {
+	if (argc == 2 && std::string_view(argv[1]) == "packed-morton")
+	{
+		try { morton_paired_projection_cases(); return 0; }
+		catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
+	}
 	try
 	{
 		morton_display_cases(); display_assembly_cases(); display_physical_assembly_cases(); texture_assembly_cases(); texture_inverse_cases(); vtc_projection_cases();logical_texture_assembly_cases(); channel_alias_cases();
+		stored_border_projection_cases();
+		morton_border_projection_cases();
+		stored_border_mip_projection_cases();
+	stored_border_mip_projection_cases(true);
+	paired_border_projection_cases();
+	morton_paired_projection_cases();
+	volume_border_projection_cases();
+	cube_border_projection_cases();
 		segmented_cases();
 		typeless_cases();
 		partial_byte_cases();
@@ -629,11 +1162,12 @@ int main()
 										const auto address = 0x1000 + y * pitch + x * bytes;
 										const auto result = plan_surface_texture_region(surface, pair.second, plan, {static_cast<std::uint32_t>(address), plan.storage_bytes});
 										const unsigned actual_y = y + x / (width + padding), actual_x = x % (width + padding);
-										const bool valid = !plan.adjusted_pitch && actual_x + w <= width && actual_y + h <= height;
+										const auto effective_width = std::min<unsigned>(w, pitch / bytes);
+										const bool valid = actual_x + effective_width <= width && actual_y + h <= height;
 										if (bool(result) != valid)
 											throw std::runtime_error("Linear format=" + std::to_string(pair.first) + " source=" + std::to_string(width) + "x" + std::to_string(height) + " pitch=" + std::to_string(pitch) + " start=" + std::to_string(x) + "," + std::to_string(y) + " region=" + std::to_string(w) + "x" + std::to_string(h) + " result=" + std::to_string(bool(result)) + " expected=" + std::to_string(valid));
 										if (result)
-											require(result->x == actual_x && result->y == actual_y && result->width == w && result->height == h);
+											require(result->x == actual_x && result->y == actual_y && result->width == effective_width && result->height == h);
 										++count;
 									}
 						const auto plan = texture(pair.first, false, 1, 1, pitch);

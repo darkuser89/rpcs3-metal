@@ -109,9 +109,24 @@ int main()
 			vertex.bias = 4;
 			sampler_texture_policy vp;
 			vp.stage = sampler_stage::vertex;
-			const auto vkey = resolve_sampler(vertex, vp);
-			require(!vkey.normalized && vkey.wrap[2] == MTLSamplerAddressModeRepeat && vkey.min_filter == MTLSamplerMinMagFilterNearest && vkey.mag_filter == MTLSamplerMinMagFilterNearest && vkey.anisotropy == 1 && vkey.bias == 0 && vkey.compare == MTLCompareFunctionNever, "Vertex sampler overrides or ignored R border differ");
-			(void)make_sampler_descriptor(vkey);
+			for (const auto dimension : {vertex_texture_dimension::one, vertex_texture_dimension::two})
+			{
+				vp.dimension = dimension;
+				const auto key = resolve_sampler(vertex, vp);
+				const auto descriptor = make_sampler_descriptor(key);
+				require(!descriptor.normalizedCoordinates && descriptor.rAddressMode == MTLSamplerAddressModeClampToEdge &&
+					descriptor.minFilter == MTLSamplerMinMagFilterNearest && descriptor.magFilter == MTLSamplerMinMagFilterNearest &&
+					descriptor.maxAnisotropy == 1 && key.bias == 0 && descriptor.compareFunction == MTLCompareFunctionNever,
+					"Vertex pixel-coordinate sampler has invalid Metal state");
+				auto invalid = key;
+				invalid.wrap[2] = MTLSamplerAddressModeRepeat;
+				rejects([&] { (void)make_sampler_descriptor(invalid); });
+				++cases;
+			}
+			vertex.normalized = true;
+			require(make_sampler_descriptor(resolve_sampler(vertex, vp)).rAddressMode == MTLSamplerAddressModeRepeat,
+				"Normalized vertex sampler lost its ignored R-axis default");
+			vertex.normalized = false;
 			rejects([&]
 					{
 						vp.dimension = vertex_texture_dimension::three;

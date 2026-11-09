@@ -1,5 +1,7 @@
 #include "Emu/RSX/RSXOffload.h"
 #include "M4ClauseRendererFixtures.h"
+#include "M4CompilerGateFixture.h"
+#include "M4ConstantUpload.h"
 #include "M4DrawEnvironmentBinding.h"
 #include "M4DrawEnvironmentFixtures.h"
 #include "M4DrawExecutor.h"
@@ -13,8 +15,10 @@
 #include "M4GuestLabel.h"
 #include "M4GuestMemoryAliases.h"
 #include "M4GuestReport.h"
+#include "M4HostAccessFixture.h"
 #include "M4RenderTasks.h"
 #include "M4ReportAtomic.h"
+#include "M4SampleTransfer.h"
 #include "M4ShaderSnapshotFixtures.h"
 #include "M4VertexDataBinding.h"
 #include "M4VertexDataFixtures.h"
@@ -44,6 +48,7 @@ class guarded_gpu_memory final : public exclusive_guest_memory, public exclusive
   public:
 	bool reject_alias_query = false;
 	bool remapped = false;
+	bool provide_storage_identity = false;
 	guest_surface_range physical(guest_surface_range range) const
 	{
 		const auto address = range.address % m_bytes.size();
@@ -72,6 +77,12 @@ class guarded_gpu_memory final : public exclusive_guest_memory, public exclusive
 	{
 		return equivalent_guest_memory_ranges(a, b, [&](unsigned block)
 											  { return std::uint64_t(physical({block, 1}).address); });
+	}
+	std::optional<std::vector<storage_identity_span>> storage_identity(guest_surface_range range) override
+	{
+		if (!provide_storage_identity || remapped || range.address >= m_bytes.size() || range.size > m_bytes.size() - range.address)
+			return {};
+		return std::vector<storage_identity_span>{{shared_from_this(), range.address, range}};
 	}
 	unsigned notifications = 0;
 	void written(guest_surface_range) noexcept override { ++notifications; }
@@ -168,6 +179,7 @@ void verify_executor_bounds(context& ctx, surface_cache& surfaces, draw_executor
 	query_pool queries(ctx, 2, 16);
 	unsigned cases = 0;
 	unsigned native_draws = 0, mirror_draws = 0, disabled_draws = 0;
+	unsigned independent_mirrors = 0, dependent_mirrors = 0;
 	const bool native_supported = supports_native_depth_bounds(ctx.device());
 	for (const auto format : {surface_depth::z16_uint, surface_depth::z16_float, surface_depth::z24s8_uint, surface_depth::z24s8_float})
 	{
@@ -282,12 +294,40 @@ void verify_executor_bounds(context& ctx, surface_cache& surfaces, draw_executor
 			}
 			verify(ctx, surfaces, target, color_pass ? std::array{64u, 128u, 192u, 255u} : std::array{17u, 34u, 51u, 255u},
 				kind == 9 ? std::array{1u, 1u, 2u, 2u} : std::array{0u, 0u, 4u, 4u});
+			if (kind == 10)
+			{
+				request.queries = nullptr;
+				auto dependent = request;
+				dependent.persistent = make_buffer(ctx, request.persistent.length, buffer_storage::private_gpu);
+				for (const bool blit_vertex : {false, true})
+				{
+					{
+						auto batch = surfaces.batch_draws();
+						surfaces.clear(target, 0xf0, 0xff112233, 0, 255, {0, 0, 4, 4});
+						if (blit_vertex)
+							copy_buffer(ctx, request.persistent, 0, dependent.persistent, 0, request.persistent.length);
+						const auto before = ctx.encoding_statistics();
+						executor.execute(draw, targets, blit_vertex ? dependent : request);
+						const auto after = ctx.encoding_statistics();
+						require(after.render_encoders == before.render_encoders + 2 &&
+							after.guest_draw_full_barriers == before.guest_draw_full_barriers + blit_vertex &&
+							after.guest_draw_fragment_barriers == before.guest_draw_fragment_barriers + !blit_vertex,
+							"Stored-depth guest draw must wait for the mirror and any dependent vertex input");
+						independent_mirrors += !blit_vertex;
+						dependent_mirrors += blit_vertex;
+						batch.finish();
+					}
+					verify(ctx, surfaces, target, {64, 128, 192, 255});
+				}
+			}
 			++cases;
 		}
 	}
 	require(cases == 72 && native_draws == (native_supported ? 104u : 0u) && mirror_draws == (native_supported ? 32u : 136u) && disabled_draws == 8,
 		"Depth bounds matrix omitted native,mirror,disabled or full-range nonfinite storage cases");
 	std::cout << "Native executor stored-depth bounds:" << cases << " guest-depth cases,two overlapping triangles,no-write/disabled depth,late depth/stencil failure,masked replacement,alpha/sample-mask rejection,equal bounds/scissor;narrow/full-range stored NaN/Inf/negative/above-one rejected with exact depth bits/stencil,queries exclude initializer;native-selector draws=" << native_draws << ",mirror draws=" << mirror_draws << ",disabled draws=" << disabled_draws << ";exact encoder selection passed\n";
+	std::cout << "Checked stored-depth guest draws: " << independent_mirrors << " fragment/tile waits and "
+		<< dependent_mirrors << " full barriers for vertex blits; four depth formats and exact pixels passed\n";
 }
 std::size_t sample_storage_offset(const framebuffer_surface& surface, unsigned x, unsigned y)
 {
@@ -365,6 +405,7 @@ void verify_framebuffer_samples(context& ctx, surface_cache& surfaces, draw_exec
 	query_pool queries(ctx, 2, 16);
 	sample_transfer transfer(ctx);
 	unsigned cases = 0;
+	unsigned checked_msaa = 0, checked_bounds = 0, checked_copy = 0;
 	for (const auto format : {surface_depth::z16_uint, surface_depth::z16_float, surface_depth::z24s8_uint, surface_depth::z24s8_float})
 	{
 		const auto info = describe_surface_depth(format);
@@ -506,12 +547,56 @@ void verify_framebuffer_samples(context& ctx, surface_cache& surfaces, draw_exec
 									" mode=" + std::to_string(mode) + " raster=" + std::to_string(raster) + " kind=" + std::to_string(kind) +
 									" depth=" + std::to_string(pair.first == &actual_depth) + " byte=" + std::to_string(i) +
 									" actual=" + std::to_string(std::to_integer<unsigned>((*pair.first)[i])) + " expected=" + std::to_string(std::to_integer<unsigned>((*pair.second)[i])));
+					if (count > 1 && (kind == 0 || kind == 9))
+					{
+						for (const bool copy_samples : {false, true})
+						{
+							if (copy_samples && kind != 9) continue;
+							auto batch = surfaces.batch_draws();
+							surfaces.clear(targets.colors[0], 0xf0, 0xff112233, 0, 255, {0, 0, 4, 4});
+							surfaces.clear(targets.depth, info.stencil ? 3 : 1, 0, info.stencil ? 0x40000042 : 0x4000, 255, {0, 0, 4, 4});
+							if (copy_samples)
+							{
+								auto copy_desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:4 height:4 mipmapped:NO];
+								copy_desc.textureType = MTLTextureType2DMultisample;
+								copy_desc.sampleCount = count;
+								copy_desc.storageMode = MTLStorageModePrivate;
+								copy_desc.usage = MTLTextureUsageRenderTarget;
+								const auto copy = make_texture(ctx, copy_desc);
+								surfaces.draw(std::array{cached_surface_use{targets.colors[0], true}}, [&](context& commands, auto images)
+								{
+									const texture_region whole{0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(4, 4, 1)};
+									copy_texture(commands, images[0], whole, copy, whole);
+									copy_texture(commands, copy, whole, images[0], whole);
+								});
+							}
+							const auto prefix = ctx.recording_submission();
+							const auto before = ctx.encoding_statistics();
+							executor.execute(packet, framebuffer);
+							const auto after = ctx.encoding_statistics();
+							require(prefix.same_batch(ctx.recording_submission()) &&
+								after.guest_draw_fragment_barriers == before.guest_draw_fragment_barriers + !copy_samples &&
+								after.guest_draw_full_barriers == before.guest_draw_full_barriers + copy_samples,
+								"MSAA guest draw selected the wrong barrier after attachment or native copy work");
+							batch.finish();
+							surfaces.flush(targets.colors[0]);
+							surfaces.flush(targets.depth);
+							require(ram.read_surface(cs.guest).bytes == expected_color && ram.read_surface(ds.guest).bytes == expected_depth,
+								"Checked MSAA guest draw changed samples, stencil or guest padding");
+							checked_msaa += kind == 0;
+							checked_bounds += kind == 9 && !copy_samples;
+							checked_copy += copy_samples;
+						}
+					}
 					++cases;
 				}
 			}
 	}
 	require(cases == 512, "MSAA framebuffer policy matrix omitted guest formats/modes/storage/state");
 	std::cout << "Native owned MSAA framebuffers:512 GPU policy cases,four guest depth formats,AA0/3/4/5,linear/Morton B-plus-depth,sample-mask with disabled hint,A2C endpoints/half coverage,A2One ordering,alpha rejection,scissor,stored-depth bounds and query counts;individual native color/depth/stencil samples,exploded guest words and whole-allocation padding passed\n";
+	std::cout << "Checked MSAA guest draws: " << checked_msaa << " ordinary and " << checked_bounds
+		<< " depth-bounds fragment/tile barriers after tracked clears, " << checked_copy
+		<< " full barriers after native copies; exact color, depth, stencil and padding passed\n";
 }
 void verify_framebuffer_sample_colors(context& ctx, surface_cache& surfaces, draw_executor& executor, memory& ram,
 	const std::vector<std::byte>& positions, const std::vector<std::byte>& indices,
@@ -765,11 +850,41 @@ void verify_versioned_upload_batch()
 	verify(ctx,surfaces,targets.colors[0],{20,40,60,255});
 	require(textures.statistics().uploads == uploads && epoch.current(draw.vertex_textures(),draw.textures()), "Draw reran resolution instead of consuming the completed batch epoch");
 	std::cout << "Productive grouped epoch consumed by native RSX vertex/fragment DrawExecutor:all16 RGBA pixels exact,no additional texture upload during draw passed\n";
+
+	ctx.geometry_uploads().clear();
+	draw_executor cold(ctx, surfaces, textures);
+	const auto free = ledger->statistics();
+	const auto available = free.budget - free.reserved_bytes;
+	constexpr std::size_t block = 64 << 10;
+	require(available > block, "Geometry budget test lacks free space");
+	std::vector<id<MTLBuffer>> reservations{ledger->shared_buffer((available - block) / block * block)};
+	for (;;)
+	{
+		try { reservations.push_back(ledger->shared_buffer(16)); }
+		catch (const heap_budget_error&) { break; }
+	}
+	unsigned admissions = 0;
+	const auto recover = ledger->register_reclaimer([&](memory_pressure_request pressure)
+	{
+		require(!pressure.native_failure && admissions == 0 && cold.vertex_statistics().prewarmed == 1 &&
+			cold.fragment_statistics().prewarmed == 1 && !cold.vertex_statistics().compiled &&
+			!cold.fragment_statistics().compiled && cold.pipeline_statistics().prewarmed == 1 && !cold.pipeline_statistics().created,
+			"Geometry allocation reached pressure recovery after waiting for a shader");
+		++admissions;
+		reservations.clear();
+	});
+	const auto before_geometry = ctx.geometry_uploads().statistics().created;
+	cold.execute(draw, targets, request, epoch.textures);
+	require(admissions == 1 && ctx.geometry_uploads().statistics().created == before_geometry + 1 &&
+		cold.compilation_statistics().admitted == 3 && cold.pipeline_statistics().prewarmed == 1,
+		"Early geometry admission failed to recover or duplicated a shader or pipeline job");
+	verify(ctx,surfaces,targets.colors[0],{20,40,60,255});
+	std::cout << "Early draw geometry: budget recovery ran after both shader jobs started and before shader materialization; one PSO and 16 exact pixels passed\n";
 }
 void verify_owned_texture_boundary()
 {
 	using namespace std::chrono_literals;
-	context ctx(2); auto ledger = std::make_shared<heap_budget>(ctx,8u << 20); ctx.set_buffer_budget(ledger);
+	context ctx(1, 64, 5s); auto ledger = std::make_shared<heap_budget>(ctx,8u << 20); ctx.set_buffer_budget(ledger);
 	auto ram = std::make_shared<memory>(); surface_cache surfaces(ctx,ram,8u << 20,ledger);
 	guest_texture_cache textures(ctx,ram,[](unsigned offset,unsigned,std::size_t) { return offset * 16; },1u << 20,ledger);
 	draw_executor executor(ctx,surfaces,textures); (void)textures.null_images();
@@ -806,9 +921,14 @@ void verify_owned_texture_boundary()
 		textures.clear_null_images();
 		auto batch = surfaces.batch_draws(); surfaces.clear(target,0xf0,0xff112233,0,255,{0,0,4,4});
 		const auto prefix = ctx.recording_submission();
-		auto cold_nulls = executor.enqueue_versioned_textures(disabled_vertex,disabled_fragment);
-		require(cold_nulls.ready() && cold_nulls.finish().revisions.empty() && textures.statistics().null_initializations == 2,
-			"First disabled sampler failed to close its owned prefix before native null initialization");
+		const auto encoders = ctx.encoding_statistics();
+		const auto submissions = surfaces.transaction_statistics().submitted;
+		auto cold_nulls = executor.enqueue_versioned_textures(disabled_vertex, disabled_fragment);
+		require(cold_nulls.ready() && cold_nulls.finish().revisions.empty() && textures.statistics().null_initializations == 2 &&
+			!prefix.ready() && prefix.same_batch(ctx.recording_submission()) &&
+			surfaces.transaction_statistics().submitted == submissions &&
+			ctx.encoding_statistics().compute_encoders == encoders.compute_encoders,
+			"Cold disabled samplers submitted or interrupted the owned draw prefix");
 		batch.finish(); prefix.wait();
 	}
 	{
@@ -824,10 +944,27 @@ void verify_owned_texture_boundary()
 		batch.finish(); gate.signaledValue = 1; (void)upload.finish();
 		verify(ctx,surfaces,target,{119,136,153,255});
 	}
+	{
+		textures.clear_null_images();
+		const auto gate = [ctx.device() newSharedEvent];
+		struct gate_scope { id<MTLSharedEvent> event; ~gate_scope() { event.signaledValue = 1; } } guard{gate};
+		ctx.begin();
+		ctx.wait_event(gate, 1);
+		const auto occupied = ctx.submit();
+		const auto encoders = ctx.encoding_statistics();
+		const auto reads = ram->reads;
+		const auto cold_nulls = executor.prepare_versioned_textures(disabled_vertex, disabled_fragment);
+		require(!occupied.ready() && cold_nulls.revisions.empty() &&
+			cold_nulls.textures.null_images()[3].texture && textures.statistics().null_initializations == 3 &&
+			ctx.encoding_statistics().compute_encoders == encoders.compute_encoders && ram->reads == reads,
+			"Cold disabled samplers waited for the only Metal4 command slot or read VM");
+		gate.signaledValue = 1;
+		occupied.wait();
+	}
 	ctx.begin(); const auto caller = ctx.recording_submission(); bool foreign = false;
 	try { (void)executor.enqueue_versioned_textures(empty_vertex,empty_fragment); } catch (const std::logic_error&) { foreign = true; }
 	require(foreign && caller.same_batch(ctx.recording_submission()) && !caller.ready(), "Texture boundary submitted a foreign caller recording"); ctx.cancel();
-	std::cout << "Owned texture boundary:32 empty/disabled draw epochs preserve one native recording/submission andexact pixels;invalid preflight andforeign caller recording untouched;cold nulls andevent-gated enabled upload close only the owned prefix without losing its pixels passed\n";
+	std::cout << "Cold null textures: disabled units preserve the recording and initialize with the sole slot occupied; enabled uploads still close their owned prefix; no disabled VM reads\n";
 }
 void verify_ready_texture_boundary()
 {
@@ -874,7 +1011,8 @@ void verify_ready_texture_boundary()
 				batch.finish();
 			}
 			require(surfaces.transaction_statistics().submitted==before.submitted+1&&surfaces.transaction_statistics().draw_batches==before.draw_batches+1&&textures.statistics().upload_batches==uploads.upload_batches,"Ready textures split one 32-draw batch");if(kind==1||kind==2||kind==3)require(surfaces.status(source).spilled,"Ready texture restored spilled source");verify(ctx,surfaces,target,{32,64,128,255});
-			const auto row=kind==2?16u:kind==3?16u:kind==5?32u:16u;const auto raw=make_buffer(ctx,256*4,buffer_storage::shared);texture_region area;area.size=MTLSizeMake(image.width,image.height,1);ctx.begin();texture_to_buffer(ctx,image,area,raw,0,256);ctx.submit().wait();
+			const auto readable = image.sampleCount == 1 ? image : textures.resolve_versioned(words, surfaces).image.texture;
+			const auto row=kind==2?16u:kind==3?16u:kind==5?32u:16u;const auto raw=make_buffer(ctx,256*4,buffer_storage::shared);texture_region area;area.size=MTLSizeMake(readable.width,readable.height,1);ctx.begin();texture_to_buffer(ctx,readable,area,raw,0,256);ctx.submit().wait();
 			for(unsigned y=0;y<4;++y)for(unsigned x=0;x<row;++x)
 			{
 				unsigned wanted=kind==2?std::array{255u,20u,40u,60u}[x%4]:kind==3?std::array{20u,255u,60u,40u}[x%4]:std::array{60u,40u,20u,255u}[x%4];
@@ -891,20 +1029,126 @@ void verify_ready_texture_boundary()
 	}
 	std::cout<<"Ready texture boundary:"<<profiles<<" VM/native1-4sample/R8-R16cast/cube-Depth3Dassembly profiles,"<<hits<<" active ready epochs preserve32-draw single batches despite unsignalled dependencies;zero new allocation/encoding/VMreads,spilled sources stay spilled,"<<checked_bytes<<" exact native bytes andtarget pixels;11synchronous cold misses closeprefix correctly passed\n";
 }
-void verify_ready_textured_draws()
+void verify_predicated_texture_preparation()
 {
-	unsigned draws=0;
+	context ctx(2);
+	auto ledger = std::make_shared<heap_budget>(ctx, 16u << 20);
+	ctx.set_buffer_budget(ledger);
+	auto ram = std::make_shared<memory>();
+	surface_cache surfaces(ctx, ram, 16u << 20, ledger);
+	guest_texture_cache textures(ctx, ram, [](unsigned offset, unsigned, std::size_t) { return offset * 16; }, 1u << 20, ledger);
+	draw_executor executor(ctx, surfaces, textures);
+	const surface_allocation_description color{4, 4, 1, surface_color::argb8, false};
+	const auto source = surfaces.acquire({0x1000, color, 16, {}});
+	const auto donor = surfaces.acquire({0x2000, color, 16, {}});
+	draw_targets targets;
+	targets.colors[0] = surfaces.acquire({0x3000, color, 16, {}});
+	surfaces.clear(donor, 0xf0, 0xff14283c, 0, 255, {0, 0, 4, 4});
+	surfaces.clear(targets.colors[0], 0xf0, 0xff112233, 0, 255, {0, 0, 4, 4});
+	surfaces.defer_copy(donor, {0, 0, 4, 4}, source, 0, 0);
+	auto words = registers();
+	texture_registers(words, 0x100);
+	const auto draw = snapshot(words, true, 1);
+	const std::array<std::byte, 12> indices{{{}, {}, {}, {}, {}, {}, {}, std::byte{1}, {}, {}, {}, std::byte{2}}};
+	const auto geometry = plan_indexed_geometry(guest_topology::triangles, indices, 4, 0, {}, {}, provoking_vertex::last);
+	draw_request request;
+	request.geometry = geometry.geometry;
+	request.fetch.attribute_mask = 1;
+	request.fetch.attributes[0] = {16u | (3u << 8) | (2u << 24) | (4u << 27), (1u << 31) | (1u << 29)};
+	test::vertex_data_processor processor;
+	processor.descriptors = request.fetch.attributes;
+	for (float value : {-1.f,-1.f,.5f,1.f,3.f,-1.f,.5f,1.f,-1.f,3.f,.5f,1.f})
+		for (unsigned shift : {24u,16u,8u,0u}) processor.persistent.push_back(std::byte(std::bit_cast<unsigned>(value) >> shift));
+	const auto vertices = vertex_data_snapshot::capture(processor, 0, test::vertex_data_metadata{1}, test::vertex_data_state{}, geometry.streams, {48,0}, 48);
+	apply_vertex_data_snapshot(ctx, vertices, request);
+	apply_draw_environment(draw_environment_snapshot::capture(test::environment_state{}), 4, 4, request);
+	query_pool queries(ctx, 1, 1, ledger);
+	ctx.begin();
+	const auto off = queries.capture_report_predicate({{}, 0, true});
+	const auto on = queries.capture_report_predicate({{}, 1, true});
+	require(off && on, "Texture preparation fixture could not capture both reports");
+	ctx.submit().wait();
+	request.queries = &queries;
+	request.predicate = off;
+	const auto before = ram->read({0x1000, 64});
+	const auto upload_count = textures.statistics().upload_batches;
+	const auto enqueue = [&](const report_predicate& predicate)
+	{
+		return executor.enqueue_versioned_textures(draw.vertex_textures(), draw.textures(), {}, &predicate);
+	};
+	executor.execute(draw, targets, request);
+	bool suppressed = false;
+	try { (void)enqueue(*off); }
+	catch (const predicated_texture_suppressed&) { suppressed = true; }
+	require(suppressed && textures.statistics().upload_batches == upload_count,
+		"False predicate started a versioned upload for its deferred texture input");
+	const auto gate = [ctx.device() newSharedEvent];
+	ctx.begin();
+	ctx.wait_event(gate, 1);
+	const auto pending = queries.capture_report_predicate({{}, 0, true});
+	const auto producer = ctx.submit();
+	surfaces.set_wait_timeout(std::chrono::milliseconds(1));
+	bool timed_out = false;
+	std::exception_ptr unexpected;
+	try { (void)enqueue(*pending); }
+	catch (const submission_wait_timeout&) { timed_out = true; }
+	catch (...) { unexpected = std::current_exception(); }
+	const bool producer_blocked = !producer.ready();
+	gate.signaledValue = 1;
+	producer.wait();
+	surfaces.set_wait_timeout(std::chrono::seconds(30));
+	if (unexpected) std::rethrow_exception(unexpected);
+	require(timed_out && producer_blocked && textures.statistics().upload_batches == upload_count,
+		"Unresolved predicate started a versioned upload for its deferred texture input");
+	const auto after = ram->read({0x1000, 64});
+	require(surfaces.status(source).deferred_copies == 1 && before.revision == after.revision && before.bytes == after.bytes,
+		"False predicate materialized its deferred texture input");
+	verify(ctx, surfaces, targets.colors[0], {17,34,51,255});
+	request.predicate = on;
+	const auto prepared = enqueue(*on).finish();
+	executor.execute(draw, targets, request, prepared.textures);
+	verify(ctx, surfaces, targets.colors[0], {20,40,60,255});
+	ctx.begin();
+	ctx.wait_event(gate, 2);
+	const auto pending_warm = queries.capture_report_predicate({{}, 0, true});
+	const auto warm_producer = ctx.submit();
+	surfaces.set_wait_timeout(std::chrono::milliseconds(1));
+	bool warm_ready = false;
+	unexpected = {};
+	try
+	{
+		auto job = enqueue(*pending_warm);
+		warm_ready = job.ready() && !warm_producer.ready();
+	}
+	catch (...) { unexpected = std::current_exception(); }
+	gate.signaledValue = 2;
+	warm_producer.wait();
+	surfaces.set_wait_timeout(std::chrono::seconds(30));
+	if (unexpected) std::rethrow_exception(unexpected);
+	require(warm_ready, "Immutable texture hit waited on a pending predicate");
+	std::cout << "Predicated texture preparation: direct and versioned false reports preserve deferred input, timeout keeps upload idle, true samples exact pixels, warm snapshot remains ready\n";
+}
+
+void verify_ready_textured_draws(bool completed_waits_only=false)
+{
+	unsigned completed_profiles=0,completed_draws=0,completed_timeouts=0,completed_cancels=0;
+	unsigned draws=0, narrowed=0, same_batch_waits=0, pending_waits=0, independent_pending=0, opaque_pending=0;
+	unsigned load_clears = 0, shader_clears = 0, opaque_passes = 0, multisample_clears = 0, multisample_copies = 0;
 	for(bool native:{false,true})
 	{
 		context ctx(2);auto ledger=std::make_shared<heap_budget>(ctx,16u<<20);ctx.set_buffer_budget(ledger);auto ram=std::make_shared<memory>();surface_cache surfaces(ctx,ram,16u<<20,ledger);guest_texture_cache textures(ctx,ram,[](unsigned offset,unsigned,std::size_t){return offset*16;},1u<<20,ledger);draw_executor executor(ctx,surfaces,textures);
 		std::array<std::byte,64> pixels;for(unsigned i=0;i<pixels.size();++i)pixels[i]=std::byte(std::array{255u,20u,40u,60u}[i%4]);ram->write({0x1000,64},pixels);
 		if(native){const auto source=surfaces.acquire({0x1000,{4,4,1,surface_color::argb8,false},16,{}});surfaces.clear(source,0xf0,0xff14283c,0,255,{0,0,4,4});}
-		auto source=registers();texture_registers(source,0x100);const auto draw=snapshot(source,true,1);const auto initial=executor.prepare_versioned_textures(draw.vertex_textures(),draw.textures());
+		auto source=registers();texture_registers(source,0x100);
+		const auto owned_registers = source.registers;
+		const auto draw=snapshot(source,true,1);const auto initial=executor.prepare_versioned_textures(draw.vertex_textures(),draw.textures());
 		draw_request request;const std::array<std::byte,12> indices{std::byte{0},std::byte{0},std::byte{0},std::byte{0},std::byte{0},std::byte{0},std::byte{0},std::byte{1},std::byte{0},std::byte{0},std::byte{0},std::byte{2}};const auto geometry=plan_indexed_geometry(guest_topology::triangles,indices,4,0,{}, {},provoking_vertex::last);request.geometry=geometry.geometry;request.fetch.attribute_mask=1;request.fetch.attributes[0]={16u|(3u<<8)|(2u<<24)|(4u<<27),(1u<<31)|(1u<<29)};
 		test::vertex_data_processor processor;processor.descriptors=request.fetch.attributes;for(float value:{-1.f,-1.f,.5f,1.f,3.f,-1.f,.5f,1.f,-1.f,3.f,.5f,1.f})for(unsigned shift:{24u,16u,8u,0u})processor.persistent.push_back(std::byte(std::bit_cast<unsigned>(value)>>shift));
 		const auto vertices=vertex_data_snapshot::capture(processor,0,test::vertex_data_metadata{1},test::vertex_data_state{},geometry.streams,{48,0},48);apply_vertex_data_snapshot(ctx,vertices,request);apply_draw_environment(draw_environment_snapshot::capture(test::environment_state{}),4,4,request);
 		draw_targets targets;targets.colors[0]=surfaces.acquire({0xa000,{4,4,1,surface_color::argb8,false},16,{}});surfaces.clear(targets.colors[0],0xf0,0xff112233,0,255,{0,0,4,4});executor.execute(draw,targets,request,initial.textures);
+		ctx.wait_idle();
 		const auto before=surfaces.transaction_statistics();const auto uploads=textures.statistics().upload_batches;const auto reads=ram->reads;std::optional<submission> recording;
+		const auto before_barriers = ctx.encoding_statistics();
 		{
 			auto batch=surfaces.batch_draws();
 			for(unsigned i=0;i<32;++i)
@@ -912,9 +1156,226 @@ void verify_ready_textured_draws()
 				auto job=executor.enqueue_versioned_textures(draw.vertex_textures(),draw.textures());require(job.ready(),"Warm textured draw started GPU preparation");const auto ready=job.finish();require(ready.current(draw.vertex_textures(),draw.textures()),"Warm textured draw lost source receipt");executor.execute(draw,targets,request,ready.textures);if(!recording)recording=ctx.recording_submission();require(recording->same_batch(ctx.recording_submission())&&!recording->ready()&&surfaces.transaction_statistics().submitted==before.submitted,"Ready texture split productive textured draw batch");++draws;
 			}batch.finish();
 		}
+		const auto after_barriers = ctx.encoding_statistics();
+		require(after_barriers.guest_draw_fragment_barriers == before_barriers.guest_draw_fragment_barriers + 32 &&
+			after_barriers.guest_draw_full_barriers == before_barriers.guest_draw_full_barriers,
+			"Independent translated vertex/index inputs did not keep the vertex stage free");
+		narrowed += 32;
 		require(surfaces.transaction_statistics().submitted==before.submitted+1&&surfaces.transaction_statistics().draw_batches==before.draw_batches+1&&textures.statistics().upload_batches==uploads&&ram->reads==reads,"Textured draw batch uploaded orrecaptured source");verify(ctx,surfaces,targets.colors[0],{20,40,60,255});
+		test::pass_state state;
+		state.registers = owned_registers;
+		state.current_draw_clause.command = 1;
+		state.base_index = 0;
+		test::pass_processor owned_processor;
+		owned_processor.persistent = processor.persistent;
+		owned_processor.descriptors = processor.descriptors;
+		test::pass_layout layout;
+		test::pass_metadata metadata;
+		const auto fragment_code = program(true);
+		test::fragment_program fragment;
+		fragment.pointer = fragment_code.data();
+		fragment.ucode_length = fragment_code.size();
+		fragment.ctrl = rsx_fragment_float32;
+		const auto owned = rsx_draw_packet::capture(state, owned_processor, layout, metadata, vertex_program(), fragment, 1,
+			provoking_vertex::last, [](const auto&, unsigned, unsigned) { return std::pair<unsigned, unsigned>{48,0}; });
+		const auto owned_encoders = ctx.encoding_statistics().render_encoders;
+		const auto owned_submissions = surfaces.transaction_statistics().submitted;
+		{
+			auto batch = surfaces.batch_draws();
+			for (unsigned i = 0; i < 32; ++i)
+				executor.execute(owned, targets, initial.textures);
+			batch.finish();
+		}
+		require(ctx.encoding_statistics().render_encoders == owned_encoders + 1 &&
+			surfaces.transaction_statistics().submitted == owned_submissions + 1,
+			"Independent ready fragment texture split the owned render pass");
+		verify(ctx, surfaces, targets.colors[0], {20,40,60,255});
+
+
+        draw_targets other;other.colors[0]=surfaces.acquire({0xc000,{4,4,1,surface_color::argb8,false},16,{}});
+        for(bool precise:{false,true})for(unsigned mode=0;mode<8;++mode)
+        {
+            surfaces.clear(targets.colors[0],0xf0,0xff112233,0,255,{0,0,4,4});surfaces.clear(other.colors[0],0xf0,0xff112233,0,255,{0,0,4,4});
+            const auto generation=surfaces.status(targets.colors[0]).content_generation;
+            const auto reached=[ctx.device() newSharedEvent],pending=[ctx.device() newSharedEvent],hold=[ctx.device() newSharedEvent];
+            struct release { id<MTLSharedEvent> a,b,c;~release(){a.signaledValue=1;b.signaledValue=1;c.signaledValue=1;} } unblock{reached,pending,hold};
+            reached.signaledValue=mode==3||mode==5?0:1;
+            query_pool visibility(ctx,1,64,ledger);draw_execution_state state;state.queries=&visibility;
+            const auto encoders=ctx.encoding_statistics().render_encoders,submissions=surfaces.transaction_statistics().submitted;
+            auto batch=surfaces.batch_draws();
+            if(mode==7)surfaces.draw(std::array{cached_surface_use{targets.colors[0],true}},[&](context& commands,auto){commands.wait_event(hold,1);});
+            visibility.begin(0,precise);
+            for(unsigned i=0;i<32;++i)
+            {
+                state.waits.clear();
+                if(mode!=0&&!(mode==3&&i==0))state.waits.push_back({reached,mode==2?0u:1u});
+                if(mode==4)state.waits.push_back({pending,1});
+                if((mode==3||mode==5)&&i==1)reached.signaledValue=1;
+                executor.execute(owned,mode==6&&i>=8&&i<16?other:targets,initial.textures,state);++completed_draws;
+            }
+            visibility.end(0);
+            const auto expected_encoders=mode==4?32u:mode==5?2u:mode==6?3u:1u;
+            require(ctx.encoding_statistics().render_encoders==encoders+expected_encoders,
+                "Completed draw waits split compatible native render encoders or lost a required pass boundary");
+            require(surfaces.transaction_statistics().submitted==submissions,"Draw wait encoder test submitted before its batch boundary");
+            if(mode==4||mode==7)
+            {
+                const auto recording=ctx.recording_submission();surfaces.submit_draw_batch();bool timed_out=false;
+                try{recording.wait(std::chrono::milliseconds(1));}catch(const submission_wait_timeout&){timed_out=true;}
+                require(timed_out&&!recording.ready()&&surfaces.status(targets.colors[0]).content_generation==generation,
+                    "Draw waits lost their actual queue gate or published target state early");++completed_timeouts;
+                if(mode==7)
+                {
+                    require(recording.cancel_pending(),"Held shared-encoder batch could not be cancelled");bool failed=false;
+                    try{batch.finish();}catch(const std::runtime_error&){failed=true;}
+                    require(failed&&!surfaces.status(targets.colors[0]).pending&&!surfaces.status(targets.colors[0]).faulted&&surfaces.status(targets.colors[0]).content_generation==generation,
+                        "Cancelled shared-encoder batch published an independent prefix or draw output");
+                    ctx.recover_completed_errors();visibility.discard(0);verify(ctx,surfaces,targets.colors[0],{17,34,51,255});verify(ctx,surfaces,other.colors[0],{17,34,51,255});++completed_cancels;++completed_profiles;continue;
+                }
+                pending.signaledValue=1;
+            }
+            batch.finish();
+            require(surfaces.transaction_statistics().submitted==submissions+1,"Completed draw waits split a surface transaction");
+            require(visibility.consume(0)==(precise?512u:1u),"Shared encoder with completed draw waits lost exact visibility samples");
+            verify(ctx,surfaces,targets.colors[0],{20,40,60,255});verify(ctx,surfaces,other.colors[0],mode==6?std::array{20u,40u,60u,255u}:std::array{17u,34u,51u,255u});++completed_profiles;
+        }
+        if(completed_waits_only)continue;
+
+		auto image = initial.textures.fragment(0);
+		auto texture_desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:image.texture.pixelFormat
+			width:image.texture.width height:image.texture.height mipmapped:NO];
+		texture_desc.storageMode = MTLStorageModePrivate;
+		texture_desc.usage = MTLTextureUsageShaderRead;
+		const auto scratch = make_texture(ctx, texture_desc);
+		const auto source_texture = image.texture;
+		image.texture = scratch;
+		const auto dependent_epoch = draw_texture_epoch::capture(ctx, owned.state().vertex_textures(), owned.state().textures(),
+			[&](bool, unsigned, const auto&) { return image; });
+		{
+			auto batch = surfaces.batch_draws();
+			executor.execute(owned, targets, initial.textures);
+			texture_region full;
+			full.size = MTLSizeMake(scratch.width, scratch.height, 1);
+			copy_texture(ctx, source_texture, full, scratch, full);
+			const auto after_copy = ctx.encoding_statistics().render_encoders;
+			executor.execute(owned, targets, dependent_epoch);
+			executor.execute(owned, targets, dependent_epoch);
+			require(ctx.encoding_statistics().render_encoders == after_copy + 2,
+				"A pending fragment texture write must prevent encoder reuse");
+			batch.finish();
+		}
+		verify(ctx, surfaces, targets.colors[0], {20,40,60,255});
+		std::cout << "Owned textured pass reuse: 32 draws in one encoder and submission, pending sampled writes split the pass, exact pixels (native source " << native << ")\n";
+		auto dependent = request;
+		dependent.persistent = make_buffer(ctx, request.persistent.length, buffer_storage::private_gpu);
+		{
+			auto batch = surfaces.batch_draws();
+			executor.execute(draw, targets, request, initial.textures);
+			copy_buffer(ctx, request.persistent, 0, dependent.persistent, 0, request.persistent.length);
+			const auto before_copy_draw = ctx.encoding_statistics();
+			executor.execute(draw, targets, dependent, initial.textures);
+			require(ctx.encoding_statistics().guest_draw_full_barriers == before_copy_draw.guest_draw_full_barriers + 1,
+				"A vertex input written earlier in the same recording must keep the full barrier");
+			++same_batch_waits;
+			batch.finish();
+		}
+		verify(ctx, surfaces, targets.colors[0], {20,40,60,255});
+		enum class pending_writer { vertex, unrelated, opaque };
+		for (const auto writer : {pending_writer::vertex, pending_writer::unrelated, pending_writer::opaque})
+		{
+			const auto gate = [ctx.device() newSharedEvent];
+			struct release_gate { id<MTLSharedEvent> event; ~release_gate() { event.signaledValue = 1; } } release{gate};
+			ctx.begin();
+			ctx.wait_event(gate, 1);
+			copy_buffer(ctx, request.persistent, 0, dependent.persistent, 0, request.persistent.length);
+			if (writer == pending_writer::opaque) (void)ctx.compute();
+			const auto producer = ctx.submit();
+			{
+				auto batch = surfaces.batch_draws();
+				const auto before_pending_draw = ctx.encoding_statistics();
+				executor.execute(draw, targets, writer == pending_writer::vertex ? dependent : request, initial.textures);
+				const auto after_pending_draw = ctx.encoding_statistics();
+				const bool producer_pending = !producer.ready();
+				gate.signaledValue = 1;
+				const bool needs_full = writer != pending_writer::unrelated;
+				require(producer_pending && after_pending_draw.guest_draw_full_barriers == before_pending_draw.guest_draw_full_barriers + needs_full &&
+					after_pending_draw.guest_draw_fragment_barriers == before_pending_draw.guest_draw_fragment_barriers + !needs_full,
+					"Pending checked and opaque producers must select the appropriate guest draw barrier");
+				pending_waits += writer == pending_writer::vertex;
+				independent_pending += writer == pending_writer::unrelated;
+				opaque_pending += writer == pending_writer::opaque;
+				batch.finish();
+			}
+			producer.wait();
+			verify(ctx, surfaces, targets.colors[0], {20,40,60,255});
+		}
+		const auto multisample = surfaces.acquire({0x1a000, {4, 4, 2, surface_color::argb8, false}, 32, {}});
+		surfaces.clear(multisample, 0xf0, 0xff112233, 0, 255, {0, 0, 4, 4});
+		auto descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:4 height:4 mipmapped:NO];
+		descriptor.textureType = MTLTextureType2DMultisample;
+		descriptor.sampleCount = 2;
+		descriptor.storageMode = MTLStorageModePrivate;
+		descriptor.usage = MTLTextureUsageRenderTarget;
+		const auto copied_samples = make_texture(ctx, descriptor);
+		ctx.wait_idle();
+		auto scissored_registers = registers();
+		texture_registers(scissored_registers, 0x100);
+		scissored_registers.registers[0x8c0 / 4] = 2u << 16;
+		const auto scissored = snapshot(scissored_registers, true, 1);
+		enum class prior_pass { load_clear, shader_clear, opaque, multisample, sample_copy };
+		for (const auto prior : {prior_pass::load_clear, prior_pass::shader_clear, prior_pass::opaque, prior_pass::multisample, prior_pass::sample_copy})
+		{
+			const bool scissor = prior != prior_pass::multisample && prior != prior_pass::sample_copy;
+			{
+				auto batch = surfaces.batch_draws();
+				if (prior == prior_pass::opaque)
+					surfaces.draw(std::array{cached_surface_use{targets.colors[0], true}}, [&](context& commands, auto images)
+					{
+						auto pass = [MTL4RenderPassDescriptor new];
+						pass.colorAttachments[0].texture = images[0];
+						pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+						pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+						pass.colorAttachments[0].clearColor = MTLClearColorMake(17. / 255, 34. / 255, 51. / 255, 1);
+						(void)commands.render(pass);
+					});
+				else if (prior == prior_pass::sample_copy)
+					surfaces.draw(std::array{cached_surface_use{multisample, true}}, [&](context& commands, auto images)
+					{
+						const texture_region whole{0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(4, 4, 1)};
+						copy_texture(commands, images[0], whole, copied_samples, whole);
+					});
+				else
+					surfaces.clear(prior == prior_pass::multisample ? multisample : targets.colors[0],
+						0xf0, 0xff112233, 0, 255, prior == prior_pass::shader_clear ? clear_rectangle{2, 0, 2, 4} : clear_rectangle{0, 0, 4, 4});
+				const auto prefix = ctx.recording_submission();
+				const auto before_draw = ctx.encoding_statistics();
+				executor.execute(scissor ? scissored : draw, targets, request, initial.textures);
+				const auto after_draw = ctx.encoding_statistics();
+				const bool full = prior == prior_pass::opaque || prior == prior_pass::sample_copy;
+				require(prefix.same_batch(ctx.recording_submission()) &&
+					after_draw.guest_draw_full_barriers == before_draw.guest_draw_full_barriers + full &&
+					after_draw.guest_draw_fragment_barriers == before_draw.guest_draw_fragment_barriers + !full,
+					"A preceding clear or opaque pass selected the wrong guest draw barrier");
+				load_clears += prior == prior_pass::load_clear;
+				shader_clears += prior == prior_pass::shader_clear;
+				opaque_passes += prior == prior_pass::opaque;
+				multisample_clears += prior == prior_pass::multisample;
+				multisample_copies += prior == prior_pass::sample_copy;
+				batch.finish();
+			}
+			verify(ctx, surfaces, targets.colors[0], {20,40,60,255},
+				scissor ? std::array<unsigned, 4>{0, 0, 2, 4} : std::array<unsigned, 4>{0, 0, 4, 4});
+		}
 	}
+	std::cout<<"Completed draw encoder waits: "<<completed_profiles<<" VM/native ready-texture profiles, "<<completed_draws<<" translated draws, "<<completed_timeouts<<" actual queue timeouts, "<<completed_cancels<<" cancellations; completed/zero/late signals share encoders, mixed pending waits and attachment changes split passes, precise512/boolean1 visibility and exact target/prefix rollback pixels passed\n";
+	if(completed_waits_only)return;
 	std::cout<<"Ready productive textures:"<<draws<<" actual translated RSX draws acrossVM/native sources,two32-draw batches/two submissions,all16RGBA targetpixels exact,no newtextureupload/VMcapture passed\n";
+	std::cout << "Checked guest draw barriers: " << narrowed << " fragment/tile waits, " << same_batch_waits
+		<< " same-recording vertex waits, " << pending_waits << " pending vertex waits, " << independent_pending
+		<< " independent pending writes and " << opaque_pending << " opaque pending fallbacks passed\n";
+	std::cout << "Render helper write tracking: " << load_clears << " load-clear and " << shader_clears
+		<< " shader-clear and " << multisample_clears << " MSAA-clear prefixes kept vertex independent, "
+		<< opaque_passes << " opaque and " << multisample_copies << " MSAA-copy prefixes kept full guest draw barriers; exact pixels passed\n";
 }
 void verify_texture_writer_boundary()
 {
@@ -931,11 +1392,53 @@ void verify_texture_writer_boundary()
 	}
 	std::cout<<"Texture writer boundaries:"<<guards<<" actual recorded logical/physical-alias writers closeprefix before readylookup,newexactpixels replaceoldimmutableimage passed\n";
 }
-void verify_pending_draw_capture()
+enum class upload_outcome { success, cancellation, superseded, deferred_source, texture_writer, border_helper,
+	inline_color, inline_mixed, inline_cancel, inline_border, inline_superseded, inline_codec };
+struct inline_codec_case { unsigned format; bool volume; bool linear; };
+enum class inline_cast_source { none, color, depth, redirected_depth };
+struct inline_cast_case { inline_cast_source source; bool d16; unsigned samples = 1; bool spilled = false; bool plane_copies = false; };
+enum class inline_assembly_case
+{
+	none, cube, depth_volume, partial_color, partial_morton, partial_banked, partial_morton_depth, partial_banked_depth
+};
+enum class inline_dependency_case { none, no_prefix, after_prefix, completed_before, completed_after, completed_zero, first_completed, opaque_completed };
+enum class draw_framebuffer_case { initialized, cold, spilled, deferred, deferred_reader, stale_resident };
+void verify_pending_draw_capture(upload_outcome outcome, inline_codec_case codec = {}, inline_cast_case cast = {},
+	inline_assembly_case assembly = inline_assembly_case::none, bool defer_batch_completion = false,
+	inline_dependency_case dependency = inline_dependency_case::none, draw_framebuffer_case target_state = draw_framebuffer_case::initialized)
 {
 	using namespace std::chrono_literals;
-	context ctx(2); auto ledger = std::make_shared<heap_budget>(ctx,8u << 20); ctx.set_buffer_budget(ledger);
+	const bool inline_upload = outcome == upload_outcome::inline_color || outcome == upload_outcome::inline_mixed ||
+		outcome == upload_outcome::inline_cancel || outcome == upload_outcome::inline_border ||
+		outcome == upload_outcome::inline_superseded || outcome == upload_outcome::inline_codec;
+	const bool depth_codec = codec.format >= 0x90;
+	const bool vtc = codec.format && !depth_codec;
+	const bool redirected_depth = cast.source == inline_cast_source::redirected_depth;
+	const bool has_cast = cast.source != inline_cast_source::none && !redirected_depth;
+	const bool cast_depth_source = cast.source == inline_cast_source::depth || redirected_depth;
+	const bool has_assembly = assembly != inline_assembly_case::none;
+	const bool cube = assembly == inline_assembly_case::cube;
+	const bool depth_assembly = assembly == inline_assembly_case::depth_volume ||
+		assembly == inline_assembly_case::partial_morton_depth || assembly == inline_assembly_case::partial_banked_depth;
+	const bool morton = assembly == inline_assembly_case::partial_morton || assembly == inline_assembly_case::partial_morton_depth;
+	const bool banked = assembly == inline_assembly_case::partial_banked || assembly == inline_assembly_case::partial_banked_depth;
+	const bool partial = assembly == inline_assembly_case::partial_color || morton || banked;
+	const bool custom_border = outcome == upload_outcome::border_helper || outcome == upload_outcome::inline_border;
+	const bool superseded = outcome == upload_outcome::superseded || outcome == upload_outcome::inline_superseded;
+	const bool native_source = outcome == upload_outcome::deferred_source || outcome == upload_outcome::inline_mixed;
+	const bool upload_wait = dependency != inline_dependency_case::none;
+	const bool completed_waits = dependency == inline_dependency_case::completed_before || dependency == inline_dependency_case::completed_after || dependency == inline_dependency_case::completed_zero;
+	const bool opaque_wait = dependency == inline_dependency_case::opaque_completed;
+	const bool split_prefix = dependency == inline_dependency_case::after_prefix || dependency == inline_dependency_case::first_completed || opaque_wait;
+	const bool cold_framebuffer = target_state == draw_framebuffer_case::cold;
+	const bool spilled_framebuffer = target_state == draw_framebuffer_case::spilled;
+	const bool deferred_framebuffer = target_state == draw_framebuffer_case::deferred;
+	const bool hold_reader = target_state == draw_framebuffer_case::deferred_reader;
+	const bool reload_resident = target_state == draw_framebuffer_case::stale_resident;
+	context ctx(2, 64, 5s, context::recording_overlap::explicit_predecessor);
+	auto ledger = std::make_shared<heap_budget>(ctx,8u << 20); ctx.set_buffer_budget(ledger);
 	auto provider = std::make_shared<guarded_gpu_memory>();
+	provider->provide_storage_identity = partial;
 	auto ram = std::make_shared<guarded_guest_memory>(provider); auto io = std::make_shared<io_mapping_epoch>();
 	const cpu_capture_dispatch capture = [provider](const auto& work) { provider->execute([&](auto&) { work(); }); };
 	surface_cache surfaces(ctx,ram,8u << 20,ledger,capture);
@@ -944,35 +1447,239 @@ void verify_pending_draw_capture()
 	std::array<std::byte,64> pixels;
 	for (unsigned b = 0; b < pixels.size(); ++b) pixels[b] = std::array{std::byte{255},std::byte{20},std::byte{40},std::byte{60}}[b % 4];
 	ram->write({0x1000,64},pixels);
-	auto words = registers(); texture_registers(words,0x100);
-	const auto vertex_words = vertex_texture_snapshot::capture(words.registers,0);
+	std::vector<std::byte> position_image;
+	for (float value : {-1.f, -1.f, .5f, 1.f, 3.f, -1.f, .5f, 1.f, -1.f, 3.f, .5f, 1.f})
+		for (unsigned shift : {24u, 16u, 8u, 0u})
+			position_image.push_back(std::byte(std::bit_cast<unsigned>(value) >> shift));
+	position_image.resize(64);
+	ram->write({0x2000, 64}, position_image);
+	const unsigned texture_address = banked ? 0x10000 : 0x1000;
+	auto words = registers(); texture_registers(words, texture_address / 16); set_vertex_texture_registers(words, 0x200);
+	if (codec.format)
+	{
+		constexpr unsigned base = 0x1a00 / 4;
+		const unsigned depth = codec.volume ? 4 : 1;
+		const unsigned width = vtc ? 8 : 4;
+		const auto block = describe_guest_texture_format(codec.format).block;
+		words.registers[base + 1] = (2u << 16) | ((codec.format | (codec.linear ? 0x20u : 0u)) << 8) |
+			((codec.volume ? 3u : 2u) << 4) | 8u | 2u;
+		words.registers[base + 6] = (width << 16) | width;
+		words.registers[0x1840 / 4] = (depth << 20) | (codec.linear ? ((width + block.width - 1) / block.width) * block.bytes : 0);
+		const auto regs = fragment_texture_snapshot::capture(words.registers, 1).at(0);
+		const auto plan = plan_guest_texture(regs);
+		std::vector<std::byte> bytes(plan.storage_bytes);
+		for (const auto& level : plan.subresources)
+			for (unsigned z = 0; z < level.depth; ++z)
+				for (unsigned y = 0; y < level.rows; ++y)
+					for (unsigned x = 0; x < level.columns; ++x)
+					{
+						const auto offset = guest_texture_block_offset(plan, level, x, y, z);
+						if (vtc)
+						{
+							const unsigned color_offset = block.bytes == 8 ? 0 : 8;
+							if (codec.format == 0x87) std::fill_n(bytes.begin() + offset, 8, std::byte{255});
+							if (codec.format == 0x88) bytes[offset] = std::byte{255};
+							bytes[offset + color_offset + 1] = std::byte{0xf8};
+						}
+						else
+						{
+							const unsigned raw = codec.format == 0x90 ? 0x8000002au : codec.format == 0x91 ? 0x7e00002au :
+								codec.format == 0x92 ? 0x8000u : 0x6000u;
+							for (unsigned c = 0; c < block.bytes; ++c)
+								bytes[offset + c] = std::byte(raw >> ((block.bytes - 1 - c) * 8));
+						}
+					}
+		ram->write({0x1000, bytes.size()}, bytes);
+	}
+	if (has_assembly)
+	{
+		constexpr unsigned base = 0x1a00 / 4;
+		words.registers[base + 1] = depth_assembly ? (2u << 16) | (0xb1u << 8) | (3u << 4) | 8u | 2u :
+			(words.registers[base + 1] & 0xffffu) | (2u << 16) | (cube ? 4u : 0u);
+		if (depth_assembly) words.registers[0x1840 / 4] = (2u << 20) | 16u;
+		const auto plan = plan_guest_texture(fragment_texture_snapshot::capture(words.registers, 1).at(0));
+		std::vector<std::byte> bytes(plan.storage_bytes);
+		const auto value = depth_assembly ? std::array{0x7du,0u,0u,42u} : std::array{255u,90u,100u,110u};
+		for (const auto& level : plan.subresources)
+			for (unsigned z = 0; z < level.depth; ++z)
+				for (unsigned y = 0; y < level.rows; ++y)
+					for (unsigned x = 0; x < level.columns; ++x)
+					{
+						const auto offset = guest_texture_block_offset(plan, level, x, y, z);
+						for (unsigned c = 0; c < 4; ++c) bytes[offset + c] = std::byte(value[c]);
+					}
+		ram->write({texture_address, bytes.size()}, bytes);
+		const surface_format format = depth_assembly ? surface_format{surface_depth::z24s8_float} : surface_format{surface_color::argb8};
+		cached_surface_description source{texture_address, {partial ? 2u : 4u,4,1,format,false}, morton ? 0u : banked ? 256u : 16u, {}};
+		if (morton) source.morton = swizzle_region{{4,4,1}, {}, {2,4,1}};
+		if (banked) source.tile = banked_tile_layout{texture_address, 0x10000, 256, 0, 0};
+		const auto native = surfaces.acquire(source);
+		surfaces.clear(native, depth_assembly ? 3u : 0xf0u, 0xff14283c, 0xffffff35, 255, {0,0,partial ? 2u : 4u,4});
+	}
+	cached_surface_ref split_target;
+	if (has_cast || redirected_depth)
+	{
+		constexpr unsigned base = 0x1a00 / 4;
+		words.registers[base + 1] = (words.registers[base + 1] & ~(0xffu << 8)) |
+			((redirected_depth ? 0xa5u : cast.d16 ? 0xb2u : 0xa1u) << 8);
+		words.registers[base + 6] = ((cast.d16 ? 8u : 16u) << 16) | 4u;
+		const surface_format format = cast_depth_source ? surface_format{surface_depth::z24s8_float} : surface_format{surface_color::argb8};
+		const auto width = cast.samples > 1 ? 2u : 4u;
+		const auto height = cast.samples == 4 ? 2u : 4u;
+		if (cast.samples > 1)
+			words.registers[base + 5] = (1u << 24) | (1u << 16);
+		const auto native = surfaces.acquire({0x1000, {width,height,cast.samples,format,false}, 16, {}});
+		if (cast.plane_copies)
+		{
+			const auto depth_donor = surfaces.acquire({0x4000, {width,height,cast.samples,format,false}, 16, {}});
+			const auto stencil_donor = surfaces.acquire({0x5000, {width,height,cast.samples,format,false}, 16, {}});
+			surfaces.clear(depth_donor, 3, 0, 0xffffff07, 255, {0,0,width,height});
+			surfaces.clear(stencil_donor, 3, 0, 0x0000002a, 255, {0,0,width,height});
+			surfaces.defer_copy(depth_donor, {0,0,width,height}, native, 0, 0, texture_plane::depth);
+			surfaces.defer_copy(stencil_donor, {0,0,width,height}, native, 0, 0, texture_plane::stencil);
+			split_target = native;
+		}
+		else surfaces.clear(native, cast_depth_source ? 3u : 0xf0u, 0xff112233, 0xffffff2a, 255, {0,0,width,height});
+		if (cast.spilled) surfaces.spill(native);
+	}
+	if (custom_border)
+	{
+		words.registers[0x1a00 / 4 + 2] = (7u << 28) | 0x040404u;
+		words.registers[0x1a00 / 4 + 7] = 0xff506070u;
+	}
+	const auto vertex_words = vertex_texture_snapshot::capture(words.registers,1);
 	const auto fragment_words = fragment_texture_snapshot::capture(words.registers,1);
+	test::framebuffer_layout framebuffer_words;
+	framebuffer_words.color_addresses[0] = outcome == upload_outcome::texture_writer ? 0x1000 : 0xa000;
+	framebuffer_words.actual_color_pitch[0] = 16;
+	framebuffer_words.zeta_address = 0;
+	const auto framebuffer = framebuffer_snapshot::capture(framebuffer_words, true);
+	const auto targets = acquire_framebuffer(framebuffer, surfaces);
+	if (!cold_framebuffer && !deferred_framebuffer && !reload_resident)
+		surfaces.clear(targets.colors[0], 0xf0,
+			outcome == upload_outcome::texture_writer ? 0xff14283c : 0xff112233, 0, 255, {0, 0, 4, 4});
+	if (spilled_framebuffer) surfaces.spill(targets.colors[0]);
+	if (reload_resident)
+	{
+		surfaces.prepare(targets.colors[0]);
+		ram->write({framebuffer_words.color_addresses[0], pixels.size()}, pixels);
+	}
+	if (deferred_framebuffer)
+	{
+		const auto donor = surfaces.acquire({0x9000, {4,4,1,surface_color::argb8,false}, 16, {}});
+		surfaces.clear(donor, 0xf0, 0xff112233, 0, 255, {0,0,4,4});
+		surfaces.defer_copy(donor, {0,0,2,4}, targets.colors[0], 0, 0);
+	}
+	cached_surface_ref reader;
+	if (hold_reader)
+	{
+		reader = surfaces.acquire({0xc000, {4,4,1,surface_color::argb8,false}, 16, {}});
+		surfaces.defer_copy(targets.colors[0], {0,0,4,4}, reader, 0, 0);
+	}
+	const auto original = surfaces.status(targets.colors[0]);
+	cached_surface_ref deferred_source;
+	if (native_source)
+	{
+		const surface_allocation_description color{4, 4, 1, surface_color::argb8, false};
+		deferred_source = surfaces.acquire({0x1000, color, 16, {}});
+		const auto donor = surfaces.acquire({0x3000, color, 16, {}});
+		surfaces.clear(donor, 0xf0, 0xff14283c, 0, 255, {0, 0, 4, 4});
+		surfaces.defer_copy(donor, {0, 0, 4, 4}, deferred_source, 0, 0);
+	}
 	const auto gate = [ctx.device() newSharedEvent];
-	struct gate_scope { id<MTLSharedEvent> event; ~gate_scope() { event.signaledValue = 1; } } gate_guard{gate};
-	const std::array waits{guest_texture_upload_dependency{gate,1}};
+	struct gate_scope { id<MTLSharedEvent> event; unsigned release_value = 1; ~gate_scope() { event.signaledValue = release_value; } } gate_guard{gate, completed_waits || opaque_wait || dependency == inline_dependency_case::first_completed ? 2u : 1u};
+	const auto second_gate = upload_wait ? [ctx.device() newSharedEvent] : nil;
+	gate_scope second_guard{second_gate};
+	const unsigned upload_value = dependency == inline_dependency_case::completed_zero ? 0u : 1u;
+	std::vector waits{guest_texture_upload_dependency{gate,upload_value}};
+	if (second_gate) waits.push_back({second_gate, upload_value});
+	if (dependency == inline_dependency_case::completed_before || opaque_wait) { [gate setSignaledValue:1]; [second_gate setSignaledValue:1]; }
+	if (dependency == inline_dependency_case::first_completed) [gate setSignaledValue:1];
+    if (opaque_wait)
+    {
+        const auto event=[ctx.device() newEvent];const auto proof=[ctx.device() newSharedEvent];const auto producer=[ctx.device() newMTL4CommandQueue];
+        require(event&&proof&&producer&&![event conformsToProtocol:@protocol(MTLSharedEvent)],"Opaque wait fixture received an observable event");
+        [producer signalEvent:event value:1];[producer signalEvent:proof value:1];
+        require([proof waitUntilSignaledValue:1 timeoutMS:1000],"Opaque event was not actually signaled by its native Metal4 producer");
+        waits.push_back({event,1});
+    }
+	cached_surface_ref unrelated;
+	if (inline_upload)
+	{
+		unrelated = surfaces.acquire({0xb000, {4,4,1,surface_color::argb8,false}, 16, {}});
+		surfaces.clear(unrelated, 0xf0, 0xff112233, 0, 255, {0,0,4,4});
+	}
+	auto batch = surfaces.batch_draws();
+	std::optional<submission> prefix;
+	if (inline_upload && dependency != inline_dependency_case::no_prefix)
+	{
+		surfaces.clear(unrelated, 0xf0, 0xff405060, 0, 255, {0,0,4,4});
+		prefix = ctx.recording_submission();
+	}
+	const auto transactions = surfaces.transaction_statistics();
 	const auto before = ctx.encoding_statistics();
-	auto job = executor.enqueue_versioned_textures(vertex_words,fragment_words,waits);
-	require(!job.ready() && textures.statistics().entries == 0 && textures.statistics().uploads == 0 && textures.statistics().upload_batches == 1 &&
-		ctx.encoding_statistics().compute_encoders == before.compute_encoders + 1, "Draw enqueue waited/published before the unsignalled native gate");
-	bool timed_out = false;
-	try { (void)job.finish(1ms); } catch (const std::runtime_error& error) { timed_out = std::string(error.what()).find("Timed out waiting") != std::string::npos; }
-	require(timed_out && !job.ready() && ledger->statistics().reserved_bytes > 0, "Pending draw timeout lost its completion owners");
+	auto job = executor.enqueue_versioned_textures(vertex_words, fragment_words,
+		!inline_upload || upload_wait ? std::span<const guest_texture_upload_dependency>{waits} : std::span<const guest_texture_upload_dependency>{},
+		nullptr, inline_upload ? texture_upload_path::draw_batch : texture_upload_path::separate);
+	waits.clear();
+	require(!job.ready() && textures.statistics().entries == 0 && textures.statistics().uploads == 0,
+		"Unfinished draw texture epoch published images");
+	if (inline_upload)
+	{
+		require(!job.has_completion() && !job.cancel_pending() && textures.statistics().upload_batches == 0 &&
+			ctx.encoding_statistics().compute_encoders == before.compute_encoders &&
+			(!prefix || prefix->same_batch(ctx.recording_submission())) &&
+			surfaces.transaction_statistics().submitted == transactions.submitted,
+			"Inline texture admission split the prefix or encoded GPU work before the draw");
+		bool unrecorded = false;
+		try { (void)job.finish(1ms); } catch (const std::logic_error&) { unrecorded = true; }
+		require(unrecorded && !job.ready(), "Unrecorded draw texture job escaped as a ready image");
+	}
+	else
+	{
+		require(textures.statistics().upload_batches == 1 && ctx.encoding_statistics().compute_encoders == before.compute_encoders + 1,
+			"Draw enqueue waited before the unsignalled native gate");
+		bool timed_out = false;
+		try { (void)job.finish(1ms); } catch (const submission_wait_timeout&) { timed_out = true; }
+		require(timed_out && !job.ready() && ledger->statistics().reserved_bytes > 0, "Pending draw timeout lost its completion owners");
+	}
 	std::optional<rsx_draw_packet> packet;
 	test::pass_state source; source.registers = words.registers; source.base_index = 0;
 	source.transform_constants[511][3] = 0x7fc12345;
 	test::pass_processor processor;
 	processor.descriptors[0] = {16u | (3u << 8) | (2u << 24) | (4u << 27),(1u << 31) | (1u << 29)};
-	for (float value : {-1.f,-1.f,.5f,1.f,3.f,-1.f,.5f,1.f,-1.f,3.f,.5f,1.f})
+	for (float value : {.125f, .5f, 0.f, 0.f, .375f, .5f, 0.f, 0.f, .625f, .5f, 0.f, 0.f})
 		for (unsigned shift : {24u,16u,8u,0u}) processor.persistent.push_back(std::byte(std::bit_cast<unsigned>(value) >> shift));
 	processor.index_bytes = {std::byte{0},std::byte{0},std::byte{0},std::byte{0},std::byte{0},std::byte{0},std::byte{0},std::byte{1},std::byte{0},std::byte{0},std::byte{0},std::byte{2}};
 	test::pass_layout layout; test::pass_metadata metadata;
-	auto vertex = vertex_program(); auto fragment_bytes = program(true); test::fragment_program fragment;
+	metadata.referenced_textures_mask = 1;
+	auto vertex = vertex_program(true); auto fragment_bytes = program(true); test::fragment_program fragment;
+	if (custom_border)
+	{
+		std::vector<std::byte> outside;
+		append(outside, std::bit_cast<unsigned>(-.25f));
+		std::copy(outside.begin(), outside.end(), fragment_bytes.begin() + 16);
+	}
+	if (cube)
+	{
+		std::vector<std::byte> direction;
+		for (const float value : {1.f,0.f,0.f,1.f}) append(direction, std::bit_cast<unsigned>(value));
+		std::copy(direction.begin(), direction.end(), fragment_bytes.begin() + 16);
+	}
 	fragment.pointer = fragment_bytes.data(); fragment.ucode_length = fragment_bytes.size(); fragment.ctrl = rsx_fragment_float32;
+	if (redirected_depth)
+	{
+		fragment.texture_state.redirected_textures = 1;
+		fragment.texture_state.texture_dimensions = 1; // Unit zero is a 2D descriptor.
+		fragment.texture_state.multisampled_textures = cast.samples > 1 ? 1 : 0;
+	}
 	checked_cpu_capture(capture,[&]
 	{
 		require(guest_memory_epoch::active() && job.current(vertex_words,fragment_words) && !job.ready(), "Pending draw metadata/receipts require GPU completion or lost the CPU epoch");
 		const auto sampler = program_sampler_plan::capture(fragment_words.at(0),job.metadata(false,0));
-		require(sampler.dimension == 1 && sampler.format_class == 1 && sampler.samples == 1, "Pending draw program metadata differs from its final source");
+		require(sampler.dimension == (codec.volume || depth_assembly ? 3 : cube ? 2 : 1) &&
+			(redirected_depth ? sampler.format_class == 16 : codec.format || has_cast || has_assembly || sampler.format_class == 1) &&
+			sampler.samples == (cast.spilled || cast.plane_copies ? 1 : cast.samples), "Pending draw program metadata differs from its final source");
 		bool wait_refused = false;
 		try { (void)job.finish(); } catch (const std::logic_error&) { wait_refused = true; }
 		require(wait_refused, "Pending draw waited inside real VM exclusion");
@@ -982,6 +1689,9 @@ void verify_pending_draw_capture()
 				require(first == 0 && count == 3, "Pending packet geometry changed its stream extent");
 				return std::pair<std::uint32_t,std::uint32_t>{48,0};
 			}));
+		bool prewarm_refused = false;
+		try { (void)executor.prewarm_stages(*packet, framebuffer, job); } catch (const std::logic_error&) { prewarm_refused = true; }
+		require(prewarm_refused && executor.compilation_statistics().admitted == 0, "Shader prewarm crossed VM exclusion");
 	});
 	require(packet && processor.write_calls == 1 && !guest_memory_epoch::active() && !job.ready() && textures.statistics().entries == 0,
 		"Owned program/geometry/stream/constants capture did not complete while the real GPU upload remained pending");
@@ -995,17 +1705,620 @@ void verify_pending_draw_capture()
 	auto moved = std::move(job); bool moved_refused = false;
 	try { (void)job.ready(); } catch (const std::logic_error&) { moved_refused = true; }
 	require(moved_refused && !moved.ready(), "Moved pending draw job retained access or lost its work");
-	gate.signaledValue = 1;
+	const auto before_prewarm = ctx.encoding_statistics();
+	const auto allocations = ledger->statistics().created;
+	auto early_pipeline = executor.prewarm_stages(*packet, framebuffer, moved);
+	require(!moved.ready() && executor.compilation_statistics().admitted == 2 + unsigned(early_pipeline.has_value()) &&
+		executor.vertex_statistics().prewarmed == 1 && executor.fragment_statistics().prewarmed == 1 &&
+		ctx.encoding_statistics().compute_encoders == before_prewarm.compute_encoders &&
+		ctx.encoding_statistics().render_encoders == before_prewarm.render_encoders &&
+		ledger->statistics().created == allocations && textures.statistics().entries == 0,
+		"Early stage prewarm must admit both libraries while textures are pending without encoding or allocating GPU resources");
+	if (outcome == upload_outcome::success && !early_pipeline)
+	{
+		const auto deadline = std::chrono::steady_clock::now() + 3s;
+		while (executor.compilation_statistics().completed < 2 && !executor.compilation_statistics().failed &&
+			std::chrono::steady_clock::now() < deadline)
+			std::this_thread::sleep_for(1ms);
+		early_pipeline = executor.prewarm_stages(*packet, framebuffer, moved);
+	}
+	if (outcome == upload_outcome::success)
+		require(early_pipeline && !moved.ready() && executor.pipeline_statistics().prewarmed == 1 &&
+			executor.compilation_statistics().admitted == 3,
+			"Ready stages did not start the pipeline while the texture upload remained gated");
+	draw_execution_state execution;
+	if (completed_waits || opaque_wait || dependency == inline_dependency_case::first_completed) execution.waits.push_back({gate, 2});
+	else if (inline_upload && !upload_wait) execution.waits.push_back({gate, 1});
+	if (dependency == inline_dependency_case::completed_after) { [gate setSignaledValue:1]; [second_gate setSignaledValue:1]; }
+	if (split_prefix)
+		surfaces.clear(unrelated, 0xf0, 0xff405060, 0, 255, {0,0,4,4});
+	executor.execute(*packet, framebuffer, moved, execution);
+	if (outcome == upload_outcome::success)
+		require(executor.pipeline_statistics().pending_reused == 1 && executor.compilation_statistics().admitted == 3,
+			"Draw did not reuse the pipeline started before texture completion");
+	const auto draw = ctx.recording_submission();
+	if (reader)
+		require(surfaces.status(reader).deferred_copies == 1 && !surfaces.status(reader).initialized,
+			"Versioned draw materialized a disjoint reader while recording");
+	if (cold_framebuffer)
+		require(!surfaces.status(targets.colors[0]).initialized,
+			"Cold framebuffer published before the translated draw completed");
+	if (spilled_framebuffer)
+		require(surfaces.status(targets.colors[0]).spilled,
+			"Spilled framebuffer published before the translated draw completed");
+	if (deferred_framebuffer)
+		require(surfaces.status(targets.colors[0]).deferred_copies == 1,
+			"Deferred framebuffer published before the translated draw completed");
+	if (inline_upload)
+	{
+		require(moved.has_completion() && (!prefix || (split_prefix ? prefix->ready() && !prefix->same_batch(draw) : prefix->same_batch(draw))) &&
+			surfaces.transaction_statistics().submitted == transactions.submitted + unsigned(split_prefix) && textures.statistics().upload_batches == 1,
+			completed_waits ? "Completed upload dependency unnecessarily submitted the independent prefix" : "Cold upload and draw did not respect the preceding batch or encoded an extra upload submission");
+		const auto conversions = ctx.encoding_statistics().checked_dispatches;
+		executor.execute(*packet, framebuffer, moved);
+		require(draw.same_batch(ctx.recording_submission()) && ctx.encoding_statistics().checked_dispatches == conversions &&
+			textures.statistics().upload_batches == 1,
+			"Second draw repeated an upload already encoded in the recording");
+	}
+	require(!moved.ready() && !draw.ready() && textures.statistics().entries == 0 &&
+		(inline_upload ? ctx.encoding_statistics().render_encoders > before_prewarm.render_encoders :
+			ctx.encoding_statistics().render_encoders == before_prewarm.render_encoders + 1),
+		"Owned draw did not record while the texture upload remained gated");
+	if (outcome == upload_outcome::texture_writer)
+	{
+		gate.signaledValue = completed_waits || opaque_wait || dependency == inline_dependency_case::first_completed ? 2 : 1;
+		bool stale = false;
+		try { executor.execute(*packet, framebuffer, moved); }
+		catch (const texture_revision_conflict&) { stale = true; }
+		require(stale && draw.ready() &&
+			surfaces.status(targets.colors[0]).content_generation == original.content_generation + 1,
+			"Texture reuse did not finish the recorded writer before rejecting its old input");
+		auto fresh = executor.enqueue_versioned_textures(vertex_words, fragment_words);
+		executor.execute(*packet, framebuffer, fresh);
+		batch.finish();
+		require(surfaces.status(targets.colors[0]).content_generation == original.content_generation + 2,
+			"Fresh capture did not draw after the texture writer boundary");
+		verify(ctx, surfaces, targets.colors[0], {20,40,60,255});
+		std::cout << "Pending texture draw: recorded source writer closed the batch before reuse and fresh capture sampled 16 exact pixels\n";
+		return;
+	}
+	if (outcome == upload_outcome::border_helper)
+	{
+		const auto initialized = ctx.encoding_statistics().checked_dispatches;
+		require(initialized == before_prewarm.checked_dispatches + 2,
+			"Cold border coverage and color conversion were not encoded in the dependent draw");
+		executor.execute(*packet, framebuffer, moved);
+		require(draw.same_batch(ctx.recording_submission()) && !moved.ready() &&
+			ctx.encoding_statistics().checked_dispatches == initialized,
+			"Same recording rebuilt its cold border helpers or waited for the upload");
+	}
+	if (outcome == upload_outcome::success)
+	{
+		executor.execute(*packet, framebuffer, moved);
+		require(draw.same_batch(ctx.recording_submission()) && !moved.ready() && textures.statistics().upload_batches == 1,
+			"Consecutive draws did not reuse the same pending upload in one recording");
+	}
+	if (defer_batch_completion)
+	{
+		require(surfaces.poll_submitted() && draw.same_batch(ctx.recording_submission()),
+			"Completion poll flushed the active recording");
+		batch.submit();
+		require(!surfaces.poll_submitted() && surfaces.status(targets.colors[0]).pending,
+			"Deferred draw scope waited or published work behind the closed event");
+		auto reader_words = words;
+		texture_registers(reader_words, framebuffer_words.color_addresses[0] / 16);
+		const auto reader = fragment_texture_snapshot::capture(reader_words.registers, 1);
+		surfaces.set_wait_timeout(1ms);
+		bool consumer_waited = false;
+		try { (void)executor.enqueue_versioned_textures(vertex_words, reader); }
+		catch (const submission_wait_timeout&) { consumer_waited = true; }
+		surfaces.set_wait_timeout(5s);
+		require(consumer_waited && !surfaces.poll_submitted(),
+			"Texture reader crossed a pending draw or retired its work on timeout");
+	}
+	else surfaces.submit_draw_batch();
+	bool draw_timed_out = false;
+	try { draw.wait(1ms); } catch (const submission_wait_timeout&) { draw_timed_out = true; }
+	require(draw_timed_out && !moved.ready() && surfaces.status(targets.colors[0]).content_generation == original.content_generation,
+		"Queued draw executed or published before the texture upload succeeded");
+
+	if (outcome == upload_outcome::inline_cancel)
+	{
+		require(!moved.cancel_pending() && draw.cancel_pending(), "Texture job could cancel another owner's draw, or draw cancellation failed");
+		bool failed = false;
+		if (defer_batch_completion)
+		{
+			try { draw.wait(5s); } catch (const submission_wait_timeout&) { throw; } catch (const std::runtime_error&) {}
+			try { (void)surfaces.poll_submitted(); } catch (const std::runtime_error&) { failed = true; }
+		}
+		else
+			try { batch.finish(); } catch (const std::runtime_error&) { failed = true; }
+		bool unpublished = false;
+		try { (void)moved.finish(); } catch (const std::runtime_error&) { unpublished = true; }
+		require(failed && unpublished && textures.statistics().entries == 0 && textures.statistics().cast_entries == 0 &&
+			surfaces.snapshot_statistics().created == 0 &&
+			surfaces.status(targets.colors[0]).content_generation == original.content_generation,
+			"Cancelled recording exposed inline uploads or target pixels");
+		ctx.recover_completed_errors();
+		verify(ctx, surfaces, targets.colors[0], {17,34,51,255});
+		verify(ctx, surfaces, unrelated, split_prefix ? std::array{64u,80u,96u,255u} : std::array{17u,34u,51u,255u});
+		if (reader)
+		{
+			require(surfaces.status(reader).deferred_copies == 1 && !surfaces.status(reader).dirty,
+				"Cancelled draw published or lost its disjoint reader");
+			verify(ctx, surfaces, reader, {17,34,51,255});
+			std::cout << "Draw deferred readers: cancelled batch kept the pending reader and its exact old pixels\n";
+		}
+		if (upload_wait)
+			std::cout << (completed_waits ? "Completed upload waits: cancelled unified batch rolled back independent prefix and published no images\n" : "Draw-owned upload waits: cancelled dependent draw preserved completed prefix and published no images\n");
+		if (defer_batch_completion)
+			std::cout << "Deferred draw retirement: cancellation rolled back both surfaces and kept textures unpublished\n";
+		std::cout << (has_assembly ? "Inline assembly draw: " : has_cast ? "Inline cast draw: " : "Inline texture draw: ")
+			<< "cancellation retained both target and prefix pixels and published no images\n";
+		return;
+	}
+	if (outcome == upload_outcome::cancellation)
+	{
+		require(moved.cancel_pending(), "Could not cancel the still-gated texture producer");
+		bool failed = false;
+		try { batch.finish(); } catch (const std::runtime_error&) { failed = true; }
+		require(failed && draw.cancelled() && textures.statistics().entries == 0 &&
+			surfaces.status(targets.colors[0]).content_generation == original.content_generation &&
+			surfaces.status(targets.colors[0]).native_write_epoch == original.native_write_epoch,
+			"Failed texture producer allowed the draw to commit or changed prior target authority");
+		ctx.recover_completed_errors();
+		verify(ctx, surfaces, targets.colors[0], {17,34,51,255});
+		std::cout << "Pending texture draw: cancelled producer blocked native commit and preserved 16 prior pixels and target authority\n";
+		return;
+	}
+	if (superseded)
+	{
+		pixels.fill(std::byte{99});
+		ram->write({0x1000,64}, pixels);
+	}
+	gate.signaledValue = completed_waits || opaque_wait || dependency == inline_dependency_case::first_completed ? 2 : 1;
+	if (second_gate && !completed_waits && !opaque_wait)
+	{
+		bool waits_for_second = false;
+		try { draw.wait(1ms); } catch (const submission_wait_timeout&) { waits_for_second = true; }
+		require(waits_for_second && !moved.ready(), "Draw committed before the second upload dependency");
+		second_gate.signaledValue = 1;
+	}
+	if (defer_batch_completion)
+	{
+		draw.wait(5s);
+		require(surfaces.status(targets.colors[0]).content_generation == original.content_generation &&
+			textures.statistics().entries == 0 && surfaces.poll_submitted() &&
+			surfaces.status(targets.colors[0]).content_generation == original.content_generation + 2,
+			"Submitted draw changed authority before its owner retired the completion");
+		auto next = surfaces.batch_draws();
+		next.submit();
+	}
+	else batch.finish();
+	if (superseded)
+	{
+		bool stale = false;
+		try { (void)moved.finish(); } catch (const texture_revision_conflict&) { stale = true; }
+		require(stale && textures.statistics().entries == 0 && textures.statistics().uploads == 0,
+			"Superseded texture was published to the live cache after the draw");
+		verify(ctx, surfaces, targets.colors[0], {20,40,60,255});
+		if (defer_batch_completion)
+			std::cout << "Deferred draw retirement: VM revision suppressed texture publication and frozen draw pixels survived\n";
+		std::cout << (inline_upload ? "Inline texture draw: " : "Pending texture draw: ")
+			<< "later VM write kept the live cache clean and the recorded draw sampled 16 frozen pixels\n";
+		return;
+	}
 	const auto epoch = moved.finish();
 	checked_cpu_capture(capture,[&] { require(epoch.current(packet->state().vertex_textures(),packet->state().textures()), "Completed draw epoch differs from the independently owned packet"); });
 	const auto repeated = moved.finish();
-	require(textures.statistics().uploads == 1 && textures.statistics().entries == 1 && repeated.textures.fragment(0).texture == epoch.textures.fragment(0).texture,
+	if (inline_upload)
+	{
+		const unsigned vm_images = native_source || has_cast || has_assembly || redirected_depth ? 1u : 2u;
+		require(surfaces.transaction_statistics().submitted == transactions.submitted + 1 + unsigned(split_prefix) &&
+			textures.statistics().uploads == vm_images && textures.statistics().entries == vm_images + unsigned(has_assembly) &&
+			textures.statistics().casts_created == unsigned(has_cast) &&
+			repeated.textures.fragment(0).texture == epoch.textures.fragment(0).texture &&
+			(!native_source || surfaces.status(deferred_source).deferred_copies == 1),
+			"Inline recording duplicated GPU work, published a wrong epoch or materialized its deferred source");
+		const unsigned cast_sample = cast_depth_source ? 0u : 34u;
+		const auto expected = redirected_depth ? std::array{0u,0u,42u,127u} :
+			has_cast ? std::array{cast_sample,cast_sample,cast_sample,cast.d16 ? cast_sample : 255u} :
+			depth_assembly ? std::array{255u,255u,255u,255u} : depth_codec ? std::array{128u,128u,128u,128u} : vtc ? std::array{255u,0u,0u,255u} :
+			custom_border ? std::array{80u,96u,112u,255u} : std::array{20u,40u,60u,255u};
+		verify(ctx, surfaces, targets.colors[0], expected);
+		verify(ctx, surfaces, unrelated, prefix ? std::array{64u,80u,96u,255u} : std::array{17u,34u,51u,255u});
+		if (redirected_depth)
+		{
+			const auto& image = epoch.textures.fragment(0);
+			auto warm = executor.enqueue_versioned_textures(vertex_words, fragment_words, {}, nullptr, texture_upload_path::draw_batch);
+			require(image.texture.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 && image.metadata.depth &&
+				image.texture.sampleCount == (cast.spilled || cast.plane_copies ? 1 : cast.samples) &&
+				bool(image.metadata.coordinates.flags & texture_coordinate_sample_raster) == (cast.spilled || cast.plane_copies) &&
+				warm.ready() && warm.finish().textures.fragment(0).texture == image.texture,
+				"Draw executor did not reuse the original native depth/stencil snapshot");
+			if (split_target)
+				require(!surfaces.status(split_target).initialized && surfaces.status(split_target).deferred_copies == 2,
+					"Draw executor materialized the independent depth/stencil copy target");
+			std::cout << (cast.plane_copies ? "Inline independent D24S8 planes: " :
+				cast.spilled ? "Inline redirected D24S8 sample raster: " : "Inline redirected D24S8 draw: ")
+				<< "one submission, 16 exact pixels, original depth/stencil snapshot from "
+				<< cast.samples << " sample(s), no cast\n";
+			return;
+		}
+		if (reader)
+		{
+			require(surfaces.status(reader).deferred_copies == 1 && !surfaces.status(reader).dirty,
+				"Successful draw published its disjoint reader");
+			verify(ctx, surfaces, reader, {17,34,51,255});
+			std::cout << "Draw deferred readers: one submission for prefix, upload and two draws; reader stayed deferred with exact old pixels\n";
+		}
+		if (upload_wait)
+		{
+			const std::array warm_waits{guest_texture_upload_dependency{second_gate, 2}};
+			const auto warm = executor.enqueue_versioned_textures(vertex_words, fragment_words, warm_waits, nullptr, texture_upload_path::draw_batch);
+			require(warm.ready() && textures.statistics().upload_batches == 1,
+				"An upload dependency gated an already resident texture");
+			std::cout << (completed_waits ? "Completed upload waits: independent prefix retained in upload/draw batch; " : "Draw-owned upload waits: ") << (split_prefix ? "independent prefix completed; " : "")
+				<< "separate draw gate, exact pixels and warm lookup passed\n";
+		}
+		if (defer_batch_completion)
+			std::cout << "Deferred draw retirement: unsignalled submit and poll returned, texture reader waited, two draws and prefix published exact pixels\n";
+		if (cold_framebuffer)
+		{
+			require(surfaces.status(targets.colors[0]).content_generation == 3,
+				"Cold framebuffer and both translated draws did not publish in order");
+			std::cout << "Cold framebuffer: target and sampled textures uploaded in one batch with two translated draws and exact pixels\n";
+		}
+		if (spilled_framebuffer)
+		{
+			const auto completed = surfaces.status(targets.colors[0]);
+			require(!completed.spilled && completed.content_generation == original.content_generation + 2,
+				"Spilled framebuffer was not retired together with both translated draws");
+			std::cout << "Spilled framebuffer: target restored and sampled textures uploaded in one batch with two translated draws and exact pixels\n";
+		}
+		if (deferred_framebuffer)
+		{
+			const auto completed = surfaces.status(targets.colors[0]);
+			require(completed.initialized && completed.deferred_copies == 0 && completed.content_generation == 4,
+				"Deferred framebuffer was not retired together with both translated draws");
+			std::cout << "Deferred framebuffer: target copies, cold texture uploads and two translated draws shared one submission with exact pixels\n";
+		}
+		if (reload_resident)
+		{
+			require(surfaces.status(targets.colors[0]).content_generation == original.content_generation + 3,
+				"Resident framebuffer reload or translated draws published the wrong generation count");
+			std::cout << "Resident framebuffer: new guest revision and cold sampled textures shared one submission with two translated draws\n";
+		}
+		if (has_assembly)
+		{
+			const auto image = epoch.textures.fragment(0).texture;
+			const auto warm = executor.enqueue_versioned_textures(vertex_words, fragment_words, {}, nullptr, texture_upload_path::draw_batch);
+			require(warm.ready() && warm.metadata(false, 0).actual_mips == 2 &&
+				textures.statistics().assemblies_reused == 1u + unsigned(upload_wait),
+				"Unrelated draw epoch prevented publication of the finished assembly");
+			const auto raw = make_buffer(ctx, 512, buffer_storage::shared);
+			texture_region first, second;
+			second.slice = cube ? 1 : 0;
+			second.origin.z = depth_assembly && !partial ? 1 : 0;
+			second.origin.x = partial ? 3 : 0;
+			second.origin.y = morton ? 1 : 0;
+			const auto stride = depth_assembly ? 8u : 4u;
+			ctx.begin();
+			texture_to_buffer(ctx, image, first, raw, 0, stride);
+			texture_to_buffer(ctx, image, second, raw, 256, stride);
+			ctx.submit().wait();
+			if (depth_assembly)
+			{
+				const std::array<float,2> native{1.f,53.f}, vm{.25f,42.f};
+				require(!std::memcmp(raw.contents, native.data(), sizeof(native)) &&
+					!std::memcmp(static_cast<const std::byte*>(raw.contents) + 256, vm.data(), sizeof(vm)),
+					"Inline assembly lost exact native depth or VM stencil");
+			}
+			else
+			{
+				const std::array<std::uint8_t,4> native{60,40,20,255}, vm{110,100,90,255};
+				require(!std::memcmp(raw.contents, native.data(), sizeof(native)) &&
+					!std::memcmp(static_cast<const std::byte*>(raw.contents) + 256, vm.data(), sizeof(vm)),
+					"Inline assembly did not preserve exact native and VM color bytes");
+			}
+			if (cube)
+			{
+				const auto plan = plan_guest_texture(fragment_words.at(0));
+				const auto& face = *std::ranges::find_if(plan.subresources, [](const auto& level) { return level.face == 1 && level.level == 0; });
+				const auto newer = surfaces.acquire({static_cast<std::uint32_t>(0x1000 + face.offset),
+					{4,4,1,surface_color::argb8,false}, face.row_pitch, {}});
+				surfaces.clear(newer, 0xf0, 0xff778899, 0, 255, {0,0,4,4});
+				const auto refresh = executor.enqueue_versioned_textures(vertex_words, fragment_words, {}, nullptr, texture_upload_path::draw_batch);
+				require(!refresh.ready() && !refresh.has_completion(),
+					"Native writer in a former VM face left the stale assembly reusable");
+			}
+			std::cout << "Inline assembly draw: " << (morton ? "partial Morton" : banked ? "partial banked" :
+				depth_assembly ? "depth volume" : cube ? "cube" : "partial color")
+				<< (partial && depth_assembly ? " depth/stencil" : "")
+				<< "; one submission, exact draw pixels and native/VM bytes, warm reuse\n";
+			return;
+		}
+		if (has_cast)
+		{
+			const auto texture = epoch.textures.fragment(0).texture;
+			const auto output = make_buffer(ctx, 1024, buffer_storage::shared);
+			texture_region region;
+			region.size = MTLSizeMake(texture.width, 4, 1);
+			ctx.begin();
+			texture_to_buffer(ctx, texture, region, output, 0, 256, 0, cast.d16 ? texture_plane::depth : texture_plane::all);
+			ctx.submit().wait();
+			const auto packed = cast_depth_source ? std::array{0x7fu,0u,0u,0x2au} : std::array{0xffu,0x11u,0x22u,0x33u};
+			for (unsigned y = 0; y < 4; ++y)
+				for (unsigned x = 0; x < 16; ++x)
+					require(static_cast<const unsigned char*>(output.contents)[y * 256 + x] == packed[(cast.d16 ? x ^ 1u : x) % 4],
+						"Inline native cast changed guest-order or target-endian bytes");
+			std::cout << "Inline cast draw: source " << (cast_depth_source ? "depth/stencil" : "color") << ", target "
+				<< (cast.d16 ? "D16" : "R8") << "; one submission, exact draw pixels and 64 raw bytes\n";
+			return;
+		}
+		if (codec.format)
+		{
+			const auto texture = epoch.textures.fragment(0).texture;
+			const auto output = make_buffer(ctx, 256, buffer_storage::shared);
+			const bool stencil = codec.format == 0x90 || codec.format == 0x91;
+			const float expected_depth = codec.format == 0x90 ? float(0x800000) / 16777215.f :
+				codec.format == 0x92 ? 32768.f / 65535.f : .5f;
+			for (unsigned mip = 0; mip < 2; ++mip)
+			{
+				texture_region region;
+				region.level = mip;
+				region.origin.z = codec.volume ? (4u >> mip) - 1 : 0;
+				const auto plane = codec.volume ? texture_plane::all : texture_plane::depth;
+				const auto pitch = vtc ? 16u : codec.volume ? 8u : codec.format == 0x92 ? 2u : 4u;
+				ctx.begin();
+				texture_to_buffer(ctx, texture, region, output, 0, pitch, 0, plane);
+				if (!codec.volume && stencil)
+					texture_to_buffer(ctx, texture, region, output, 64, 1, 0, texture_plane::stencil);
+				ctx.submit().wait();
+				if (vtc)
+				{
+					const std::array<float, 4> red{1, 0, 0, 1};
+					require(!std::memcmp(output.contents, red.data(), sizeof(red)), "Inline VTC mip readback differs");
+				}
+				else if (!codec.volume && codec.format == 0x92)
+					require(*static_cast<const std::uint16_t*>(output.contents) == 0x8000u, "Inline D16 mip bits differ");
+				else
+				{
+					const auto* texels = static_cast<const float*>(output.contents);
+					require(texels[0] == expected_depth, "Inline depth mip bits differ");
+					if (codec.volume)
+						require(texels[1] == (stencil ? 42.f : 0.f), "Inline volume stencil differs");
+					else if (stencil)
+						require(static_cast<const std::byte*>(output.contents)[64] == std::byte{42}, "Inline stencil plane differs");
+				}
+			}
+			std::cout << "Inline depth/VTC draw: format " << codec.format << ", volume " << codec.volume <<
+				", linear " << codec.linear << "; one submission, exact draw pixels and two raw mip checks\n";
+			return;
+		}
+		if (!upload_wait)
+			std::cout << (native_source ? "Inline mixed texture draw: " : custom_border ? "Inline border texture draw: " : "Inline VM texture draw: ")
+				<< "one submission for uploads, unrelated prefix and two draws; 32 exact pixels\n";
+		return;
+	}
+	if (outcome == upload_outcome::border_helper)
+	{
+		verify(ctx, surfaces, targets.colors[0], {80,96,112,255});
+		std::cout << "Cold border draw: two helpers and two translated draws shared one recording behind a gated texture upload, 16 exact custom-border pixels\n";
+		return;
+	}
+	if (outcome == upload_outcome::deferred_source)
+	{
+		require(surfaces.status(deferred_source).deferred_copies == 1 &&
+			textures.statistics().entries == 1 && repeated.textures.fragment(0).texture == epoch.textures.fragment(0).texture,
+			"Draw materialized the deferred target or lost its published native snapshot");
+		verify(ctx, surfaces, targets.colors[0], {20,40,60,255});
+		std::cout << "Pending texture draw: gated native snapshot sampled 16 exact pixels and left its source deferred\n";
+		return;
+	}
+	require(textures.statistics().uploads == 2 && textures.statistics().entries == 2 && repeated.textures.fragment(0).texture == epoch.textures.fragment(0).texture &&
+		repeated.textures.vertex(0).texture == epoch.textures.vertex(0).texture,
 		"Repeated completion published the same pending draw twice");
-	draw_targets targets; targets.colors[0] = surfaces.acquire({0xa000,{4,4,1,surface_color::argb8,false},16,{}});
-	executor.execute(*packet,targets,epoch.textures);
 	verify(ctx,surfaces,targets.colors[0],{20,40,60,255});
-	require(textures.statistics().uploads == 1, "Owned pending-capture draw resolved textures again");
-	std::cout << "Native pending draw:unsignalled upload returns before real guarded CPU program/geometry/streams/constants capture;CPU timeout and VM/foreign/move guards;mutable inputs destroyed before completion,one publication and16exact RGBA pixels from the owned packet passed\n";
+	require(textures.statistics().uploads == 2 && executor.compilation_statistics().admitted == 3 &&
+		executor.vertex_statistics().prewarm_reused >= 1 && executor.fragment_statistics().prewarm_reused >= 1,
+		"The draws must reuse both early library jobs and admit only one pipeline job");
+	std::cout << "Pending texture draw: two draws shared one recording before the gated vertex/fragment upload completed, 16 exact pixels, one PSO, and two cached images\n";
+	std::cout << "Early pipeline: ready shader stages started one PSO behind the texture gate; draw reused the preparation and all 16 pixels were exact\n";
+}
+void verify_pending_texture_draws()
+{
+	for (const auto outcome : {upload_outcome::success, upload_outcome::cancellation, upload_outcome::superseded,
+		upload_outcome::deferred_source, upload_outcome::texture_writer, upload_outcome::border_helper})
+		verify_pending_draw_capture(outcome);
+}
+void verify_inline_texture_draws()
+{
+	for (const auto outcome : {upload_outcome::inline_color, upload_outcome::inline_mixed, upload_outcome::inline_cancel,
+		upload_outcome::inline_border, upload_outcome::inline_superseded})
+		verify_pending_draw_capture(outcome);
+}
+void verify_inline_depth_and_vtc()
+{
+	for (const bool linear : {false, true})
+	{
+		for (const auto format : {0x90u, 0x91u, 0x92u, 0x93u})
+			for (const bool volume : {false, true})
+				verify_pending_draw_capture(upload_outcome::inline_codec, {format, volume, linear});
+		for (const auto format : {0x86u, 0x87u, 0x88u})
+			verify_pending_draw_capture(upload_outcome::inline_codec, {format, true, linear});
+	}
+}
+void verify_inline_native_casts()
+{
+	for (const auto source : {inline_cast_source::color, inline_cast_source::depth})
+		for (const bool d16 : {false, true})
+			verify_pending_draw_capture(upload_outcome::inline_color, {}, {source, d16});
+	verify_pending_draw_capture(upload_outcome::inline_cancel, {}, {inline_cast_source::depth, true});
+}
+void verify_inline_assemblies()
+{
+	for (const auto profile : {inline_assembly_case::cube, inline_assembly_case::depth_volume, inline_assembly_case::partial_color,
+		inline_assembly_case::partial_morton, inline_assembly_case::partial_banked,
+		inline_assembly_case::partial_morton_depth, inline_assembly_case::partial_banked_depth})
+		verify_pending_draw_capture(upload_outcome::inline_color, {}, {}, profile);
+	for (const auto profile : {inline_assembly_case::partial_color, inline_assembly_case::partial_morton,
+		inline_assembly_case::partial_banked_depth})
+		verify_pending_draw_capture(upload_outcome::inline_cancel, {}, {}, profile);
+}
+void verify_deferred_draw_retirement()
+{
+	for (const auto outcome : {upload_outcome::inline_color, upload_outcome::inline_superseded, upload_outcome::inline_cancel})
+		verify_pending_draw_capture(outcome, {}, {}, inline_assembly_case::none, true);
+}
+void verify_submitted_texture_independence()
+{
+	using namespace std::chrono_literals;
+	context ctx(2);
+	auto budget = std::make_shared<heap_budget>(ctx, 8 << 20);
+	ctx.set_buffer_budget(budget);
+	auto provider = std::make_shared<test::host_access_fixture>();
+	provider->provide_storage_identity = true;
+	provider->pin_first_alias();
+	auto ram = std::make_shared<guarded_guest_memory>(provider);
+	const cpu_capture_dispatch capture = [provider](const auto& work) { provider->execute([&](auto&) { work(); }); };
+	surface_cache surfaces(ctx, ram, 8 << 20, budget, capture);
+	guest_texture_cache textures(ctx, ram, [](unsigned offset, unsigned, std::size_t) { return offset * 16; },
+		1 << 20, budget, 8, {capture, std::make_shared<io_mapping_epoch>()});
+	draw_executor executor(ctx, surfaces, textures);
+	const auto enqueue = [&](unsigned address, texture_upload_path path = texture_upload_path::draw_batch)
+	{
+		auto words = registers();
+		texture_registers(words, address / 16);
+		return executor.enqueue_versioned_textures(vertex_texture_snapshot::capture(words.registers, 0),
+			fragment_texture_snapshot::capture(words.registers, 1), {}, nullptr, path);
+	};
+	auto words = registers();
+	texture_registers(words, 0x11000 / 16);
+	const auto warm = executor.prepare_versioned_textures(vertex_texture_snapshot::capture(words.registers, 0),
+		fragment_texture_snapshot::capture(words.registers, 1));
+	std::array<std::byte, 64> vm_pixels;
+	const std::array vm_pixel{std::byte{0xff}, std::byte{0x44}, std::byte{0x55}, std::byte{0x66}};
+	for (std::size_t i = 0; i < vm_pixels.size(); ++i) vm_pixels[i] = vm_pixel[i % vm_pixel.size()];
+	for (const auto address : {0x13000u, 0x14000u})
+	{
+		ram->write({address, vm_pixels.size()}, vm_pixels);
+		const auto native = surfaces.acquire({address, {2,4,1,surface_color::argb8,false}, 16, {}});
+		surfaces.clear(native, 0xf0, 0xff112233, 0, 255, {0,0,2,4});
+	}
+	auto first_assembly = enqueue(0x13000, texture_upload_path::separate);
+	const auto warm_assembly = first_assembly.finish().textures.fragment(0).texture;
+	const auto warm_stats = textures.statistics();
+	require(warm_stats.assemblies_created == 1, "Partial native texture did not create a mixed assembly");
+	const auto target = surfaces.acquire({0x3000, {4,4,1,surface_color::argb8,false}, 16, {}});
+	const auto wide_alias = surfaces.acquire({0x3000, {4,8,1,surface_color::argb8,false}, 16, {}});
+	const auto gate = [ctx.device() newSharedEvent];
+	struct release_gate { id<MTLSharedEvent> gate; ~release_gate() { gate.signaledValue = 1; } } release{gate};
+	auto batch = surfaces.batch_draws();
+	const std::array uses{cached_surface_use{target, true}};
+	surfaces.draw(uses, [&](context& commands, auto) { commands.wait_event(gate, 1); });
+	const auto work = ctx.recording_submission();
+	surfaces.clear(target, 0xf0, 0xff234567, 0, 255, {0,0,4,4});
+	batch.submit();
+	surfaces.set_wait_timeout(1ms);
+	auto independent = enqueue(0x11000);
+	const auto cold = enqueue(0x12000);
+	require(independent.ready() && independent.finish().textures.fragment(0).texture == warm.textures.fragment(0).texture &&
+		!cold.ready() && !surfaces.poll_submitted(),
+		"Independent warm or cold texture preparation waited for the gated clear");
+	auto ready_assembly = enqueue(0x13000);
+	const auto inline_assembly = enqueue(0x14000);
+	require(ready_assembly.ready() && ready_assembly.finish().textures.fragment(0).texture == warm_assembly &&
+		!inline_assembly.ready() && textures.statistics().assemblies_created == warm_stats.assemblies_created + 1 &&
+		!surfaces.poll_submitted(), "Independent warm or cold mixed assembly waited for the gated clear");
+	auto cold_assembly = enqueue(0x14000, texture_upload_path::separate);
+	require(!cold_assembly.ready() && !surfaces.poll_submitted(), "Mixed assembly published while the GPU was gated");
+	const auto waits = [&](unsigned address)
+	{
+		try { (void)enqueue(address); } catch (const submission_wait_timeout&) { return true; }
+		return false;
+	};
+	require(waits(0x3000) && waits(0x3040), "Pending clear exposed a target or its wider alias");
+	provider->execute([&](auto&)
+	{
+		ram->begin_mapping_change({0, 65536});
+		provider->replace_first();
+		ram->end_mapping_change({0, 65536});
+	});
+	require(waits(0x43000) && enqueue(0x11000).ready() && !surfaces.poll_submitted(),
+		"Retained physical alias escaped the wait or forced an independent texture to wait");
+	surfaces.set_wait_timeout(5s);
+	gate.signaledValue = 1;
+	work.wait(5s);
+	require(surfaces.poll_submitted() && surfaces.status(target).dirty && !surfaces.status(wide_alias).initialized,
+		"Clear after independent texture preparation did not publish in order");
+	const auto image = cold_assembly.finish().textures.fragment(0).texture;
+	const auto assembly_bytes = make_buffer(ctx, 4 * 256, buffer_storage::shared);
+	ctx.begin();
+	texture_to_buffer(ctx, image, {0,0,MTLOriginMake(0,0,0),MTLSizeMake(4,4,1)}, assembly_bytes, 0, 256);
+	ctx.submit().wait(5s);
+	const auto* pixels = static_cast<const unsigned char*>(assembly_bytes.contents);
+	for (unsigned y = 0; y < 4; ++y)
+		for (unsigned x = 0; x < 4; ++x)
+		{
+			const auto expected = x < 2 ? std::array{0x33u,0x22u,0x11u,0xffu} : std::array{0x66u,0x55u,0x44u,0xffu};
+			for (unsigned c = 0; c < 4; ++c)
+				require(pixels[y * 256 + x * 4 + c] == expected[c], "Mixed assembly changed native or guest pixels");
+		}
+	std::cout << "Submitted mixed assembly: warm reuse and cold native/VM preparation returned behind the gated clear; all 16 pixels exact\n";
+	surfaces.flush(target);
+	const auto result = ram->read({0x43000, 64}).bytes;
+	const std::array pixel{std::byte{0xff}, std::byte{0x23}, std::byte{0x45}, std::byte{0x67}};
+	for (std::size_t i = 0; i < result.size(); ++i)
+		require(result[i] == pixel[i % pixel.size()], "Retained physical clear returned incorrect bytes");
+	std::cout << "Submitted texture independence: warm and cold disjoint preparation returned; target, wider alias and remapped physical alias waited; exact clear bytes passed\n";
+}
+void verify_inline_upload_dependencies()
+{
+	verify_pending_draw_capture(upload_outcome::inline_color, {}, {}, inline_assembly_case::none, false, inline_dependency_case::no_prefix);
+	verify_pending_draw_capture(upload_outcome::inline_color, {}, {}, inline_assembly_case::partial_morton_depth, false, inline_dependency_case::after_prefix);
+	verify_pending_draw_capture(upload_outcome::inline_cancel, {}, {}, inline_assembly_case::none, false, inline_dependency_case::after_prefix);
+}
+void verify_completed_inline_upload_dependencies()
+{
+    unsigned cases=0;
+    for(const auto dependency:{inline_dependency_case::completed_before,inline_dependency_case::completed_after,inline_dependency_case::completed_zero})
+        for(const auto outcome:{upload_outcome::inline_color,upload_outcome::inline_cancel})
+        {
+            verify_pending_draw_capture(outcome,{}, {},dependency==inline_dependency_case::completed_after?inline_assembly_case::partial_morton_depth:inline_assembly_case::none,false,dependency);
+            ++cases;
+        }
+    verify_pending_draw_capture(upload_outcome::inline_color,{}, {},inline_assembly_case::none,false,inline_dependency_case::first_completed);++cases;
+    for(const auto outcome:{upload_outcome::inline_color,upload_outcome::inline_cancel})
+    {verify_pending_draw_capture(outcome,{}, {},inline_assembly_case::none,false,inline_dependency_case::opaque_completed);++cases;}
+    std::cout<<"Completed inline upload dependencies: "<<cases<<" cold VM/mixed Morton-depth cases; before-enqueue/after-enqueue/zero-value completion preserves one prefix/upload/draw transaction, queued cancellation rolls both surfaces back, mixed ready/pending and GPU-completed opaque events split prefix; original GPU waits and exact pixels preserved\n";
+}
+
+void verify_cold_framebuffer()
+{
+	verify_pending_draw_capture(upload_outcome::inline_color, {}, {}, inline_assembly_case::none,
+		false, inline_dependency_case::none, draw_framebuffer_case::cold);
+}
+void verify_spilled_framebuffer()
+{
+	verify_pending_draw_capture(upload_outcome::inline_color, {}, {}, inline_assembly_case::none,
+		false, inline_dependency_case::none, draw_framebuffer_case::spilled);
+}
+void verify_deferred_framebuffer()
+{
+	verify_pending_draw_capture(upload_outcome::inline_color, {}, {}, inline_assembly_case::none,
+		false, inline_dependency_case::none, draw_framebuffer_case::deferred);
+}
+void verify_draw_deferred_readers()
+{
+	for (const auto outcome : {upload_outcome::inline_color, upload_outcome::inline_cancel})
+		verify_pending_draw_capture(outcome, {}, {}, inline_assembly_case::none,
+			false, inline_dependency_case::none, draw_framebuffer_case::deferred_reader);
+}
+void verify_resident_framebuffer()
+{
+	verify_pending_draw_capture(upload_outcome::inline_color, {}, {}, inline_assembly_case::none,
+		false, inline_dependency_case::none, draw_framebuffer_case::stale_resident);
 }
 void verify_versioned_job_boundaries()
 {
@@ -1144,8 +2457,9 @@ void verify_versioned_job_callback_ownership()
 void verify_versioned_job_orphan()
 {
 	using namespace std::chrono_literals;
-	for (unsigned source_kind = 0; source_kind < 3; ++source_kind)
+	for (unsigned source_kind = 0; source_kind < 4; ++source_kind)
 	{
+		const bool multisampled = source_kind >= 2;
 		std::optional<versioned_draw_texture_job> orphan;
 		std::shared_ptr<heap_budget> ledger;
 		std::weak_ptr<guest_surface_memory> weak_memory;
@@ -1166,8 +2480,9 @@ void verify_versioned_job_orphan()
 				if (!source_kind) ram->write({0x1000,64},pixels);
 				else
 				{
-					const auto surface = surfaces.acquire({0x1000,{source_kind == 2 ? 2u : 4u,4,source_kind == 2 ? 2u : 1u,surface_color::argb8,false},16,{}});
+					const auto surface = surfaces.acquire({0x1000,{multisampled ? 2u : 4u,4,multisampled ? 2u : 1u,surface_color::argb8,false},16,{}});
 					surfaces.clear(surface,0xf0,0xff14283c,0,255,{0,0,4,4});
+					if (source_kind == 3) surfaces.spill(surface);
 				}
 				auto source = registers(); texture_registers(source,0x100);
 				gate = [ctx->device() newSharedEvent]; const std::array waits{guest_texture_upload_dependency{gate,1}};
@@ -1187,7 +2502,21 @@ void verify_versioned_job_orphan()
 				const auto epoch = orphan->finish();
 				context consumer(1);
 				const auto output = make_buffer(consumer,1024,buffer_storage::shared);
-				consumer.begin(); texture_to_buffer(consumer,epoch.textures.fragment(0).texture,{0,0,MTLOriginMake(0,0,0),MTLSizeMake(4,4,1)},output,0,256); consumer.submit().wait();
+				auto image = epoch.textures.fragment(0).texture;
+				require(image.sampleCount == (multisampled ? 2u : 1u), "Orphan job lost its native sample storage");
+				consumer.begin();
+				if (image.sampleCount > 1)
+				{
+					auto td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:image.pixelFormat width:4 height:4 mipmapped:NO];
+					td.storageMode = MTLStorageModePrivate;
+					td.usage = MTLTextureUsageRenderTarget;
+					const auto expanded = make_texture(consumer, td);
+					sample_transfer transfer(consumer);
+					transfer.expand(consumer, image, expanded);
+					image = expanded;
+				}
+				texture_to_buffer(consumer,image,{0,0,MTLOriginMake(0,0,0),MTLSizeMake(4,4,1)},output,0,256);
+				consumer.submit().wait();
 				for (unsigned y = 0; y < 4; ++y) for (unsigned x = 0; x < 16; ++x)
 					require(static_cast<const unsigned char*>(output.contents)[y * 256 + x] == std::array{60u,40u,20u,255u}[x % 4], "Orphan versioned job changed native pixels after context teardown");
 			}
@@ -1195,7 +2524,7 @@ void verify_versioned_job_orphan()
 		orphan.reset();
 		require(weak_memory.expired() && ledger->statistics().reserved_bytes == 0, "Completed orphan job retained receipt services or native heap charges");
 	}
-	std::cout << "Native VM andcold-snapshot orphan draw jobs:single-sample ANDMSAA expansion,shared transfer engine,pending upload outlives executor/cache/surfaces/context/provider caller andautorelease pool;timeout retains backing,another native context reads64exact BGRA bytes,receipt services andall charges retire at final job release passed\n";
+	std::cout << "Native orphan draw jobs: VM, single-sample, resident and spilled MSAA snapshots survive executor/cache/context destruction; timeout retains backing, another context reads 64 exact BGRA bytes per profile, final release retires all charges\n";
 }
 void verify_native_snapshot_batch()
 {
@@ -1629,33 +2958,44 @@ fragment float4 raster_color() { return float4(1); }
 	require(cases == 532, "Owned raster matrix omitted depth formats or raster profiles");
 	std::cout << "Native owned raster:" << cases << " Z16/Z24/integer/float bias and signed slope/fill/clip/clamp/stored-depth-bounds cases match independent direct MSL4 depth bytes;frozen registers,stale override replacement,point/line isolation and near/far visibility passed\n";
 }
-void verify_separated_flat_draws()
+void verify_separated_flat_draws(bool gate_stages = false)
 {
 	for(bool mirror:{false,true})
 	{
 		context ctx(2);auto ram=std::make_shared<memory>();auto ledger=std::make_shared<heap_budget>(ctx,16u<<20);ctx.set_buffer_budget(ledger);
 		surface_cache surfaces(ctx,ram,16u<<20,ledger);guest_texture_cache textures(ctx,ram,[](unsigned offset,unsigned,std::size_t){return offset;},1u<<20,ledger);
-		draw_executor executor(ctx,surfaces,textures);draw_targets targets;targets.colors[0]=surfaces.acquire({0x11000,{4,4,1,surface_color::argb8,false},16,{}});
+		M4GatedCompiler* gate = nil;
+		if (gate_stages)
+		{
+			NSError* error = nil;
+			const auto native = [ctx.device() newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&error];
+			require(native != nil, "Unable to create real gated draw compiler");
+			gate = [[M4GatedCompiler alloc] initWithNative:native];
+		}
+		draw_executor executor(ctx,surfaces,textures,(id<MTL4Compiler>)gate);
+		struct release_gate { M4GatedCompiler* gate; ~release_gate() { [gate releaseCallbacks]; } } release{gate};
+		draw_targets targets;targets.colors[0]=surfaces.acquire({0x11000,{4,4,1,surface_color::argb8,false},16,{}});
 		if(mirror){targets.depth=surfaces.acquire({0x21000,{4,4,1,surface_depth::z24s8_uint,false},16,{}});surfaces.clear(targets.depth,3,0,0x40000000,255,{0,0,4,4});}
-		const auto packet=[&](std::array<unsigned,4> rgba,unsigned x,unsigned width)
+		const auto packet=[&](std::array<unsigned,4> rgba,unsigned x,unsigned width,bool flat = true, unsigned color_mask = 0x01010101)
 		{
 			test::pass_state state;state.registers=registers().registers;state.current_draw_clause.command=1;state.current_draw_clause.primitive=8;state.current_draw_clause.first=0;state.current_draw_clause.count=4;
 			state.bounds=mirror;state.bounds_min=.2f;state.bounds_max=.3f;state.registers[0x8c0/4]=(width<<16)|x;
+			state.registers[0x324 / 4] = color_mask;
 			test::pass_processor processor;test::pass_layout layout;test::pass_metadata metadata;metadata.referenced_inputs_mask=3;
 			for(float value:{-1.f,-1.f,.5f,1.f,1.f,-1.f,.5f,1.f,1.f,1.f,.5f,1.f,-1.f,1.f,.5f,1.f})
 				for(unsigned shift:{24u,16u,8u,0u})processor.persistent.push_back(std::byte(std::bit_cast<unsigned>(value)>>shift));
 			for(unsigned vertex=0;vertex<4;++vertex)for(unsigned c=0;c<4;++c)
 			{
-				const auto raw=std::bit_cast<unsigned>(vertex==3 ? rgba[c]/255.f : (c==3 ? 1.f : 0.f));
+				const auto raw=std::bit_cast<unsigned>((!flat || vertex==3) ? rgba[c]/255.f : (c==3 ? 1.f : 0.f));
 				for(unsigned shift:{24u,16u,8u,0u})processor.persistent.push_back(std::byte(raw>>shift));
 			}
 			for(unsigned unit=0;unit<2;++unit)processor.descriptors[unit]={16u|(1u<<8)|(2u<<24)|(4u<<27),(1u<<29)|unit*64};
-			auto vertex=vertex_program();vertex.data[7]&=~1u;vertex.ctrl=rsx_program_flat;vertex.output_mask=1;
+			auto vertex=vertex_program();vertex.data[7]&=~1u;vertex.ctrl=flat ? rsx_program_flat : 0;vertex.output_mask=1;
 			constexpr unsigned input=2u|(1u<<12)|(2u<<10)|(3u<<8);
 			for(unsigned word:{(63u<<15)|(7u<<10)|(1u<<30),(1u<<22)|(1u<<8)|(input>>9),(input&511)<<23,(15u<<13)|(15u<<17)|(1u<<7)|(1u<<2)|1u})vertex.data.push_back(word);
 			vertex.instruction_mask.set(2);
 			std::vector<std::byte> bytes;for(unsigned word:{(1u<<24)|(15u<<9)|(1u<<13)|1u,(0xe4u<<9)|(7u<<18)|(0xe4u<<21)|1u,0xe4u<<9,0xe4u<<9})append(bytes,word);
-			test::fragment_program fragment;fragment.pointer=bytes.data();fragment.ucode_length=bytes.size();fragment.ctrl=rsx_fragment_float32|rsx_program_flat;
+			test::fragment_program fragment;fragment.pointer=bytes.data();fragment.ucode_length=bytes.size();fragment.ctrl=rsx_fragment_float32|(flat ? rsx_program_flat : 0);
 			draw_capture_limits limits;limits.vertex_stream_bytes=128;
 			limits.sparse_sources=[&](const vertex_stream_range& range)
 			{
@@ -1668,16 +3008,815 @@ void verify_separated_flat_draws()
 				[](const auto&,unsigned,unsigned)->std::pair<unsigned,unsigned>{throw std::runtime_error("Flat quad entered legacy prefix capture");},limits);
 		};
 		const auto full=packet({64,128,192,255},0,4);surfaces.clear(targets.colors[0],0xf0,0xff112233,0,255,{0,0,4,4});
-		executor.execute(full,targets);verify(ctx,surfaces,targets.colors[0],{64,128,192,255});
+		const auto under_pressure = [&](const rsx_draw_packet& draw, const auto& check_admission)
+		{
+			const auto free = ledger->statistics();
+			const auto available = free.budget - free.reserved_bytes;
+			constexpr std::size_t block = 64 << 10;
+			require(available > block, "Owned vertex upload test lacks free space");
+			std::vector<id<MTLBuffer>> reservations{ledger->shared_buffer((available - block) / block * block)};
+			for (;;)
+			{
+				try { reservations.push_back(ledger->shared_buffer(16)); }
+				catch (const heap_budget_error&) { break; }
+			}
+			unsigned admissions = 0;
+			const auto recover = ledger->register_reclaimer([&](memory_pressure_request pressure)
+			{
+				require(!pressure.native_failure && admissions == 0, "Unexpected draw pressure recovery");
+				check_admission();
+				++admissions;
+				reservations.clear();
+			});
+			executor.execute(draw, targets);
+			require(admissions == 1, "Draw storage did not reach pressure recovery");
+		};
+		under_pressure(full, [&]
+		{
+			require(executor.vertex_statistics().prewarmed == 1 && executor.fragment_statistics().prewarmed == 1 &&
+				!executor.vertex_statistics().prewarm_waited && !executor.fragment_statistics().prewarm_waited &&
+				!executor.pipeline_statistics().created && !ctx.geometry_uploads().statistics().created,
+				"Owned vertex allocation reached pressure recovery after waiting for a shader or uploading geometry");
+			if (gate_stages)
+			{
+				[gate waitForCallbacks:2];
+				require(executor.pipeline_statistics().prewarmed == 1 && executor.compilation_statistics().admitted == 4 &&
+					!executor.vertex_statistics().compiled && !executor.fragment_statistics().compiled && ![gate renderLaunches],
+					"Productive draw did not queue its PSO before storage admission with both stage callbacks held");
+				[gate releaseLibraryCallback:@"RPCS3 native RSX vertex program"];
+				require(![gate renderLaunches], "Productive draw launched PSO without fragment dependency");
+				[gate releaseLibraryCallback:@"RPCS3 native RSX fragment program"];
+				[gate releaseCallbacks];
+			}
+		});
+		// Two stage libraries, one flat-color compute pipeline and one render pipeline.
+		require(ctx.vertex_uploads().statistics().created && executor.compilation_statistics().admitted == 4 &&
+			executor.pipeline_statistics().created == 1, "Early owned vertex upload duplicated a shader or pipeline job");
+		verify(ctx,surfaces,targets.colors[0],{64,128,192,255});
+		std::cout << "Early owned vertex upload: pressure recovery followed both shader submissions and preceded materialization and geometry; one PSO and 16 exact pixels passed (depth mirror " << mirror << ")\n";
+		if (gate_stages)
+		{
+			require([gate renderLaunches] == 1 && [gate computeLaunches] == 1 && ![gate mainThreadLaunch],
+				"Productive gated draw duplicated native jobs or launched compilation on owner");
+			std::cout << "Pending-stage productive draw: native render dependency admitted before vertex storage, both libraries required, same PSO adopted and 16 exact pixels passed (depth mirror " << mirror << ")\n";
+			continue;
+		}
 		const auto left=packet({255,0,0,255},0,2),right=packet({0,255,0,255},2,2);
 		const auto before=surfaces.transaction_statistics();
 		{auto batch=surfaces.batch_draws();for(unsigned i=0;i<8;++i)executor.execute(i&1 ? right : left,targets);batch.finish();}
 		require(surfaces.transaction_statistics().draw_batches==before.draw_batches+1 && surfaces.transaction_statistics().batched_draws==before.batched_draws+8,
 			"Flat result prepasses split compatible owned draws or lost their transaction");
+		require(executor.compilation_statistics().admitted == 4 && executor.pipeline_statistics().created == 1,
+			"Flat Color draws started new compiler jobs for an already resolved pipeline");
+		require(executor.geometry_plans_created() == 1,
+			"Compatible owned draws rebuilt the CPU geometry plan");
 		verify(ctx,surfaces,targets.colors[0],{255,0,0,255},{0,0,2,4},{0,255,0,255});
+		std::cout << "Owned geometry plan: one CPU plan for nine draws with fresh vertex data and exact scissored output (depth mirror " << mirror << ")\n";
+		const auto masked = packet({128, 200, 251, 255}, 0, 4, true, 0x00010000);
+		const auto before_pso = executor.pipeline_statistics();
+		const auto before_vertex = executor.vertex_statistics();
+		const auto before_fragment = executor.fragment_statistics();
+		const auto before_jobs = executor.compilation_statistics().admitted;
+		under_pressure(masked, [&]
+		{
+			require(executor.pipeline_statistics().prewarmed == before_pso.prewarmed + 1 &&
+				executor.pipeline_statistics().created == before_pso.created &&
+				executor.compilation_statistics().admitted == before_jobs + 1 &&
+				executor.vertex_statistics().compiled == before_vertex.compiled &&
+				executor.fragment_statistics().compiled == before_fragment.compiled,
+				"Cold render PSO did not start before native vertex storage admission");
+		});
+		require(executor.pipeline_statistics().created == before_pso.created + 1 &&
+			executor.compilation_statistics().admitted == before_jobs + 1,
+			"Cold render PSO was not adopted exactly once");
+		verify(ctx, surfaces, targets.colors[0], {128,0,0,255}, {0,0,2,4}, {128,255,0,255});
+		std::cout << "Ready-stage cold PSO: one job before native vertex storage admission, 16 exact masked pixels (depth mirror " << mirror << ")\n";
+		{
+			auto batch = surfaces.batch_draws();
+			executor.execute(left, targets);
+			executor.execute(right, targets);
+			batch.finish();
+		}
+
+		if (!mirror)
+		{
+			draw_targets other;
+			other.colors[0] = surfaces.acquire({0x12000, {4,4,1,surface_color::argb8,false},16,{}});
+			surfaces.clear(other.colors[0], 0xf0, 0xff112233, 0, 255, {0,0,4,4});
+			const auto base = packet({255,0,0,255}, 0, 4, false);
+			const auto overlay = packet({0,255,0,255}, 2, 2, false);
+			const auto encoders = ctx.encoding_statistics().render_encoders;
+			const auto submissions = surfaces.transaction_statistics().submitted;
+			{
+				auto batch = surfaces.batch_draws();
+				executor.execute(base, targets);
+				executor.execute(overlay, targets);
+				require(ctx.encoding_statistics().render_encoders == encoders + 1,
+					"Compatible owned draws opened more than one Metal4 render encoder");
+				executor.execute(base, other);
+				require(ctx.encoding_statistics().render_encoders == encoders + 2,
+					"An attachment change did not start a new Metal4 render encoder");
+				executor.execute(overlay, targets);
+				require(ctx.encoding_statistics().render_encoders == encoders + 3,
+					"Switching between already prepared attachments reused the wrong encoder");
+				batch.finish();
+			}
+			require(surfaces.transaction_statistics().submitted == submissions + 1,
+				"Render pass reuse split the native draw batch");
+			verify(ctx, surfaces, targets.colors[0], {255,0,0,255}, {0,0,2,4}, {0,255,0,255});
+			verify(ctx, surfaces, other.colors[0], {255,0,0,255});
+			std::cout << "Owned render pass reuse: two ordered draws in one encoder, two attachment switches, one submission and 32 exact pixels\n";
+			for (bool precise : {true, false})
+			{
+				query_pool shared_query(ctx, 3, 3, ledger);
+				query_pool foreign_query(ctx, 1, 1, ledger);
+				draw_execution_state queried;
+				queried.queries = &shared_query;
+				draw_execution_state foreign;
+				foreign.queries = &foreign_query;
+				const auto query_encoders = ctx.encoding_statistics().render_encoders;
+				const auto query_submissions = surfaces.transaction_statistics().submitted;
+				auto batch = surfaces.batch_draws();
+				shared_query.begin(0, precise);
+				executor.execute(base, targets, queried);
+				executor.execute(overlay, targets, queried);
+				shared_query.end(0);
+				require(ctx.encoding_statistics().render_encoders == query_encoders + 1 &&
+					shared_query.statistics().initializations == 1 && shared_query.statistics().reused_batch == 1,
+					"Compatible visibility draws did not share the Metal4 encoder and one initialized counter");
+				executor.execute(overlay, targets, queried);
+				shared_query.begin(1, !precise);
+				executor.execute(overlay, targets, queried);
+				shared_query.end(1);
+				shared_query.begin(2, true);
+				executor.execute(base, targets, queried);
+				executor.execute(overlay, targets);
+				require(ctx.encoding_statistics().render_encoders == query_encoders + 1 &&
+					shared_query.statistics().initializations == 3 && shared_query.statistics().reused_batch == 1,
+					"Same-buffer query offsets and disabled draws split the Metal4 encoder");
+				executor.execute(overlay, targets, queried);
+				shared_query.end(2);
+				require(ctx.encoding_statistics().render_encoders == query_encoders + 2 &&
+					shared_query.statistics().reused_batch == 2, "Reactivating a used visibility offset did not start a new encoder");
+				foreign_query.begin(0, true);
+				executor.execute(overlay, targets, foreign);
+				foreign_query.end(0);
+				require(ctx.encoding_statistics().render_encoders == query_encoders + 3,
+					"A different query buffer reused the previous Metal4 encoder");
+				batch.finish();
+				require(surfaces.transaction_statistics().submitted == query_submissions + 1 &&
+					shared_query.consume(0) == (precise ? 24u : 1u) && shared_query.consume(1) == (precise ? 1u : 8u) &&
+					shared_query.consume(2) == 24u && foreign_query.consume(0) == 8u,
+					"Dynamic visibility mode or offset changed a query result");
+				verify(ctx, surfaces, targets.colors[0], {255,0,0,255}, {0,0,2,4}, {0,255,0,255});
+				std::cout << "Owned dynamic visibility: three counters and two disabled draws in one encoder, reactivated offset and foreign arena split; exact results "
+					<< (precise ? "24/1/24/8" : "1/8/24/8") << " and 16 pixels\n";
+			}
+		}
+
+		for (const auto& target : {targets.colors[0], targets.depth})
+			if (target) { surfaces.flush(target); surfaces.prepare(target); }
+		const auto color_before = surfaces.status(targets.colors[0]);
+		const auto depth_before = mirror ? surfaces.status(targets.depth) : cached_surface_status{};
+		query_pool queries(ctx, 1, 2, ledger);
+		ctx.begin();
+		const auto off = queries.capture_report_predicate({{}, 0, true});
+		const auto on = queries.capture_report_predicate({{}, 1, true});
+		require(off && on, "Native executor predicate capture failed");
+		ctx.submit().wait();
+		const auto unchanged = [](const cached_surface_status& a, const cached_surface_status& b)
+		{
+			return a.initialized == b.initialized && a.dirty == b.dirty && a.spilled == b.spilled &&
+				!a.pending && !a.faulted && a.content_generation == b.content_generation &&
+				a.native_write_epoch == b.native_write_epoch && a.guest_revisions == b.guest_revisions;
+		};
+		draw_execution_state conditional;
+		conditional.queries = &queries;
+		conditional.predicate = queries.submit_report_predicate({{}, 0, true});
+		require(conditional.predicate && conditional.predicate->settled_cpu_result(ctx) == false, "Completed CPU-known false report was not recognized");
+		const auto skipped_transactions = surfaces.transaction_statistics().submitted;
+		const auto skipped_encoders = ctx.encoding_statistics();
+		const auto skipped_allocations = ledger->statistics().created;
+		const auto skipped_vertex = executor.vertex_statistics().lookups;
+		const auto skipped_fragment = executor.fragment_statistics().lookups;
+		queries.begin(0, true);
+		executor.execute(full, targets, conditional);
+		queries.end(0);
+		require(queries.consume(0) == 0 && surfaces.transaction_statistics().submitted == skipped_transactions &&
+			ctx.encoding_statistics().compute_encoders == skipped_encoders.compute_encoders &&
+			ctx.encoding_statistics().render_encoders == skipped_encoders.render_encoders &&
+			ledger->statistics().created == skipped_allocations && executor.vertex_statistics().lookups == skipped_vertex &&
+			executor.fragment_statistics().lookups == skipped_fragment &&
+			unchanged(surfaces.status(targets.colors[0]), color_before) &&
+			(!mirror || unchanged(surfaces.status(targets.depth), depth_before)),
+			"Known false report prepared or submitted a native draw");
+		{
+			const auto event = [ctx.device() newSharedEvent];
+			struct release { id<MTLSharedEvent> event; ~release() { event.signaledValue = 1; } } release_gate{event};
+			ctx.begin();
+			ctx.wait_event(event, 1);
+			const auto producer = ctx.submit();
+			const auto blocked_false = queries.submit_report_predicate({{}, 0, true});
+			const auto blocked_true = queries.submit_report_predicate({{}, 1, true});
+			require(blocked_false && !blocked_false->settled_cpu_result(ctx) &&
+				blocked_true && !blocked_true->settled_cpu_result(ctx) && producer.cancel_pending(),
+				"CPU-known report bypassed a pending predecessor");
+			event.signaledValue = 1;
+			try { producer.wait(); } catch (const submission_wait_timeout&) { throw; } catch (const std::runtime_error&) {}
+			bool rejected = false;
+			try { (void)blocked_false->settled_cpu_result(ctx); }
+			catch (const submission_wait_timeout&) { throw; }
+			catch (const std::runtime_error&) { rejected = true; }
+			require(producer.cancelled() && rejected, "Known false report hid a failed predecessor");
+			rejected = false;
+			try { (void)blocked_true->settled_cpu_result(ctx); }
+			catch (const submission_wait_timeout&) { throw; }
+			catch (const std::runtime_error&) { rejected = true; }
+			require(rejected, "Known true report hid a failed predecessor");
+			ctx.recover_completed_errors();
+		}
+		conditional.predicate = off;
+		queries.begin(0, true);
+		const auto false_dispatches = ctx.encoding_statistics().checked_dispatches;
+		executor.execute(full, targets, conditional);
+		queries.end(0);
+		require(queries.consume(0) == 0 && ctx.encoding_statistics().checked_dispatches == false_dispatches + 1,
+			"False predicate ran flat-color compute or emitted visible geometry");
+		require(unchanged(surfaces.status(targets.colors[0]), color_before) &&
+			(!mirror || unchanged(surfaces.status(targets.depth), depth_before)),
+			"False predicate published a new surface version");
+		verify(ctx,surfaces,targets.colors[0],{255,0,0,255},{0,0,2,4},{0,255,0,255});
+		conditional.predicate = on;
+		queries.begin(0, true);
+		const auto true_dispatches = ctx.encoding_statistics().checked_dispatches;
+		executor.execute(full, targets, conditional);
+		queries.end(0);
+		const auto color_after = surfaces.status(targets.colors[0]);
+		require(queries.consume(0) == 16 && ctx.encoding_statistics().checked_dispatches == true_dispatches + 1 &&
+			color_after.dirty && color_after.content_generation == color_before.content_generation + 1 &&
+			color_after.native_write_epoch > color_before.native_write_epoch,
+			"True predicate lost native visibility or failed to publish the surface");
+		verify(ctx,surfaces,targets.colors[0],{64,128,192,255});
+
+		constexpr std::uint32_t color_address = 0x11000, label_address = color_address + 4, label_value = 0x12345678;
+		constexpr std::array old_pixel{255u, 17u, 34u, 51u}, new_pixel{255u, 64u, 128u, 192u};
+		constexpr std::array label_bytes{std::byte{0x12}, std::byte{0x34}, std::byte{0x56}, std::byte{0x78}};
+		const auto check_guest = [&](const std::array<unsigned, 4>& pixel, bool labelled)
+		{
+			const auto snapshot = ram->read({color_address, 64});
+			for (std::size_t i = 0; i < snapshot.bytes.size(); ++i)
+			{
+				const auto expected = labelled && i >= 4 && i < 8 ? label_bytes[i - 4] : std::byte(pixel[i % 4]);
+				require(snapshot.bytes[i] == expected, "Predicated draw and label produced incorrect guest bytes");
+			}
+		};
+		const auto prepare_label_target = [&]
+		{
+			surfaces.clear(targets.colors[0], 0xf0, 0xff112233, 0, 255, {0, 0, 4, 4});
+			surfaces.flush(targets.colors[0]);
+			surfaces.prepare(targets.colors[0]);
+		};
+		const auto queue_draw = [&](const report_predicate& predicate, id<MTLSharedEvent> gate)
+		{
+			draw_execution_state state;
+			state.queries = &queries;
+			state.predicate = predicate;
+			if (gate) state.waits.push_back({gate, 1});
+			surfaces.set_wait_timeout(std::chrono::milliseconds(1));
+			bool timed_out = false;
+			try { executor.execute(full, targets, state); }
+			catch (const submission_wait_timeout&) { timed_out = true; }
+			surfaces.set_wait_timeout(std::chrono::seconds(30));
+			require(timed_out && surfaces.status(targets.colors[0]).pending, "Predicated label test lost its pending draw");
+		};
+		struct gate_guard
+		{
+			id<MTLSharedEvent> event;
+			~gate_guard() { if (!event.signaledValue) event.signaledValue = 1; }
+			void open() { event.signaledValue = 1; }
+		};
+		for (const bool visible : {false, true})
+		{
+			prepare_label_target();
+			const auto prior = surfaces.status(targets.colors[0]);
+			gate_guard gate{[ctx.device() newSharedEvent]};
+			queue_draw(visible ? *on : *off, gate.event);
+			unsigned dependencies = 0, stores = 0;
+			const auto sync = [&]
+			{
+				const auto after = surfaces.status(targets.colors[0]);
+				require(!after.pending && after.dirty == visible && after.content_generation == prior.content_generation + visible,
+					"Label dependencies saw the wrong predicated surface version");
+				++dependencies;
+			};
+			const auto store = [&](unsigned address, unsigned value)
+			{
+				require(dependencies == 1 && !stores && address == label_address && value == label_value &&
+					!surfaces.status(targets.colors[0]).dirty, "Predicated alias label preceded writeback");
+				check_guest(visible ? new_pixel : old_pixel, false);
+				ram->write({address, 4}, label_bytes);
+				++stores;
+			};
+			bool timed_out = false;
+			try { release_guest_label(surfaces, textures, label_address, label_value, sync, store, std::chrono::milliseconds(1)); }
+			catch (const submission_wait_timeout&) { timed_out = true; }
+			require(timed_out && !stores && !dependencies, "Pending predicated draw allowed an early label");
+			check_guest(old_pixel, false);
+			gate.open();
+			release_guest_label(surfaces, textures, label_address, label_value, sync, store);
+			require(stores == 1 && dependencies == 1, "Completed predicated draw did not publish the label");
+			check_guest(visible ? new_pixel : old_pixel, true);
+		}
+
+		prepare_label_target();
+		const auto before_failure = surfaces.status(targets.colors[0]);
+		const auto failure = make_buffer(ctx, 4, buffer_storage::shared);
+		*static_cast<std::uint32_t*>(failure.contents) = 1;
+		gate_guard failed_gate{[ctx.device() newSharedEvent]};
+		ctx.begin();
+		ctx.wait_event(failed_gate.event, 1);
+		const auto failed_predicate = queries.capture_report_predicate({{}, 1, true});
+		require(failed_predicate.has_value(), "Predicate failure fixture could not capture its report");
+		ctx.require_gpu_success(failure, 0, @"Intentional predicated label producer failure");
+		const auto failed_producer = ctx.submit();
+		queue_draw(*failed_predicate, nil);
+		failed_gate.open();
+		unsigned failed_callbacks = 0;
+		bool failed_label = false;
+		try
+		{
+			release_guest_label(surfaces, textures, label_address, label_value,
+				[&] { ++failed_callbacks; }, [&](auto, auto) { ++failed_callbacks; });
+		}
+		catch (const std::runtime_error& error)
+		{
+			failed_label = std::string_view(error.what()).find("Intentional predicated label producer failure") != std::string_view::npos;
+		}
+		require(failed_label && failed_producer.ready() && !failed_callbacks &&
+			unchanged(surfaces.status(targets.colors[0]), before_failure), "Failed predicate leaked a label or a writable surface");
+		check_guest(old_pixel, false);
+		ctx.recover_completed_errors();
+
+		for (const bool visible : {false, true})
+		{
+			prepare_label_target();
+			gate_guard gate{[ctx.device() newSharedEvent]};
+			queue_draw(visible ? *on : *off, gate.event);
+			store_guest_flip_label(label_address, label_value, [&](unsigned address, unsigned)
+				{ ram->write({address, 4}, label_bytes); });
+			require(!gate.event.signaledValue && surfaces.status(targets.colors[0]).pending,
+				"Predicated flip label blocked on GPU completion");
+			check_guest(old_pixel, true);
+			gate.open();
+			bool conflict = false;
+			try { surfaces.synchronize(); }
+			catch (const surface_conflict_error&) { conflict = true; }
+			require(conflict == visible && !surfaces.status(targets.colors[0]).pending &&
+				!surfaces.status(targets.colors[0]).dirty, "Flip label accepted a stale conditional surface");
+			surfaces.flush(targets.colors[0]);
+			check_guest(old_pixel, true);
+		}
+
+		prepare_label_target();
+		const auto deferred_reader = surfaces.acquire({0x31000, {4, 4, 1, surface_color::argb8, false}, 16, {}});
+		surfaces.defer_copy(targets.colors[0], {0, 0, 4, 4}, deferred_reader, 0, 0);
+		for (const auto* predicate : {&*off, &*on})
+		{
+			conditional.predicate = *predicate;
+			executor.execute(full, targets, conditional);
+			const auto reader = surfaces.status(deferred_reader);
+			require(reader.deferred_copies == 1 && !reader.dirty, "Versioned predicated draw materialized a disjoint reader");
+		}
+		verify(ctx, surfaces, targets.colors[0], {64, 128, 192, 255});
+		verify(ctx, surfaces, deferred_reader, {17, 34, 51, 255});
+
+		const auto alias = surfaces.acquire({color_address + 8, {2, 4, 1, surface_color::argb8, false}, 16, {}});
+		const auto donor = surfaces.acquire({0x32000, {2, 4, 1, surface_color::argb8, false}, 8, {}});
+		for (const bool deferred : {false, true})
+		{
+			prepare_label_target();
+			if (deferred)
+			{
+				surfaces.clear(donor, 0xf0, 0xff00ff00, 0, 255, {0, 0, 2, 4});
+				surfaces.defer_copy(donor, {0, 0, 2, 4}, alias, 0, 0);
+			}
+			else surfaces.clear(alias, 0xf0, 0xff00ff00, 0, 255, {0, 0, 2, 4});
+			const auto prior = surfaces.status(alias);
+			const auto guest_before = ram->read({color_address, 64});
+			if (!deferred)
+			{
+				gate_guard gate{[ctx.device() newSharedEvent]};
+				ctx.begin();
+				ctx.wait_event(gate.event, 1);
+				conditional.predicate = queries.capture_report_predicate({{}, 0, true});
+				require(conditional.predicate.has_value(), "Overlap timeout fixture could not capture its report");
+				const auto producer = ctx.submit();
+				surfaces.set_wait_timeout(std::chrono::milliseconds(1));
+				bool timed_out = false;
+				try { executor.execute(left, targets, conditional); }
+				catch (const submission_wait_timeout&) { timed_out = true; }
+				surfaces.set_wait_timeout(std::chrono::seconds(30));
+				const auto during = ram->read({color_address, 64});
+				require(timed_out && !producer.ready() && during.bytes == guest_before.bytes &&
+					during.revision == guest_before.revision && unchanged(surfaces.status(alias), prior),
+					"Pending predicate allowed overlapping writeback");
+				gate.open();
+				producer.wait();
+			}
+			conditional.predicate = off;
+			executor.execute(left, targets, conditional);
+			const auto guest_after = ram->read({color_address, 64});
+			const auto unchanged_alias = surfaces.status(alias);
+			require(guest_after.bytes == guest_before.bytes && guest_after.revision == guest_before.revision &&
+				unchanged(unchanged_alias, prior) && unchanged_alias.deferred_copies == prior.deferred_copies,
+				"False predicate published overlapping surface preparation");
+			conditional.predicate = on;
+			executor.execute(left, targets, conditional);
+			verify(ctx, surfaces, targets.colors[0], {255, 0, 0, 255}, {0, 0, 2, 4}, {0, 255, 0, 255});
+		}
+		auto cold_targets = targets;
+		cold_targets.colors[0] = surfaces.acquire({0x33000, {4, 4, 1, surface_color::argb8, false}, 16, {}});
+		const auto cold = surfaces.status(cold_targets.colors[0]);
+		const auto reads = ram->reads;
+		const auto render_encoders = ctx.encoding_statistics().render_encoders;
+		conditional.predicate = off;
+		executor.execute(left, cold_targets, conditional);
+		require(unchanged(surfaces.status(cold_targets.colors[0]), cold) && ram->reads == reads &&
+			ctx.encoding_statistics().render_encoders == render_encoders, "False predicate initialized a cold surface");
+		for (unsigned profile = 0; profile < 3; ++profile)
+		{
+			const auto address = 0x34000u + profile * 0x1000;
+			std::array<std::byte,64> bytes;
+			for (unsigned i = 0; i < bytes.size(); ++i)
+				bytes[i] = std::byte(std::array{255u,17u,34u,51u}[i % 4]);
+			ram->write({address, bytes.size()}, bytes);
+			cold_targets.colors[0] = surfaces.acquire({address, {4,4,1,surface_color::argb8,false},16,{}});
+			const auto target = cold_targets.colors[0];
+			if (profile == 1)
+			{
+				surfaces.clear(target, 0xf0, 0xff00ff00, 0, 255, {0,0,4,4});
+				surfaces.spill(target);
+			}
+			if (profile == 2)
+			{
+				const auto source = surfaces.acquire({0x37000, {4,4,1,surface_color::argb8,false},16,{}});
+				surfaces.clear(source, 0xf0, 0xff00ff00, 0, 255, {0,0,4,4});
+				surfaces.defer_copy(source, {0,0,2,4}, target, 2, 0);
+			}
+			const auto original = surfaces.status(target);
+			const auto before = surfaces.transaction_statistics().submitted;
+			const auto original_reads = ram->reads;
+			conditional.predicate = off;
+			executor.execute(left, cold_targets, conditional);
+			require(unchanged(surfaces.status(target), original) && surfaces.status(target).deferred_copies == original.deferred_copies &&
+				ram->reads == original_reads && surfaces.transaction_statistics().submitted == before,
+				"Ready false report touched an unprepared target");
+			conditional.predicate = on;
+			executor.execute(left, cold_targets, conditional);
+			require(surfaces.transaction_statistics().submitted == before + 1 && !surfaces.status(target).spilled &&
+				surfaces.status(target).deferred_copies == 0 &&
+				surfaces.status(target).content_generation == original.content_generation + (profile == 2 ? 3u : profile == 1 ? 1u : 2u),
+				"True report split target initialization from its draw");
+			verify(ctx, surfaces, target, {255,0,0,255}, {0,0,2,4},
+				profile ? std::array{0u,255u,0u,255u} : std::array{17u,34u,51u,255u});
+		}
+		context ordered(2, 64, std::chrono::seconds(5), context::recording_overlap::explicit_predecessor);
+		auto ordered_budget = std::make_shared<heap_budget>(ordered, 16u << 20);
+		auto ordered_ram = std::make_shared<memory>();
+		ordered.set_buffer_budget(ordered_budget);
+		surface_cache ordered_surfaces(ordered, ordered_ram, 16u << 20, ordered_budget);
+		guest_texture_cache ordered_textures(ordered, ordered_ram,
+			[](unsigned offset, unsigned, std::size_t) { return offset; }, 1u << 20, ordered_budget);
+		draw_executor ordered_executor(ordered, ordered_surfaces, ordered_textures);
+		query_pool ordered_queries(ordered, 1, 2, ordered_budget);
+		draw_targets ordered_targets;
+		if (mirror)
+		{
+			ordered_targets.depth = ordered_surfaces.acquire({0x21000,{4,4,1,surface_depth::z24s8_uint,false},16,{}});
+			ordered_surfaces.clear(ordered_targets.depth, 3, 0, 0x40000000, 255, {0,0,4,4});
+		}
+		draw_execution_state pending_draw;
+		pending_draw.queries = &ordered_queries;
+		for (const bool deferred : {false, true})
+		for (const bool visible : {false, true})
+		{
+			const auto address = 0x38000u + unsigned(visible) * 0x1000u + unsigned(deferred) * 0x2000u;
+			ordered_targets.colors[0] = ordered_surfaces.acquire({address, {4,4,1,surface_color::argb8,false},16,{}});
+			const auto target = ordered_targets.colors[0];
+			const auto original = ordered_surfaces.status(target);
+			gate_guard gate{[ordered.device() newSharedEvent]};
+			ordered.begin();
+			ordered.wait_event(gate.event, 1);
+			pending_draw.predicate = ordered_queries.capture_report_predicate({{}, unsigned(visible), true});
+			require(pending_draw.predicate.has_value(), "Pending cold target could not capture a report");
+			const auto producer = ordered.submit();
+			const auto submitted = ordered_surfaces.transaction_statistics().submitted;
+			ordered_surfaces.set_wait_timeout(std::chrono::milliseconds(1));
+			bool timed_out = false;
+			try
+			{
+				if (deferred)
+				{
+					auto batch = ordered_surfaces.batch_draws(64, surface_cache::predicated_draw_completion::deferred);
+					ordered_executor.execute(left, ordered_targets, pending_draw);
+					batch.submit();
+				}
+				else
+					ordered_executor.execute(left, ordered_targets, pending_draw);
+			}
+			catch (const submission_wait_timeout&) { timed_out = true; }
+			if (deferred && !timed_out)
+			{
+				bool read_waited = false;
+				try { (void)ordered_surfaces.cpu_read({address, 64}); }
+				catch (const submission_wait_timeout&) { read_waited = true; }
+				require(read_waited && !ordered_surfaces.poll_submitted(),
+					"CPU read or completion poll crossed the pending predicated draw");
+			}
+			ordered_surfaces.set_wait_timeout(std::chrono::seconds(30));
+			require(timed_out != deferred && !producer.ready() && ordered_surfaces.status(target).pending &&
+				!ordered_surfaces.status(target).initialized && ordered_surfaces.transaction_statistics().submitted == submitted + 1,
+				"Pending report prevented recording the private target load and draw");
+			gate.open();
+			if (deferred)
+			{
+				ordered.wait_idle();
+				require(ordered_surfaces.poll_submitted() && !ordered_surfaces.status(target).pending,
+					"Completed predicated draw did not retire when polled");
+			}
+			else
+				ordered_surfaces.synchronize();
+			if (visible)
+				verify(ordered, ordered_surfaces, target, {255,0,0,255}, {0,0,2,4}, {0,0,0,0});
+			else
+				require(unchanged(ordered_surfaces.status(target), original), "Pending false report published the target load");
+		}
+
+		draw_targets clause_targets = targets;
+		const auto clause_target = surfaces.acquire({0x3d000, {4,4,1,surface_color::argb8,false},16,{}});
+		clause_targets.colors[0] = clause_target;
+		surfaces.clear(clause_target, 0xf0, 0xff112233, 0, 255, {0,0,4,4});
+		const auto clause_generation = surfaces.status(clause_target).content_generation;
+		const auto submissions = surfaces.transaction_statistics().submitted;
+		gate_guard first_gate{[ctx.device() newSharedEvent]}, last_gate{[ctx.device() newSharedEvent]};
+		test::pass_clause clause;
+		clause.pass_count = 2;
+		test::clause_context clause_context;
+		draw_execution_state clause_draw;
+		clause_draw.queries = &queries;
+		clause_draw.predicate = on;
+		auto clause_batch = surfaces.batch_draws(64, surface_cache::predicated_draw_completion::deferred);
+		const auto passes = drive_draw_clause(clause, &clause_context, [&](unsigned pass, unsigned)
+		{
+			require(clause_context.dependencies.size() == pass + 1 &&
+				surfaces.status(clause_target).content_generation == clause_generation + pass,
+				"Predicated pass observed stale dependency or target state");
+			clause_draw.waits = {{pass ? last_gate.event : first_gate.event, 1}};
+			executor.execute(pass ? right : left, clause_targets, clause_draw);
+		}, 4, clause_cleanup_owner::rsx_thread_end, true, [&]
+		{
+			bool waited = false;
+			try { surfaces.synchronize(std::chrono::milliseconds(1)); }
+			catch (const submission_wait_timeout&) { waited = true; }
+			require(waited && !surfaces.poll_submitted() && clause_context.dependencies == std::vector<unsigned>{0},
+				"Predicated dependency ran while the preceding pass was gated");
+			first_gate.open();
+			surfaces.synchronize();
+		});
+		clause_batch.submit();
+		require(passes == 2 && !surfaces.poll_submitted() && !clause_context.cleanups &&
+			surfaces.transaction_statistics().submitted == submissions + 2 &&
+			surfaces.status(clause_target).content_generation == clause_generation + 1,
+			"Predicated clause waited for its last pass or published it early");
+		clause.post_execute_cleanup(&clause_context);
+		last_gate.open();
+		ctx.wait_idle();
+		require(surfaces.poll_submitted() && surfaces.status(clause_target).content_generation == clause_generation + 2,
+			"Final predicated pass did not publish through polling");
+		require(clause_context.cleanups == 1, "Predicated clause cleanup ran more than once");
+		verify(ctx, surfaces, clause_target, {255,0,0,255}, {0,0,2,4}, {0,255,0,255});
+
+		surfaces.clear(clause_target, 0xf0, 0xff112233, 0, 255, {0,0,4,4});
+		draw_execution_state direct;
+		direct.queries = &queries;
+		direct.predicate = queries.submit_report_predicate({{}, 1, true});
+		require(direct.predicate && direct.predicate->settled_cpu_result(ctx) == true,
+			"Completed CPU-known true report was not recognized");
+		const auto direct_before = surfaces.transaction_statistics();
+		const auto direct_generation = surfaces.status(clause_target).content_generation;
+		auto direct_batch = surfaces.batch_draws();
+		queries.begin(0, true);
+		executor.execute(left, clause_targets, direct);
+		executor.execute(right, clause_targets, direct);
+		queries.end(0);
+		require(surfaces.transaction_statistics().submitted == direct_before.submitted &&
+			surfaces.status(clause_target).content_generation == direct_generation,
+			"Known true report submitted the two draws separately");
+		direct_batch.finish();
+		const auto direct_after = surfaces.transaction_statistics();
+		require(direct_after.submitted == direct_before.submitted + 1 &&
+			direct_after.batched_draws == direct_before.batched_draws + 2 &&
+			surfaces.status(clause_target).content_generation == direct_generation + 2 && queries.consume(0) == 16,
+			"Known true report did not use the direct native batch or lost visibility");
+		verify(ctx, surfaces, clause_target, {255,0,0,255}, {0,0,2,4}, {0,255,0,255});
 	}
+	if (gate_stages) return;
 	std::cout<<"Productive separated flat draws:normal andstored-depth-mirror paths,flat-only quad source3,18owned draws includingtwo8drawnativebatches;fresh red/green flat results retain bothscissor halves,all64checked RGBA8pixels exact,onebatch each passed\n";
+	std::cout<<"Native executor conditional draws: normal and depth-bounds packets, false surface rollback, true publication, exact pixels/visibility and no flat dispatch passed\n";
+	std::cout<<"Native predicated labels: ten normal/depth-bounds profiles, timeout ordering, exact guest bytes, failed producer refusal and flip conflict passed\n";
+	std::cout<<"Native predicated draw retains disjoint deferred readers and their original pixels across false and true writes\n";
+	std::cout<<"Native predicated overlap: four dirty/deferred profiles preserve guest state on false and compose exact pixels on true, with pending-report timeouts and cold targets checked\n";
+	std::cout<<"Conditional target loads: six cold/spilled/deferred profiles used one submission on true and no work on ready false; four pending reports retained or published exact target state\n";
+	std::cout<<"Deferred conditional draws: four normal/depth-bounds profiles returned behind the report gate; CPU reads waited and polling published true or rolled back false\n";
+	std::cout<<"Deferred conditional clauses: two GPU profiles waited before later dependencies, returned with the final pass gated and retained both exact scissor halves\n";
+	std::cout<<"Known false draws: normal and depth-bounds skipped all draw preparation and GPU submission; pending and failed predecessors remained ordered\n";
+	std::cout<<"Known true draws: normal and depth-bounds used one direct batch for two passes; exact pixels, visibility and predecessor errors preserved\n";
 }
+void verify_owned_inline_retirement(unsigned route_selection=0)
+{
+	using namespace std::chrono_literals;
+	unsigned cases=0,timeouts=0,cancelled=0,abandoned=0,captures=0;std::size_t checked=0;
+	for(unsigned routing=0;routing<29;++routing)for(bool mirror:{false,true})for(unsigned samples:{1u,2u,4u})for(bool cold:{false,true})for(unsigned outcome=0;outcome<4;++outcome)
+	@autoreleasepool
+	{
+		if((route_selection==1&&routing!=1)||(route_selection==2&&(routing<2||routing>=4))||
+			(route_selection==3&&(routing<4||routing>=6))||(route_selection==4&&(routing<6||routing>=8))||
+			(route_selection==5&&(routing<8||routing>=10))||(route_selection==6&&(routing<10||routing>=14))||
+			(route_selection==7&&(routing<14||routing>=18))||(route_selection==8&&(routing<18||routing>=24))||
+			(route_selection==9&&routing<24))continue;
+		try
+		{
+			context ctx(2);auto ram=std::make_shared<memory>();auto budget=std::make_shared<heap_budget>(ctx,8u<<20);ctx.set_buffer_budget(budget);
+			surface_cache surfaces(ctx,ram,8u<<20,budget);guest_texture_cache textures(ctx,ram,[](unsigned a,unsigned,std::size_t){return a;},1u<<20,budget);
+			draw_executor executor(ctx,surfaces,textures);draw_targets targets;
+			const auto factors=samples==1?sample_layout{1,1}:rsx_sample_layout(samples);
+			const auto coverage=plan_guest_surface(0x1000,4*factors.x,4*factors.y,4,16*factors.x);
+			targets.colors[0]=surfaces.acquire({0x1000,{4,4,samples,surface_color::argb8,false},16*factors.x,{}});
+			if(!cold)surfaces.clear(targets.colors[0],0xf0,0xff112233,0,255,{0,0,4,4});
+			if(mirror){targets.depth=surfaces.acquire({0x10000,{4,4,samples,surface_depth::z24s8_uint,false},16*factors.x,{}});surfaces.clear(targets.depth,3,0,0x40000000,255,{0,0,4,4});}
+			test::pass_state source;source.registers=registers().registers;source.current_draw_clause.command=2;source.base_index=0;
+			source.bounds=mirror;source.bounds_min=0;source.bounds_max=1;
+			std::vector<std::byte> positions;for(float v:{-1.f,-1.f,.5f,1.f,3.f,-1.f,.5f,1.f,-1.f,3.f,.5f,1.f})for(unsigned shift:{24u,16u,8u,0u})positions.push_back(std::byte(std::bit_cast<unsigned>(v)>>shift));
+			source.current_draw_clause.inline_vertex_array.resize(12);std::memcpy(source.current_draw_clause.inline_vertex_array.data(),positions.data(),positions.size());
+			test::pass_processor processor;processor.descriptors[0]={16u|(1u<<8)|(2u<<24)|(4u<<27),0x60000000u};
+			test::pass_block block;test::pass_layout layout;layout.interleaved_blocks.push_back(&block);test::pass_metadata metadata;
+			auto vertex=vertex_program();auto bytes=program(false);test::fragment_program fragment;fragment.pointer=bytes.data();fragment.ucode_length=bytes.size();fragment.ctrl=rsx_fragment_float32;
+			if(routing)
+			{
+				constexpr unsigned input=0x1b02;
+				vertex.data[4]=(63u<<15)|(7u<<10);
+				vertex.data[5]=1u<<27;
+				vertex.data[6]=input>>11;
+				vertex.data[7]=((input&2047u)<<21)|(15u<<17)|(3u<<7)|1u;
+			}
+			if(routing>=2&&routing<8)
+			{
+				const bool rounded=routing>=4&&routing<6,added=routing>=6,invalid=routing%2;
+				const std::array<unsigned,4> scalar{(63u<<15)|(7u<<10)|(1u<<28)|(1u<<24)|1u,1u<<27,0x1b02u>>11,((0x1b02u&2047u)<<21)|(15u<<17)|(3u<<7)|((rounded||added?8u:7u)<<2)|1u};
+				const std::array<unsigned,4> address{(1u<<15)|(7u<<10),((rounded?23u:13u)<<22)|(0x1b03u>>9),(0x1b03u&511u)<<23,((added?5u:4u)<<13)|(31u<<2)|(63u<<7)};
+				source.transform_constants[0][1]=std::bit_cast<unsigned>(added?(invalid?4.f:-4.f):rounded?(invalid?7.5f:-7.5f):(invalid?16.f:-7.f));
+				if(added)source.transform_constants[0][3]=std::bit_cast<unsigned>(invalid?4.f:-4.f);
+				vertex.data.resize((invalid?16:12)+(added?4:0));
+				if(invalid)
+				{
+					const auto ordinary=vertex_program();std::copy_n(ordinary.data.begin()+4,4,vertex.data.begin()+4);vertex.data[7]&=~1u;
+				}
+				const unsigned first=invalid?8:4;
+				std::copy(address.begin(),address.end(),vertex.data.begin()+first);
+				if(added)
+				{
+					const std::array<unsigned,4> sum{(1u<<15)|(1u<<24)|(7u<<10),24u<<22,0,(4u<<13)|(31u<<2)|(63u<<7)};
+					std::copy(sum.begin(),sum.end(),vertex.data.begin()+first+4);
+				}
+				std::copy(scalar.begin(),scalar.end(),vertex.data.begin()+first+4+(added?4:0));
+				vertex.instruction_mask.set(2);if(invalid||added)vertex.instruction_mask.set(3);if(invalid&&added)vertex.instruction_mask.set(4);
+			}
+			if(routing>=8&&routing<18)
+			{
+				using words=std::array<unsigned,4>;
+				const auto operand=[](words& w,unsigned slot,unsigned packed)
+				{
+					if(slot==0){w[1]|=packed>>9;w[2]|=(packed&511u)<<23;}
+					else if(slot==1)w[2]|=packed<<6;
+					else{w[2]|=packed>>11;w[3]|=(packed&2047u)<<21;}
+				};
+				const bool subnormal=routing==10||routing==14,lit=routing>=15;
+				const std::array<unsigned,10> opcodes{5,6,2,3,4,13,14,7,7,7};
+				const std::array<float,10> values{1,2,std::numeric_limits<float>::max(),-2,-4,0x1p-64f,-127,1,1,std::bit_cast<float>(1u)},expected{1,1,0,-.5f,.5f,-64,0,0,std::numeric_limits<float>::infinity(),4};
+				words math{(63u<<15)|(1u<<30)|(7u<<10)|(subnormal?1u<<14:0u),opcodes[routing-8]<<27,0,(15u<<17)|(3u<<7)|(31u<<2)};operand(math,2,lit?0x1b03u:3u);
+				words compare{(4u<<15)|(1u<<30)|(7u<<10),((routing==16?11u:16u)<<22)|(1u<<12),0,(15u<<13)|(63u<<7)|(31u<<2)};operand(compare,0,lit?0xaa0d:0xff0d);operand(compare,1,3u);
+				words position{(63u<<15)|(1u<<30)|(7u<<10),2u<<22,0,(15u<<13)|(63u<<7)|1u};operand(position,0,0x1b02);operand(position,1,0x1b11);
+				source.transform_constants[0][0]=std::bit_cast<unsigned>(values[routing-8]);for(auto& word:source.transform_constants[1])word=std::bit_cast<unsigned>(expected[routing-8]);
+				if(lit){source.transform_constants[0][1]=std::bit_cast<unsigned>(routing==15?0.f:2.f);source.transform_constants[0][3]=std::bit_cast<unsigned>(routing==16?256.f:routing==15?1.f:2.f);source.transform_constants[0][2]=0x7fc12345u;}
+				vertex.data.resize(subnormal?20:16);std::copy(math.begin(),math.end(),vertex.data.begin()+4);
+				if(subnormal)
+				{
+					// Observe a subnormal scalar result through the bit-classified
+					// condition register; a floating SEQ could flush both sides.
+					const words branch{2u<<10,9u<<27,0,(4u<<29)|(31u<<2)},end{0,0,0,1u|(31u<<2)};
+					const auto ordinary=vertex_program();std::copy(branch.begin(),branch.end(),vertex.data.begin()+8);std::copy_n(ordinary.data.begin()+4,4,vertex.data.begin()+12);std::copy(end.begin(),end.end(),vertex.data.begin()+16);vertex.instruction_mask.set(4);
+				}
+				else{std::copy(compare.begin(),compare.end(),vertex.data.begin()+8);std::copy(position.begin(),position.end(),vertex.data.begin()+12);}
+				vertex.instruction_mask.set(2);vertex.instruction_mask.set(3);
+			}
+			if(routing>=18&&routing<24)
+			{
+				using words=std::array<unsigned,4>;
+				constexpr std::array opcodes{11u,12u,16u,18u,19u,20u};
+				const bool expected=routing==18||routing==21||routing==23;
+				words math{(3u<<15)|(1u<<30)|(1u<<14)|(1u<<29)|(7u<<10),opcodes[routing-18]<<22,
+					(3u<<23)|(0x5503u<<6),(15u<<13)|(63u<<7)|(31u<<2)};
+				const words branch{(expected?2u:5u)<<10,9u<<27,0,(4u<<29)|(31u<<2)},end{0,0,0,1u|(31u<<2)};
+				// Every old native comparison loses this magnitude against zero.
+				source.transform_constants[0][0]=routing<20?0x80000001u:1u;source.transform_constants[0][1]=0;
+				const auto ordinary=vertex_program();vertex.data.resize(20);
+				std::copy(math.begin(),math.end(),vertex.data.begin()+4);std::copy(branch.begin(),branch.end(),vertex.data.begin()+8);
+				std::copy_n(ordinary.data.begin()+4,4,vertex.data.begin()+12);std::copy(end.begin(),end.end(),vertex.data.begin()+16);
+				vertex.instruction_mask.set(2);vertex.instruction_mask.set(3);vertex.instruction_mask.set(4);
+			}
+			if(routing>=24)
+			{
+				using words=std::array<unsigned,4>;
+				constexpr std::array opcodes{9u,10u,14u,15u,22u};
+				words math{(3u<<15)|(1u<<30)|(1u<<14)|(1u<<29)|(7u<<10),opcodes[routing-24]<<22,
+					(3u<<23)|(0x5503u<<6),(15u<<13)|(63u<<7)|(31u<<2)};
+				const words branch{2u<<10,9u<<27,0,(4u<<29)|(31u<<2)},end{0,0,0,1u|(31u<<2)};
+				source.transform_constants[0][0]=routing==24||routing==27?0x80000001u:1u;source.transform_constants[0][1]=0;
+				const auto ordinary=vertex_program();vertex.data.resize(20);
+				std::copy(math.begin(),math.end(),vertex.data.begin()+4);std::copy(branch.begin(),branch.end(),vertex.data.begin()+8);
+				std::copy_n(ordinary.data.begin()+4,4,vertex.data.begin()+12);std::copy(end.begin(),end.end(),vertex.data.begin()+16);
+				vertex.instruction_mask.set(2);vertex.instruction_mask.set(3);vertex.instruction_mask.set(4);
+			}
+			draw_capture_limits limits;limits.vertex_stream_bytes=48;limits.sparse_sources=[&](const vertex_stream_range& range)
+			{
+				require(range.source_vertices&&*range.source_vertices==std::vector<unsigned>{0,1,2},"Owned inline capture lost its exact source vertices");
+				vertex_sparse_inputs input;input.attribute_mask=1;input.attributes[0]={processor.descriptors[0],false,0,std::as_bytes(std::span{source.current_draw_clause.inline_vertex_array})};return input;
+			};
+			const auto gate=[ctx.device() newSharedEvent];struct release{id<MTLSharedEvent> event;~release(){event.signaledValue=1;}} unblock{gate};
+			draw_execution_state execution;execution.waits={{gate,1}};
+			const auto before=surfaces.status(targets.colors[0]);const auto submissions=surfaces.transaction_statistics().submitted;
+			std::optional<submission> token;test::clause_context clause_context;
+			surfaces.set_wait_timeout(1ms);
+			{
+				auto batch=surfaces.batch_draws();
+				require(drive_draw_clause(source.current_draw_clause,&clause_context,[&](unsigned pass,unsigned flags)
+				{
+					require(!pass&&flags==4,"Owned inline draw lost first-pass state");
+					const auto packet=rsx_draw_packet::capture(source,processor,layout,metadata,vertex,fragment,0,provoking_vertex::last,
+						[](const auto&,unsigned,unsigned)->std::pair<unsigned,unsigned>{throw std::runtime_error("Owned inline entered legacy input writer");},limits);
+					executor.execute(packet,targets,execution);
+					token=ctx.recording_submission();
+				},4,clause_cleanup_owner::rsx_thread_end)==1&&!clause_context.cleanups,"Owned inline pass cleaned up before submission");
+				const bool completion=owned_clause_requires_draw_completion(source.current_draw_clause,true);
+				require(!completion,"Owned inline still required GPU completion");
+				// The packet, registers, programs, vertex words and capture views
+				// all die before the GPU can execute its first instruction.
+				std::fill(source.current_draw_clause.inline_vertex_array.begin(),source.current_draw_clause.inline_vertex_array.end(),0xffffffffu);
+				std::fill(source.registers.begin(),source.registers.end(),0xffffffffu);std::fill(vertex.data.begin(),vertex.data.end(),0xffffffffu);
+				for(auto& constant:source.transform_constants)for(auto& word:constant)word=0xffffffffu;
+				std::fill(bytes.begin(),bytes.end(),std::byte{0xff});std::fill(positions.begin(),positions.end(),std::byte{0xff});
+				source.current_draw_clause.inline_vertex_array.clear();source.current_draw_clause.inline_vertex_array.shrink_to_fit();
+				source.registers.clear();source.registers.shrink_to_fit();vertex.data.clear();vertex.data.shrink_to_fit();
+				bytes.clear();bytes.shrink_to_fit();positions.clear();positions.shrink_to_fit();processor.descriptors={};limits.sparse_sources={};
+				if(outcome==3)
+				{
+					bool timed_out=false;try{batch.finish();}catch(const submission_wait_timeout&){timed_out=true;}
+					require(timed_out,"Frame-capture boundary did not retain its synchronous wait");++captures;
+				}
+				else if(outcome!=2)batch.submit();
+			}
+			source.current_draw_clause.post_execute_cleanup(&clause_context);
+			require(clause_context.cleanups==1&&!source.current_draw_clause.rendering,"Owned inline RSX cleanup was not exactly once");
+			if(outcome==2)
+			{
+				require(token&&token->cancelled()&&!surfaces.status(targets.colors[0]).pending&&surfaces.transaction_statistics().submitted==submissions,
+					"Abandoned inline recording was submitted or retained");++abandoned;
+			}
+			else
+			{
+				require(token&&!token->ready()&&!surfaces.poll_submitted()&&surfaces.status(targets.colors[0]).content_generation==before.content_generation&&
+					surfaces.transaction_statistics().submitted==submissions+1,"Owned inline submitted early metadata or waited for its closed GPU gate");
+				bool timed_out=false;try{surfaces.synchronize(1ms);}catch(const submission_wait_timeout&){timed_out=true;}
+				require(timed_out,"Owned inline lacks actual pending GPU work");++timeouts;
+				if(outcome==1)require(token->cancel_pending(),"Owned inline queued cancellation failed");
+				gate.signaledValue=1;bool rejected=false;try{surfaces.synchronize(30s);}catch(const std::runtime_error&){rejected=true;}
+				require(rejected==(outcome==1),"Owned inline publication/cancellation differs");
+				if(outcome==1){++cancelled;ctx.recover_completed_errors();}
+			}
+			surfaces.set_wait_timeout(30s);
+			const bool success=outcome==0||outcome==3;
+			require(!surfaces.status(targets.colors[0]).pending&&!surfaces.status(targets.colors[0]).faulted&&
+				surfaces.status(targets.colors[0]).content_generation==before.content_generation+(success?1+unsigned(cold):0),"Owned inline output generation/rollback differs");
+			surfaces.flush(targets.colors[0]);const auto actual=ram->read_surface(coverage).bytes;
+			const std::array<unsigned,4> pixel=success&&routing!=3&&routing!=5&&routing!=7?std::array{255u,64u,128u,192u}:cold?std::array{0u,0u,0u,0u}:std::array{255u,17u,34u,51u};
+			for(unsigned i=0;i<actual.size();++i)require(actual[i]==std::byte(pixel[i%4]),"Owned inline output/rollback sample differs after input destruction");
+			checked+=actual.size();++cases;
+		}
+		catch(const std::exception& e){throw std::runtime_error("Owned inline routing="+std::to_string(routing)+" mirror="+std::to_string(mirror)+" samples="+std::to_string(samples)+" cold="+std::to_string(cold)+" outcome="+std::to_string(outcome)+": "+e.what());}
+	}
+	std::cout<<"Owned inline retirement: "<<cases<<" normal/depth-mirror, 1/2/4-sample, existing/cold-target profiles; "<<timeouts<<" real pending GPU timeouts, "<<cancelled<<" queued cancellations, "<<abandoned<<" abandoned recordings, "<<captures<<" retained frame-capture waits, exactly one RSX cleanup and "<<checked<<" exact output/rollback bytes after packet/register/program/inline data destruction\n";
+}
+
 void verify_packed_high_vertices()
 {
 	context ctx;
@@ -1774,18 +3913,210 @@ void verify_packed_high_vertices()
 	std::cout << "Complete owned native draws:non-modulo high-ID window52bytes and20-bit base-wrapped sparse60bytes,exactly48needed VM source bytes per draw,no prefix requirements,all16RGBA8pixels exact passed\n";
 }
 } // namespace
-int main()
+int main(int argc, char** argv)
 {
 	@autoreleasepool
 	{
 		try
 		{
+			if (argc == 2 && std::string_view(argv[1]) == "--deferred-pipeline-only")
+			{
+				verify_separated_flat_draws(true);
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "--selection-rounding-only")
+			{
+				verify_owned_inline_retirement(9);
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "--comparisons-only")
+			{
+				verify_owned_inline_retirement(8);
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "--ex2-lit-only")
+			{
+				verify_owned_inline_retirement(7);
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "--scalar-math-only")
+			{
+				verify_owned_inline_retirement(6);
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "--legacy-math-only")
+			{
+				verify_owned_inline_retirement(5);
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "--address-add-only")
+			{
+				verify_owned_inline_retirement(4);
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "--address-rounding-only")
+			{
+				verify_owned_inline_retirement(3);
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "--indexed-vertex-output-only")
+			{
+				verify_owned_inline_retirement(2);
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "--scalar-dual-draws-only")
+			{
+				verify_owned_inline_retirement(true);
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "--owned-inline-retirement-only")
+			{
+				verify_owned_inline_retirement();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "--geometry-admission-only")
+			{
+				verify_versioned_upload_batch();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "--conditional-texture-only")
+			{
+				verify_predicated_texture_preparation();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "--cold-null-texture-only")
+			{
+				verify_owned_texture_boundary();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "--inline-assembly-only")
+			{
+				verify_inline_assemblies();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "--deferred-draw-retirement-only")
+			{
+				verify_deferred_draw_retirement();
+				verify_submitted_texture_independence();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "--completed-upload-dependencies-only")
+			{
+				verify_completed_inline_upload_dependencies();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "--inline-upload-dependencies-only")
+			{
+				verify_inline_upload_dependencies();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "--cold-framebuffer-only")
+			{
+				verify_cold_framebuffer();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "--spilled-framebuffer-only")
+			{
+				verify_spilled_framebuffer();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "--deferred-framebuffer-only")
+			{
+				verify_deferred_framebuffer();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "--draw-deferred-readers-only")
+			{
+				verify_draw_deferred_readers();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "--resident-framebuffer-only")
+			{
+				verify_resident_framebuffer();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "--inline-native-cast-only")
+			{
+				verify_inline_native_casts();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "--redirected-depth-only")
+			{
+				for (unsigned samples : {1u, 2u, 4u})
+					verify_pending_draw_capture(upload_outcome::inline_color, {}, {inline_cast_source::redirected_depth, false, samples});
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "--sample-raster-only")
+			{
+				for (unsigned samples : {2u, 4u})
+					verify_pending_draw_capture(upload_outcome::inline_color, {}, {inline_cast_source::redirected_depth, false, samples, true});
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "--split-planes-only")
+			{
+				for (unsigned samples : {2u, 4u})
+					verify_pending_draw_capture(upload_outcome::inline_color, {}, {inline_cast_source::redirected_depth, false, samples, false, true});
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "--inline-depth-vtc-only")
+			{
+				verify_inline_depth_and_vtc();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "--inline-texture-draw-only")
+			{
+				verify_inline_texture_draws();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "--cold-border-draw-only")
+			{
+				verify_pending_draw_capture(upload_outcome::border_helper);
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "--pending-texture-draw-only")
+			{
+				verify_pending_texture_draws();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "--completed-draw-waits-only")
+			{verify_ready_textured_draws(true);return 0;}
+			if (argc == 2 && std::string_view(argv[1]) == "--ready-textured-draw-only")
+			{
+				verify_ready_textured_draws();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "--conditional-only")
+			{
+				verify_separated_flat_draws();
+				return 0;
+			}
+			require(argc == 1, "Unknown native draw executor test selector");
 			verify_versioned_upload_batch();
 			verify_owned_texture_boundary();
 			verify_ready_texture_boundary();
 			verify_ready_textured_draws();
+			verify_predicated_texture_preparation();
 			verify_texture_writer_boundary();
-			verify_pending_draw_capture();
+			verify_pending_texture_draws();
+			verify_inline_texture_draws();
+			verify_inline_depth_and_vtc();
+			verify_inline_native_casts();
+			for (unsigned samples : {1u, 2u, 4u})
+				verify_pending_draw_capture(upload_outcome::inline_color, {}, {inline_cast_source::redirected_depth, false, samples});
+			for (unsigned samples : {2u, 4u})
+				verify_pending_draw_capture(upload_outcome::inline_color, {}, {inline_cast_source::redirected_depth, false, samples, true});
+			for (unsigned samples : {2u, 4u})
+				verify_pending_draw_capture(upload_outcome::inline_color, {}, {inline_cast_source::redirected_depth, false, samples, false, true});
+			verify_inline_assemblies();
+			verify_deferred_draw_retirement();
+			verify_submitted_texture_independence();
+			verify_inline_upload_dependencies();
+			verify_completed_inline_upload_dependencies();
+			verify_cold_framebuffer();
+			verify_spilled_framebuffer();
+			verify_deferred_framebuffer();
+			verify_draw_deferred_readers();
+			verify_resident_framebuffer();
 			verify_versioned_job_boundaries();
 			verify_versioned_job_callback_ownership();
 			verify_versioned_job_orphan();
@@ -1793,6 +4124,7 @@ int main()
 			verify_upload_batch_publication();
 			verify_native_cast_batch_publication();
 			verify_owned_raster();
+			verify_owned_inline_retirement();
 			verify_packed_high_vertices();
 			verify_separated_flat_draws();
 			context ctx{1};
@@ -1808,16 +4140,14 @@ int main()
 				const auto uploads = textures.statistics().uploads;
 				const auto budget_before = budget->statistics();
 				null_texture_family nulls;
-				@autoreleasepool
-				{
-					nulls = textures.null_images();
-					// Retire the completed source page and its autoreleased owners
-					// before checking the four persistent texture heaps exactly.
-					(void)ctx.trim_upload_pages();
-				}
+				@autoreleasepool { nulls = textures.null_images(); }
 				std::size_t null_bytes = 0;
 				for (const auto& image : nulls)
+				{
+					require(image.texture.storageMode == MTLStorageModeShared && image.texture.heap.storageMode == MTLStorageModeShared,
+						"CPU-initialized null texture must have budgeted shared backing");
 					null_bytes += image.texture.heap.size;
+				}
 				require(budget->statistics().reserved_bytes == budget_before.reserved_bytes + null_bytes &&
 							budget->statistics().live_heaps == budget_before.live_heaps + 4,
 						"Native null family bypassed shared heap accounting");
@@ -3233,9 +5563,9 @@ kernel void sample_nulls(device float4* out [[buffer(0)]],texture2d<float> one [
 							!guarded_surfaces.status(depth_original).native_write_epoch,
 						"Spill/VM refresh corrupted precision epoch");
 				verify_precise_depth(newer_precision);
-				require(!guarded_surfaces.status(depth_mirror).spilled && guarded_surfaces.status(depth_mirror).native_write_epoch == newer_epoch,
-						"Native spill restoration did not retain selected provenance");
-				std::cout << "Native clean mirror selection: original1/7 andnewer1/9 depth float bits beat quantized E4M12 VM aliases in32pixels,flush/spill/restore epochs retained\n";
+				require(guarded_surfaces.status(depth_mirror).spilled && guarded_surfaces.status(depth_mirror).native_write_epoch == newer_epoch,
+						"Direct spill snapshot restored its source or lost selected provenance");
+				std::cout << "Native clean mirror selection: original1/7 andnewer1/9 depth float bits beat quantized E4M12 VM aliases in32pixels,raw spill and native provenance retained\n";
 				guarded_surfaces.cpu_write({0x18000, 32}, std::array<std::byte, 32>{});
 				guarded_surfaces.prepare(depth_original);
 				guarded_surfaces.prepare(depth_mirror);

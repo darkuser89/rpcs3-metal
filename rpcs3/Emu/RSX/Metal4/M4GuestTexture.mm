@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 
 #if !__has_feature(objc_arc)
 #error "Native immutable texture ownership requires ARC."
@@ -71,9 +72,9 @@ struct conversion_parameters
 	std::uint32_t columns, rows, depth, width;
 	std::uint32_t block_bytes, swap_width, mode, morton;
 	std::array<std::uint32_t, 3> log2;
-	std::uint32_t reserved = 0;
+	std::array<std::uint32_t, 2> morton_inset{};
 };
-static_assert(sizeof(conversion_parameters) == 88 && offsetof(conversion_parameters, columns) == 40 &&
+static_assert(sizeof(conversion_parameters) == 96 && offsetof(conversion_parameters, columns) == 40 &&
 	offsetof(conversion_parameters, log2) == 72);
 constexpr std::string_view conversion_source = R"metal(
 #include <metal_stdlib>
@@ -81,7 +82,7 @@ using namespace metal;
 struct params {
     ulong source_offset,source_row,source_image,first,count;
     uint columns,rows,depth,width,block_bytes,swap_width,mode,morton;
-    uint log2[3],reserved;
+    uint log2[3],morton_inset[2];
 };
 kernel void convert_texture(device const uchar* src [[buffer(0)]],device uchar* dst [[buffer(1)]],
     constant params& p [[buffer(2)]],uint tid [[thread_position_in_grid]]) {
@@ -92,24 +93,42 @@ kernel void convert_texture(device const uchar* src [[buffer(0)]],device uchar* 
     if(p.morton==2u) {
         if(z<(p.depth&~3u)) address=p.source_offset+(z&~3ul)*p.source_image+4*(y*p.source_row+x*p.block_bytes)+(z&3ul)*p.block_bytes;
     } else if(p.morton) {
-        const ulong3 position(x,y,z);ulong index=0;uint output=0;
+        const ulong3 position(x+p.morton_inset[0],y+p.morton_inset[1],z);ulong index=0;uint output=0;
         for(uint bit=0;bit<max(max(p.log2[0],p.log2[1]),p.log2[2]);++bit)
             for(uint axis=0;axis<3;++axis)
                 if(bit<p.log2[axis]) index|=((position[axis]>>bit)&1ul)<<output++;
         address=p.source_offset+index*p.block_bytes;
     }
-    if(!p.mode) {
+    const uint mode=p.mode&3u;
+    if(!mode) {
         for(uint byte=0;byte<p.block_bytes;++byte)
             dst[ordinal*p.block_bytes+byte]=src[address+(byte^(p.swap_width-1))];
-    } else if(p.mode==1) {
+    } else if(mode==1) {
         uint v=(uint(src[address])<<8)|src[address+1];v=(v&0xf81fu)|((v&0x3e0u)<<1);
         dst[ordinal*2]=uchar(v);dst[ordinal*2+1]=uchar(v>>8);
     } else {
-        const uint blue=p.mode==2?src[address]:src[address+1];
-        const uint green=p.mode==2?src[address+2]:src[address+3];
-        for(uint lane=0;lane<2 && x*2+lane<p.width;++lane) {
-            const uint red=p.mode==2?src[address+1+lane*2]:src[address+lane*2];
-            const ulong output=((z*p.rows+y)*p.width+x*2+lane)*4;
+        const uint blue=mode==2?src[address]:src[address+1];
+        const uint green=mode==2?src[address+2]:src[address+3];
+        const bool border=(p.mode&4u)!=0u;
+        for(uint lane=0;lane<2;++lane) {
+            ulong pixel=x*2+lane;
+            if (border) {
+                // One block on each side stores two red lanes. Only the
+                // innermost lane belongs to the sampled one-texel ring.
+                if (x==0) {
+                    if (!lane) continue;
+                    pixel=0;
+                } else if (x+1==p.columns) {
+                    if (lane) continue;
+                    pixel=p.width-1;
+                } else {
+                    --pixel;
+                    if (pixel>=p.width-1) continue;
+                }
+            }
+            if (pixel>=p.width) continue;
+            const uint red=mode==2?src[address+1+lane*2]:src[address+lane*2];
+            const ulong output=((z*p.rows+y)*p.width+pixel)*4;
             dst[output]=uchar(blue);dst[output+1]=uchar(green);dst[output+2]=uchar(red);dst[output+3]=255;
         }
     }
@@ -121,7 +140,7 @@ kernel void decode_depth_volume(device const uchar* src [[buffer(0)]],device uin
     if(ulong(tid)>=p.count)return;const ulong ordinal=p.first+tid;
     const ulong x=ordinal%p.columns,y=(ordinal/p.columns)%p.rows,z=ordinal/(ulong(p.columns)*p.rows);
     ulong address=p.source_offset+z*p.source_image+y*p.source_row+x*p.block_bytes;
-    if(p.morton){const ulong3 position(x,y,z);ulong index=0;uint output=0;
+    if(p.morton){const ulong3 position(x+p.morton_inset[0],y+p.morton_inset[1],z);ulong index=0;uint output=0;
         for(uint bit=0;bit<max(max(p.log2[0],p.log2[1]),p.log2[2]);++bit)for(uint axis=0;axis<3;++axis)if(bit<p.log2[axis])index|=((position[axis]>>bit)&1ul)<<output++;
         address=p.source_offset+index*p.block_bytes;}
     uint raw=0;for(uint i=0;i<p.block_bytes;++i)raw=(raw<<8)|src[address+i];uint depth;
@@ -186,24 +205,65 @@ guest_texture_resolver::guest_texture_resolver(context& ctx, std::shared_ptr<gue
 
 	m_conversion = compile.compute(library, @"convert_texture");
 }
+namespace
+{
+std::array<std::size_t, 2> texture_image_extent(const guest_texture_layout& plan)
+{
+	if (uses_stored_border_mip_atlas(plan))
+		return plan_stored_border_mip_atlas(plan).extent;
+	const auto padding = plan.stored_border ? 2u : 0u;
+	return {plan.width + padding, plan.height + padding};
+}
+
+void validate_border_extent(const guest_texture_layout& plan, id<MTLDevice> device)
+{
+	const auto extent = texture_image_extent(plan);
+	const bool volume = plan.dimension == vertex_texture_dimension::three;
+	// Apple's Metal feature set tables list the same 3D limit for every
+	// supported Apple GPU family.
+	const auto limit = volume ? 2048 : max_2d_texture_dimension(device);
+	if (std::max({extent[0], extent[1], plan.depth}) > limit)
+		throw std::length_error("Stored-border image exceeds native texture dimensions");
+}
+} // namespace
+
 guest_texture_resolver::source guest_texture_resolver::prepare(const fragment_texture_registers& words) const
 {
 	const auto plan = plan_guest_texture(words);
 	if (plan.storage_bytes > m_limit)
 		throw std::length_error("Guest texture snapshot exceeds its explicit limit");
-	if (plan.stored_border || plan.adjusted_pitch)
-		throw std::invalid_argument("Stored-border/degenerate-pitch texture needs full native coordinate/cache policy");
+	const bool stored_volume = plan.stored_border && plan.dimension == vertex_texture_dimension::three;
+	if (plan.stored_border &&
+		(!supports_stored_border_storage(plan) ||
+			!texture_state_detail::stored_border_wrap(words.address & 15) ||
+			!texture_state_detail::stored_border_wrap((words.address >> 8) & 15)))
+		throw std::invalid_argument("Unsupported stored texture border layout or addressing");
+	if (plan.stored_border)
+		validate_border_extent(plan, m_context.device());
 	const bool dxt = plan.codec.block.width == 4;
 
 	if (dxt && !m_context.device().supportsBCTextureCompression)
 		throw std::invalid_argument("Native GPU lacks BC texture sampling");
 	for (const auto& s : plan.subresources)
-		if (plan.swizzled && plan.codec.block.width == 1)
-			(void)plan_swizzle({{s.columns, s.rows, s.depth}, {}, {s.columns, s.rows, s.depth}}, plan.codec.block.bytes);
+		if (guest_texture_morton_blocks(plan))
+			(void)plan_swizzle(guest_texture_swizzle_region(plan, guest_texture_image_subresource(plan, s)), plan.codec.block.bytes);
 	auto segments = texture_storage_segments(plan.offset, plan.location, plan.storage_bytes, m_translate);
 	std::vector<guest_surface_layout> coverage;
-	for (const auto& part : segments) coverage.push_back(guest_byte_coverage({part.address, part.size}));
-	return {plan, std::move(segments), std::move(coverage)};
+	std::vector<std::size_t> capture_offsets;
+	if (plan.stored_border && (plan.swizzled || uses_stored_border_mip_atlas(plan) || stored_volume))
+	{
+		auto active = project_stored_border_texture(plan, segments);
+		coverage.reserve(active.size());
+		capture_offsets.reserve(active.size());
+		for (auto& part : active)
+		{
+			coverage.push_back(std::move(part.coverage));
+			capture_offsets.push_back(part.offset);
+		}
+	}
+	else
+		for (const auto& part : segments) coverage.push_back(guest_byte_coverage({part.address, part.size}));
+	return {plan, std::move(segments), std::move(coverage), std::move(capture_offsets)};
 }
 
 void guest_texture_resolver::cpu_capture(const std::function<void()>& operation) const
@@ -254,19 +314,21 @@ captured_guest_texture guest_texture_resolver::capture(const fragment_texture_re
 		if (texture_storage_segments(input.plan.offset, input.plan.location, input.plan.storage_bytes, m_translate) != input.segments)
 			throw texture_revision_conflict();
 		revisions.clear();
-		for (std::size_t i = 0; i < input.segments.size(); ++i)
+		for (std::size_t i = 0; i < input.coverage.size(); ++i)
 		{
-			const auto& part = input.segments[i];
+			const auto offset = input.capture_offsets.empty() ? input.segments[i].offset : input.capture_offsets[i];
 			auto snapshot = m_memory->read_surface(input.coverage[i]);
-			if (snapshot.bytes.size() != part.size)
+			if (snapshot.bytes.size() != input.coverage[i].range.size)
 				throw std::runtime_error("VM texture snapshot has incomplete storage");
-			std::copy(snapshot.bytes.begin(), snapshot.bytes.end(), bytes.begin() + part.offset);
+			std::copy(snapshot.bytes.begin(), snapshot.bytes.end(), bytes.begin() + offset);
 			revisions.push_back(snapshot.revision);
 		}
 		if (!current(input, revisions)) throw texture_revision_conflict();
 	});
 	const auto& plan = input.plan;
 	texture_cache_state metadata;
+	metadata.stored_border_extent = guest_texture_stored_border_extent(plan);
+	metadata.stored_border_depth = guest_texture_stored_border_depth(plan);
 	metadata.actual_mips = static_cast<std::uint32_t>(plan.mips);
 	metadata.depth = bool(plan.codec.depth);
 	metadata.source_depth_format = plan.codec.depth ? static_cast<std::uint32_t>(*plan.codec.depth) : 0;
@@ -392,15 +454,22 @@ resolved_fragment_texture guest_texture_resolver::realize(const captured_guest_t
 id<MTLTexture> guest_texture_resolver::allocate(const guest_texture_layout& plan)
 {
 	const auto format = guest_texture_vtc(plan) ? MTLPixelFormatRGBA32Float : guest_texture_depth_volume(plan) ? MTLPixelFormatRG32Float : native_format(plan.codec.storage);
-	auto descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:plan.width height:plan.height mipmapped:NO];
+	const bool atlas = uses_stored_border_mip_atlas(plan);
+	const auto extent = texture_image_extent(plan);
+	if (plan.stored_border)
+		validate_border_extent(plan, m_context.device());
+	auto descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:extent[0] height:extent[1] mipmapped:NO];
 	descriptor.storageMode = MTLStorageModePrivate;
 	descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
 	if(guest_texture_vtc(plan))descriptor.usage |= MTLTextureUsageShaderWrite;
-	descriptor.mipmapLevelCount = plan.mips;
+	descriptor.mipmapLevelCount = atlas ? 1 : plan.mips;
 	if (plan.codec.depth && !guest_texture_depth_volume(plan))
 		descriptor.usage |= MTLTextureUsageRenderTarget;
 	if (plan.dimension == vertex_texture_dimension::cube)
-		descriptor.textureType = MTLTextureTypeCube;
+	{
+		descriptor.textureType = atlas ? MTLTextureType2DArray : MTLTextureTypeCube;
+		if (atlas) descriptor.arrayLength = plan.layers;
+	}
 	if (plan.dimension == vertex_texture_dimension::three)
 	{
 		descriptor.textureType = MTLTextureType3D;
@@ -408,119 +477,373 @@ id<MTLTexture> guest_texture_resolver::allocate(const guest_texture_layout& plan
 	}
 	return m_budget ? m_budget->texture(descriptor) : make_texture(m_context, descriptor);
 }
-void guest_texture_resolver::encode_depth_volume(const guest_texture_layout& plan,id<MTLBuffer> guest,id<MTLTexture> texture)
+void guest_texture_resolver::encode_buffer_conversion(id<MTLComputePipelineState> pipeline, id<MTLBuffer> source,
+	id<MTLBuffer> destination, const upload_slice& uniforms, std::size_t write_offset, std::size_t write_size, std::size_t threads)
 {
-	if(!guest||guest.device!=m_context.device()||guest.length<plan.storage_bytes||!texture||texture.device!=m_context.device()||texture.textureType!=MTLTextureType3D||texture.pixelFormat!=MTLPixelFormatRG32Float||texture.width!=plan.width||texture.height!=plan.height||texture.depth!=plan.depth||texture.mipmapLevelCount!=plan.mips)
-		throw std::invalid_argument("Depth volume upload lacks complete native storage");
-	std::size_t maximum=0;for(const auto& s:plan.subresources)maximum=std::max(maximum,checked_texture_product(checked_texture_product(s.width,s.height),checked_texture_product(s.depth,8)));
-	if(!m_depth_volume_decode){helper_catalog compile(m_context);const auto library=compile.library(conversion_source,@"Native RSX texture input conversion");m_depth_volume_decode=compile.compute(library,@"decode_depth_volume");}
-	const auto staging=make_buffer(m_context,maximum,buffer_storage::private_gpu);++m_upload_statistics.staging_buffers;m_upload_statistics.staging_bytes+=std::max(staging.length,staging.allocatedSize);
-	for(const auto& s:plan.subresources)
-	{
-		const auto texels=checked_texture_product(checked_texture_product(s.width,s.height),s.depth);const auto log2=plan.swizzled?plan_swizzle({{s.columns,s.rows,s.depth},{},{s.columns,s.rows,s.depth}},plan.codec.block.bytes).log2:std::array<std::uint32_t,3>{};
-		for(std::size_t first=0;first<texels;)
-		{
-			const auto count=std::min<std::size_t>(texels-first,1u<<30);const conversion_parameters params{s.offset,s.row_pitch,checked_texture_product(s.row_pitch,s.storage_rows),first,count,static_cast<std::uint32_t>(s.columns),static_cast<std::uint32_t>(s.rows),static_cast<std::uint32_t>(s.depth),static_cast<std::uint32_t>(s.width),static_cast<std::uint32_t>(plan.codec.block.bytes),1,static_cast<std::uint32_t>(*plan.codec.depth),plan.swizzled,log2,0};
-			const auto upload=m_context.upload(std::as_bytes(std::span{&params,1}),256);bindings resources;resources.set_buffer(0,guest);resources.set_buffer(1,staging);resources.set_buffer(2,upload.buffer,upload.offset);m_context.keep_alive(m_depth_volume_decode);const auto table=resources.snapshot(m_context);const auto encoder=m_context.compute();m_context.barrier(MTLStageBlit|MTLStageDispatch,MTLStageDispatch);[encoder setComputePipelineState:m_depth_volume_decode];[encoder setArgumentTable:table];[encoder dispatchThreads:MTLSizeMake(count,1,1) threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(256,m_depth_volume_decode.maxTotalThreadsPerThreadgroup),1,1)];++m_upload_statistics.conversion_dispatches;first+=count;
-		}
-		texture_region region;region.level=s.level;region.size=MTLSizeMake(s.width,s.height,s.depth);buffer_to_texture(m_context,staging,0,texture,region,s.width*8,s.width*s.height*8);++m_upload_statistics.subresources;++m_upload_statistics.depth_volume_subresources;m_upload_statistics.depth_volume_texels+=texels;
-	}
+	bindings arguments;
+	arguments.set_buffer(0, source);
+	arguments.set_buffer(1, destination);
+	arguments.set_buffer(2, uniforms.buffer, uniforms.offset);
+	const std::array accesses{
+		context::accessed_resource{source, 0, source.length},
+		context::accessed_resource{destination, write_offset, write_size, true},
+		context::accessed_resource{uniforms.buffer, uniforms.offset, uniforms.size}};
+	m_context.checked_dispatch(pipeline, arguments, accesses, MTLSizeMake(threads, 1, 1),
+		MTLSizeMake(std::min<NSUInteger>(256, pipeline.maxTotalThreadsPerThreadgroup), 1, 1));
 }
-void guest_texture_resolver::encode_depth_volume_plane(id<MTLTexture> source,const texture_region& region,id<MTLTexture> target,unsigned level,std::size_t z)
+
+guest_texture_resolver::prepared_depth_volume_plane guest_texture_resolver::prepare_depth_volume_plane(
+	id<MTLTexture> source, const texture_region& region)
+{
+	const auto format = source.pixelFormat;
+	const unsigned unit = format == MTLPixelFormatDepth16Unorm ? 2u : 4u;
+	const bool stencil = format == MTLPixelFormatDepth32Float_Stencil8;
+	const auto texels = checked_texture_product(region.size.width, region.size.height);
+	if (texels > (1u << 30)) throw std::length_error("Depth volume plane exceeds dispatch budget");
+	if (!m_depth_volume_interleave)
+	{
+		helper_catalog compile(m_context);
+		const auto library = compile.library(conversion_source, @"Native RSX texture input conversion");
+		m_depth_volume_interleave = compile.compute(library, @"interleave_depth_volume");
+	}
+	const auto depth = make_buffer(m_context, checked_texture_product(texels, unit), buffer_storage::private_gpu);
+	const auto stencil_data = stencil ? make_buffer(m_context, texels, buffer_storage::private_gpu) : depth;
+	const auto output = make_buffer(m_context, checked_texture_product(texels, 8), buffer_storage::private_gpu);
+	const std::array<std::uint64_t, 2> shape{texels, unit | (stencil ? 256u : 0u)};
+	return {depth, stencil_data, output, make_upload(m_context, std::as_bytes(std::span{&shape, 1}))};
+}
+
+void guest_texture_resolver::encode_depth_volume_plane(id<MTLTexture> source,const texture_region& region,id<MTLTexture> target,const texture_region& destination, const prepared_depth_volume_plane* prepared)
 {
 	const auto format=source.pixelFormat;const bool short_depth=format==MTLPixelFormatDepth16Unorm,stencil=format==MTLPixelFormatDepth32Float_Stencil8;
 	if(!target||target.pixelFormat!=MTLPixelFormatRG32Float||target.textureType!=MTLTextureType3D||(!short_depth&&format!=MTLPixelFormatDepth32Float&&!stencil)||region.size.depth!=1)
 		throw std::invalid_argument("Depth volume plane requires matching native depth/stencil source");
 	const auto texels=checked_texture_product(region.size.width,region.size.height);const unsigned unit=short_depth?2u:4u;if(texels>(1u<<30))throw std::length_error("Depth volume plane exceeds dispatch budget");
-	if(!m_depth_volume_interleave){helper_catalog compile(m_context);const auto library=compile.library(conversion_source,@"Native RSX texture input conversion");m_depth_volume_interleave=compile.compute(library,@"interleave_depth_volume");}
-	const auto depth=make_buffer(m_context,checked_texture_product(texels,unit),buffer_storage::private_gpu),output=make_buffer(m_context,checked_texture_product(texels,8),buffer_storage::private_gpu);const auto stencil_data=stencil?make_buffer(m_context,texels,buffer_storage::private_gpu):depth;
-	texture_to_buffer(m_context,source,region,depth,0,region.size.width*unit,0,texture_plane::depth);if(stencil)texture_to_buffer(m_context,source,region,stencil_data,0,region.size.width,0,texture_plane::stencil);
-	const std::array<std::uint64_t,2> shape{texels,unit|(stencil?256u:0u)};const auto upload=m_context.upload(std::as_bytes(std::span{&shape,1}),256);bindings resources;resources.set_buffer(0,depth);resources.set_buffer(1,stencil_data);resources.set_buffer(2,output);resources.set_buffer(3,upload.buffer,upload.offset);m_context.keep_alive(m_depth_volume_interleave);const auto table=resources.snapshot(m_context);const auto encoder=m_context.compute();m_context.barrier(MTLStageBlit|MTLStageDispatch,MTLStageDispatch);[encoder setComputePipelineState:m_depth_volume_interleave];[encoder setArgumentTable:table];[encoder dispatchThreads:MTLSizeMake(texels,1,1) threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(256,m_depth_volume_interleave.maxTotalThreadsPerThreadgroup),1,1)];
-	texture_region destination;destination.level=level;destination.origin=MTLOriginMake(0,0,z);destination.size=region.size;buffer_to_texture(m_context,output,0,target,destination,region.size.width*8,texels*8);++m_upload_statistics.depth_volume_plane_packs;
+	const auto local = prepared ? prepared_depth_volume_plane{} : prepare_depth_volume_plane(source, region);
+	const auto& storage = prepared ? *prepared : local;
+	const auto depth = storage.depth, stencil_data = storage.stencil, output = storage.output;
+	texture_to_buffer(m_context, source, region, depth, 0, region.size.width * unit, 0, texture_plane::depth);
+	if (stencil) texture_to_buffer(m_context, source, region, stencil_data, 0, region.size.width, 0, texture_plane::stencil);
+	const upload_slice upload{storage.uniforms, 0, storage.uniforms.length};
+	bindings resources;
+	resources.set_buffer(0, depth); resources.set_buffer(1, stencil_data);
+	resources.set_buffer(2, output); resources.set_buffer(3, upload.buffer, upload.offset);
+	const std::array accesses{
+		context::accessed_resource{depth, 0, depth.length},
+		context::accessed_resource{stencil_data, 0, stencil_data.length},
+		context::accessed_resource{output, 0, output.length, true},
+		context::accessed_resource{upload.buffer, upload.offset, upload.size}};
+	m_context.checked_dispatch(m_depth_volume_interleave, resources, accesses, MTLSizeMake(texels, 1, 1),
+		MTLSizeMake(std::min<NSUInteger>(256, m_depth_volume_interleave.maxTotalThreadsPerThreadgroup), 1, 1));
+	buffer_to_texture(m_context,output,0,target,destination,region.size.width*8,texels*8);++m_upload_statistics.depth_volume_plane_packs;
 }
-void guest_texture_resolver::encode_vtc(const guest_texture_layout& plan,id<MTLBuffer> guest,id<MTLTexture> texture)
+namespace
 {
-	if(!guest||guest.device!=m_context.device()||guest.length<plan.storage_bytes||!texture||texture.device!=m_context.device()||
-		texture.textureType!=MTLTextureType3D||texture.pixelFormat!=MTLPixelFormatRGBA32Float||texture.width!=plan.width||texture.height!=plan.height||texture.depth!=plan.depth||texture.mipmapLevelCount!=plan.mips)
-		throw std::invalid_argument("VTC upload lacks complete native source/destination storage");
-	std::size_t maximum=0;
-	for(const auto& s:plan.subresources)
+struct texture_upload_operation
+{
+	guest_texture_subresource subresource;
+	texture_region region;
+	std::size_t staging_bytes;
+	std::vector<conversion_parameters> conversions;
+};
+struct texture_upload_layout
+{
+	std::vector<texture_upload_operation> operations;
+	std::size_t staging_bytes = 0;
+};
+constexpr std::size_t texture_upload_uniform_alignment = 256;
+
+texture_upload_layout plan_texture_upload(const guest_texture_layout& plan, std::size_t source_size, MTLPixelFormat format)
+{
+	texture_upload_layout result;
+	result.operations.reserve(plan.subresources.size());
+	const auto block = storage_block(format, plan.codec.depth ? texture_plane::depth : texture_plane::all);
+	const auto atlas = uses_stored_border_mip_atlas(plan) ? std::optional{plan_stored_border_mip_atlas(plan)} : std::nullopt;
+	for (const auto& level : plan.subresources)
 	{
-		(void)guest_texture_block_offset(plan,s,s.columns-1,s.rows-1,s.depth-1);
-		maximum=std::max(maximum,checked_texture_product(checked_texture_product(s.columns,s.rows),checked_texture_product(s.depth,plan.codec.block.bytes)));
-	}
-	if(!m_vtc_decode){helper_catalog compile(m_context);const auto library=compile.library(conversion_source,@"Native RSX texture input conversion");m_vtc_decode=compile.compute(library,@"decode_vtc");}
-	auto descriptor=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:native_format(plan.codec.storage) width:plan.width height:plan.height mipmapped:NO];
-	descriptor.textureType=MTLTextureType2DArray;descriptor.arrayLength=plan.depth;descriptor.mipmapLevelCount=plan.mips;descriptor.storageMode=MTLStorageModePrivate;descriptor.usage=MTLTextureUsageShaderRead;
-	const auto compressed=m_budget?m_budget->texture(descriptor):make_texture(m_context,descriptor);++m_upload_statistics.vtc_array_images;
-	const auto staging=make_buffer(m_context,maximum,buffer_storage::private_gpu);++m_upload_statistics.staging_buffers;m_upload_statistics.staging_bytes+=std::max(staging.length,staging.allocatedSize);
-	for(const auto& s:plan.subresources)
-	{
-		const auto blocks=checked_texture_product(checked_texture_product(s.columns,s.rows),s.depth);
-		for(std::size_t first=0;first<blocks;)
+		const auto subresource = guest_texture_image_subresource(plan, level);
+		const auto& s = subresource;
+		const bool morton = guest_texture_morton_blocks(plan);
+		texture_region region;
+		region.level = s.level;
+		region.slice = s.face;
+		if (atlas)
 		{
-			const auto count=std::min<std::size_t>(blocks-first,1u<<30);
-			const conversion_parameters params{s.offset,s.row_pitch,checked_texture_product(s.row_pitch,s.storage_rows),first,count,
-				static_cast<std::uint32_t>(s.columns),static_cast<std::uint32_t>(s.rows),static_cast<std::uint32_t>(s.depth),static_cast<std::uint32_t>(s.width),static_cast<std::uint32_t>(plan.codec.block.bytes),1,0,2,{},0};
-			const auto upload=m_context.upload(std::as_bytes(std::span{&params,1}),256);bindings resources;resources.set_buffer(0,guest);resources.set_buffer(1,staging);resources.set_buffer(2,upload.buffer,upload.offset);m_context.keep_alive(m_conversion);const auto table=resources.snapshot(m_context);const auto encoder=m_context.compute();m_context.barrier(MTLStageBlit|MTLStageDispatch,MTLStageDispatch);[encoder setComputePipelineState:m_conversion];[encoder setArgumentTable:table];[encoder dispatchThreads:MTLSizeMake(count,1,1) threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(256,m_conversion.maxTotalThreadsPerThreadgroup),1,1)];
-			++m_upload_statistics.conversion_dispatches;m_upload_statistics.conversion_blocks+=count;first+=count;
+			const auto& origin = atlas->origins.at(s.level);
+			region.level = 0;
+			region.origin = MTLOriginMake(origin[0], origin[1], 0);
 		}
-		const auto row=checked_texture_product(s.columns,plan.codec.block.bytes),image=checked_texture_product(row,s.rows);
-		for(std::size_t z=0;z<s.depth;++z){texture_region region;region.level=s.level;region.slice=z;region.size=MTLSizeMake(s.width,s.height,1);buffer_to_texture(m_context,staging,z*image,compressed,region,row,image);}
-		const std::array<std::uint32_t,4> shape{static_cast<std::uint32_t>(s.width),static_cast<std::uint32_t>(s.height),static_cast<std::uint32_t>(s.depth),s.level};const auto upload=m_context.upload(std::as_bytes(std::span{&shape,1}),256);bindings resources;resources.set_texture(0,compressed);resources.set_texture(1,texture);resources.set_buffer(0,upload.buffer,upload.offset);m_context.keep_alive(m_vtc_decode);const auto table=resources.snapshot(m_context);const auto encoder=m_context.compute();m_context.barrier(MTLStageBlit|MTLStageDispatch,MTLStageDispatch);[encoder setComputePipelineState:m_vtc_decode];[encoder setArgumentTable:table];const NSUInteger x=std::min<NSUInteger>(8,m_vtc_decode.maxTotalThreadsPerThreadgroup);[encoder dispatchThreads:MTLSizeMake(s.width,s.height,s.depth) threadsPerThreadgroup:MTLSizeMake(x,std::min<NSUInteger>(8,m_vtc_decode.maxTotalThreadsPerThreadgroup/x),1)];
-		++m_upload_statistics.subresources;++m_upload_statistics.vtc_decode_dispatches;m_upload_statistics.vtc_texels+=s.width*s.height*s.depth;m_upload_statistics.converted_bytes+=image*s.depth;
-	}
-}
-void guest_texture_resolver::encode_upload(const guest_texture_layout& plan, id<MTLBuffer> guest, id<MTLTexture> texture)
-{
-	if(guest_texture_depth_volume(plan)){encode_depth_volume(plan,guest,texture);return;}
-	if(guest_texture_vtc(plan)){encode_vtc(plan,guest,texture);return;}
-	struct operation
-	{
-		const guest_texture_subresource* subresource;
-		texture_region region;
-		bool morton, direct;
-		std::size_t staging_bytes;
-	};
-	std::vector<operation> operations;
-	operations.reserve(plan.subresources.size());
-	std::size_t maximum_staging = 0;
-	if (!guest || guest.device != m_context.device() || guest.length < plan.storage_bytes)
-		throw std::invalid_argument("Native texture upload source does not own its complete layout");
-	for (const auto& s : plan.subresources)
-	{
-		const bool morton = plan.swizzled && plan.codec.block.width == 1;
-		texture_region region;
-		region.level = s.level; region.slice = s.face;
 		region.size = MTLSizeMake(s.width, s.height, s.depth);
-		const auto native_block = storage_block(texture.pixelFormat, plan.codec.depth ? texture_plane::depth : texture_plane::all);
-		const auto pitched_bytes = checked_texture_product(checked_texture_product(s.row_pitch, s.storage_rows), s.depth);
-		const bool direct = !morton && s.offset <= guest.length && pitched_bytes <= guest.length - s.offset &&
+		const auto slice_bytes = checked_texture_product(s.row_pitch, s.storage_rows);
+		const auto pitched_bytes = checked_texture_product(slice_bytes, s.depth);
+		const bool direct = !morton && s.offset <= source_size && pitched_bytes <= source_size - s.offset &&
 			(plan.codec.depth ? s.row_pitch % plan.codec.block.bytes == 0 :
-			!plan.codec.conversion && plan.codec.endian_width == 1 && s.offset % native_block.bytes == 0 && s.row_pitch % native_block.bytes == 0);
+			!plan.codec.conversion && plan.codec.endian_width == 1 && s.offset % block.bytes == 0 && s.row_pitch % block.bytes == 0);
 		const auto bytes = direct ? 0 : plan.codec.depth ?
 			transfer_layout({1, 1, plan.codec.block.bytes}, s.columns, s.rows, s.depth).allocation_size :
-			transfer_layout(native_block, s.width, s.height, s.depth).allocation_size;
-		maximum_staging = std::max(maximum_staging, bytes);
-		operations.push_back({&s, region, morton, direct, bytes});
+			transfer_layout(block, s.width, s.height, s.depth).allocation_size;
+		auto& op = result.operations.emplace_back(texture_upload_operation{s, region, bytes, {}});
+		result.staging_bytes = std::max(result.staging_bytes, bytes);
+		if (direct) continue;
+
+		std::array<std::uint32_t, 3> log2{};
+		std::array<std::uint32_t, 2> inset{};
+		if (morton)
+		{
+			const auto swizzle = guest_texture_swizzle_region(plan, s);
+			log2 = plan_swizzle(swizzle, plan.codec.block.bytes).log2;
+			inset = {static_cast<std::uint32_t>(swizzle.origin[0]), static_cast<std::uint32_t>(swizzle.origin[1])};
+		}
+		const auto blocks = checked_texture_product(checked_texture_product(s.columns, s.rows), s.depth);
+		const auto mode = plan.codec.conversion | (plan.codec.block.width == 2 && s.border ? 4u : 0u);
+		constexpr std::size_t max_count = 1u << 30;
+		for (std::size_t first = 0; first < blocks;)
+		{
+			const auto count = std::min(blocks - first, max_count);
+			op.conversions.push_back({s.offset, s.row_pitch, slice_bytes, first, count,
+				static_cast<std::uint32_t>(s.columns), static_cast<std::uint32_t>(s.rows), static_cast<std::uint32_t>(s.depth), static_cast<std::uint32_t>(s.width),
+				static_cast<std::uint32_t>(plan.codec.block.bytes), plan.codec.depth ? 1u : plan.codec.endian_width,
+				plan.codec.depth ? 0u : mode, morton ? 1u : 0u, log2, inset});
+			first += count;
+		}
 	}
-	// One bounded private scratch range for this upload, reused only after the
-	// prior native blit/codec reader. Dispatch|Blit -> Dispatch barriers enforce
-	// that ordering; argument bindings/completion retain the one allocation.
-	const auto staging = maximum_staging ? make_buffer(m_context, maximum_staging, buffer_storage::private_gpu) : nil;
+	return result;
+}
+texture_upload_layout plan_volume_upload(const guest_texture_layout& plan, bool vtc)
+{
+	texture_upload_layout result;
+	result.operations.reserve(plan.subresources.size());
+	const auto atlas = uses_stored_border_mip_atlas(plan) ? std::optional{plan_stored_border_mip_atlas(plan)} : std::nullopt;
+	for (const auto& subresource : plan.subresources)
+	{
+		const auto s = guest_texture_image_subresource(plan, subresource);
+		if (vtc) (void)guest_texture_block_offset(plan, s, s.columns - 1, s.rows - 1, s.depth - 1);
+		const auto width = vtc ? s.columns : s.width;
+		const auto height = vtc ? s.rows : s.height;
+		const auto count = checked_texture_product(checked_texture_product(width, height), s.depth);
+		const auto bytes = checked_texture_product(count, vtc ? plan.codec.block.bytes : 8u);
+		texture_region region;
+		region.level = s.level;
+		if (atlas)
+		{
+			const auto& origin = atlas->origins.at(s.level);
+			region.level = 0;
+			region.origin = MTLOriginMake(origin[0], origin[1], 0);
+		}
+		region.size = MTLSizeMake(s.width, s.height, s.depth);
+		auto& op = result.operations.emplace_back(texture_upload_operation{s, region, bytes, {}});
+		result.staging_bytes = std::max(result.staging_bytes, bytes);
+		std::array<std::uint32_t, 3> log2{};
+		std::array<std::uint32_t, 2> inset{};
+		if (!vtc && plan.swizzled)
+		{
+			const auto swizzle = guest_texture_swizzle_region(plan, s);
+			log2 = plan_swizzle(swizzle, plan.codec.block.bytes).log2;
+			inset = {static_cast<std::uint32_t>(swizzle.origin[0]), static_cast<std::uint32_t>(swizzle.origin[1])};
+		}
+		const auto pitch = checked_texture_product(s.row_pitch, s.storage_rows);
+		for (std::size_t first = 0; first < count;)
+		{
+			const auto chunk = std::min<std::size_t>(count - first, 1u << 30);
+			op.conversions.push_back({s.offset, s.row_pitch, pitch, first, chunk,
+				static_cast<std::uint32_t>(s.columns), static_cast<std::uint32_t>(s.rows),
+				static_cast<std::uint32_t>(s.depth), static_cast<std::uint32_t>(s.width),
+				static_cast<std::uint32_t>(plan.codec.block.bytes), 1, vtc ? 0u : static_cast<std::uint32_t>(*plan.codec.depth),
+				vtc ? 2u : unsigned(plan.swizzled), log2, inset});
+			first += chunk;
+		}
+	}
+	return result;
+}
+
+std::array<std::uint32_t, 4> vtc_shape(const guest_texture_subresource& s)
+{
+	return {static_cast<std::uint32_t>(s.width), static_cast<std::uint32_t>(s.height),
+		static_cast<std::uint32_t>(s.depth), s.level};
+}
+} // namespace
+
+struct guest_texture_resolver::prepared_vm_upload
+{
+	id<MTLTexture> texture, compressed;
+	id<MTLBuffer> source, staging, uniforms;
+	texture_upload_layout layout;
+	std::vector<surface_depth_transfer::transfer_storage> depth_planes;
+};
+
+void guest_texture_resolver::prepare_volume_decoder(bool vtc)
+{
+	auto& decoder = vtc ? m_vtc_decode : m_depth_volume_decode;
+	if (decoder) return;
+	helper_catalog compile(m_context);
+	const auto library = compile.library(conversion_source, @"Native RSX texture input conversion");
+	decoder = compile.compute(library, vtc ? @"decode_vtc" : @"decode_depth_volume");
+}
+
+id<MTLTexture> guest_texture_resolver::allocate_vtc_storage(const guest_texture_layout& plan)
+{
+	auto descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:native_format(plan.codec.storage)
+		width:plan.width height:plan.height mipmapped:NO];
+	descriptor.textureType = MTLTextureType2DArray;
+	descriptor.arrayLength = plan.depth;
+	descriptor.mipmapLevelCount = plan.mips;
+	descriptor.storageMode = MTLStorageModePrivate;
+	descriptor.usage = MTLTextureUsageShaderRead;
+	return m_budget ? m_budget->texture(descriptor) : make_texture(m_context, descriptor);
+}
+
+guest_texture_resolver::prepared_vm_upload guest_texture_resolver::prepare_vm_upload(const captured_guest_texture& snapshot)
+{
+	const auto texture = allocate(snapshot.m_plan);
+	return prepare_vm_upload(snapshot.m_plan, texture, make_upload(m_context, snapshot.m_bytes));
+}
+
+guest_texture_resolver::prepared_vm_upload guest_texture_resolver::prepare_vm_upload(const guest_texture_layout& plan, id<MTLTexture> texture, id<MTLBuffer> source)
+{
+	const bool vtc = guest_texture_vtc(plan);
+	const bool volume = vtc || guest_texture_depth_volume(plan);
+	auto layout = volume ? plan_volume_upload(plan, vtc) : plan_texture_upload(plan, source.length, texture.pixelFormat);
+	if (volume) prepare_volume_decoder(vtc);
+	const auto compressed = vtc ? allocate_vtc_storage(plan) : nil;
+	const auto staging = layout.staging_bytes ? make_buffer(m_context, layout.staging_bytes, buffer_storage::private_gpu) : nil;
+	id<MTLBuffer> uniforms = nil;
+	if (staging)
+	{
+		static_assert(sizeof(conversion_parameters) <= texture_upload_uniform_alignment);
+		std::size_t count = 0;
+		for (const auto& op : layout.operations) count += op.conversions.size() + unsigned(vtc);
+		uniforms = make_buffer(m_context, checked_texture_product(count, texture_upload_uniform_alignment), buffer_storage::shared);
+		auto* bytes = static_cast<std::byte*>(uniforms.contents);
+		const auto store = [&](const auto& params)
+		{
+			std::memcpy(bytes, &params, sizeof(params));
+			bytes += texture_upload_uniform_alignment;
+		};
+		for (const auto& op : layout.operations)
+		{
+			for (const auto& params : op.conversions) store(params);
+			if (vtc) store(vtc_shape(op.subresource));
+		}
+	}
+	std::vector<surface_depth_transfer::transfer_storage> depth_planes;
+	if (!volume && plan.codec.depth)
+	{
+		depth_planes.reserve(layout.operations.size());
+		for (const auto& op : layout.operations)
+		{
+			const auto& s = op.subresource;
+			const bool direct = op.conversions.empty();
+			depth_planes.push_back(m_depth.prepare_transfer(m_context, *plan.codec.depth, direct ? source : staging,
+				direct ? surface_byte_region{s.offset, s.row_pitch} : surface_byte_region{0, s.columns * plan.codec.block.bytes},
+				op.region, false));
+		}
+	}
+	return {texture, compressed, source, staging, uniforms, std::move(layout), std::move(depth_planes)};
+}
+
+void guest_texture_resolver::encode_volume_upload(const guest_texture_layout& plan, id<MTLBuffer> guest, id<MTLTexture> texture,
+	const prepared_vm_upload* prepared)
+{
+	const bool vtc = guest_texture_vtc(plan);
+	const auto extent = texture_image_extent(plan);
+	const auto levels = uses_stored_border_mip_atlas(plan) ? 1 : plan.mips;
+	if (!guest || guest.device != m_context.device() || guest.length < plan.storage_bytes || !texture ||
+		texture.device != m_context.device() || texture.textureType != MTLTextureType3D ||
+		texture.pixelFormat != (vtc ? MTLPixelFormatRGBA32Float : MTLPixelFormatRG32Float) ||
+		texture.width != extent[0] || texture.height != extent[1] || texture.depth != plan.depth || texture.mipmapLevelCount != levels)
+		throw std::invalid_argument("Volume upload lacks complete native source/destination storage");
+	const auto local = prepared ? texture_upload_layout{} : plan_volume_upload(plan, vtc);
+	const auto& layout = prepared ? prepared->layout : local;
+	if (!prepared) prepare_volume_decoder(vtc);
+	const auto compressed = prepared ? prepared->compressed : vtc ? allocate_vtc_storage(plan) : nil;
+	const auto staging = prepared ? prepared->staging : make_buffer(m_context, layout.staging_bytes, buffer_storage::private_gpu);
+	++m_upload_statistics.staging_buffers;
+	m_upload_statistics.staging_bytes += std::max(staging.length, staging.allocatedSize);
+	if (vtc) ++m_upload_statistics.vtc_array_images;
+	std::size_t offset = 0;
+	const auto uniform = [&](const auto& params)
+	{
+		if (!prepared) return m_context.upload(std::as_bytes(std::span{&params, 1}), texture_upload_uniform_alignment);
+		const upload_slice slice{prepared->uniforms, offset, sizeof(params)};
+		offset += texture_upload_uniform_alignment;
+		return slice;
+	};
+	for (const auto& op : layout.operations)
+	{
+		const auto& s = op.subresource;
+		const unsigned stride = vtc ? plan.codec.block.bytes : 8u;
+		for (const auto& params : op.conversions)
+		{
+			encode_buffer_conversion(vtc ? m_conversion : m_depth_volume_decode, guest, staging, uniform(params),
+				params.first * stride, params.count * stride, params.count);
+			++m_upload_statistics.conversion_dispatches;
+			if (vtc) m_upload_statistics.conversion_blocks += params.count;
+		}
+		++m_upload_statistics.subresources;
+		if (!vtc)
+		{
+			buffer_to_texture(m_context, staging, 0, texture, op.region, s.width * 8, s.width * s.height * 8);
+			++m_upload_statistics.depth_volume_subresources;
+			m_upload_statistics.depth_volume_texels += op.staging_bytes / 8;
+			continue;
+		}
+		const auto row = checked_texture_product(s.columns, stride);
+		const auto image = checked_texture_product(row, s.rows);
+		for (std::size_t z = 0; z < s.depth; ++z)
+		{
+			auto region = op.region;
+			region.slice = z;
+			region.size.depth = 1;
+			buffer_to_texture(m_context, staging, z * image, compressed, region, row, image);
+		}
+		const auto upload = uniform(vtc_shape(s));
+		bindings resources;
+		resources.set_texture(0, compressed);
+		resources.set_texture(1, texture);
+		resources.set_buffer(0, upload.buffer, upload.offset);
+		const std::array accesses{
+			context::accessed_resource{compressed},
+			context::accessed_resource{texture, 0, 0, true},
+			context::accessed_resource{upload.buffer, upload.offset, upload.size}};
+		const NSUInteger x = std::min<NSUInteger>(8, m_vtc_decode.maxTotalThreadsPerThreadgroup);
+		m_context.checked_dispatch(m_vtc_decode, resources, accesses, MTLSizeMake(s.width, s.height, s.depth),
+			MTLSizeMake(x, std::min<NSUInteger>(8, m_vtc_decode.maxTotalThreadsPerThreadgroup / x), 1));
+		++m_upload_statistics.vtc_decode_dispatches;
+		m_upload_statistics.vtc_texels += s.width * s.height * s.depth;
+		m_upload_statistics.converted_bytes += op.staging_bytes;
+	}
+}
+
+void guest_texture_resolver::encode_upload(const guest_texture_layout& plan, id<MTLBuffer> guest, id<MTLTexture> texture,
+	const prepared_vm_upload* prepared)
+{
+	if (guest_texture_depth_volume(plan) || guest_texture_vtc(plan))
+	{
+		encode_volume_upload(plan, guest, texture, prepared);
+		return;
+	}
+	if (!guest || guest.device != m_context.device() || guest.length < plan.storage_bytes)
+		throw std::invalid_argument("Native texture upload source does not own its complete layout");
+	const auto local = prepared ? texture_upload_layout{} : plan_texture_upload(plan, guest.length, texture.pixelFormat);
+	const auto& layout = prepared ? prepared->layout : local;
+	// Reuse the private scratch only after the prior blit or codec reader.
+	const auto staging = prepared ? prepared->staging :
+		layout.staging_bytes ? make_buffer(m_context, layout.staging_bytes, buffer_storage::private_gpu) : nil;
 	if (staging)
 	{
 		++m_upload_statistics.staging_buffers;
 		m_upload_statistics.staging_bytes += std::max(staging.length, staging.allocatedSize);
 	}
-	for (const auto& op : operations)
+	std::size_t uniform_offset = 0, plane_index = 0;
+	for (const auto& op : layout.operations)
 	{
-		const auto& s = *op.subresource;
-		if (op.direct)
+		const auto& s = op.subresource;
+		if (op.conversions.empty())
 		{
 			if (plan.codec.depth)
 			{
-				m_depth.upload(m_context, *plan.codec.depth, guest, {s.offset, s.row_pitch}, texture, op.region);
+				m_depth.upload_impl(m_context, *plan.codec.depth, guest, {s.offset, s.row_pitch}, texture, op.region,
+					prepared ? &prepared->depth_planes[plane_index++] : nullptr);
 				++m_upload_statistics.depth_subresources;
 			}
 			else
@@ -532,34 +855,20 @@ void guest_texture_resolver::encode_upload(const guest_texture_layout& plan, id<
 		}
 		else
 		{
-			std::array<std::uint32_t, 3> log2{};
-			if (op.morton) log2 = plan_swizzle({{s.columns, s.rows, s.depth}, {}, {s.columns, s.rows, s.depth}}, plan.codec.block.bytes).log2;
-			const auto blocks = checked_texture_product(checked_texture_product(s.columns, s.rows), s.depth);
-			constexpr std::size_t max_count = 1u << 30;
-			for (std::size_t first = 0; first < blocks;)
+			for (const auto& params : op.conversions)
 			{
-				const auto count = std::min(blocks - first, max_count);
-				const conversion_parameters params{s.offset, s.row_pitch, checked_texture_product(s.row_pitch, s.storage_rows), first, count,
-					static_cast<std::uint32_t>(s.columns), static_cast<std::uint32_t>(s.rows), static_cast<std::uint32_t>(s.depth), static_cast<std::uint32_t>(s.width),
-					static_cast<std::uint32_t>(plan.codec.block.bytes), plan.codec.depth ? 1u : plan.codec.endian_width,
-					plan.codec.depth ? 0u : plan.codec.conversion, op.morton ? 1u : 0u, log2};
-				const auto uniforms = m_context.upload(std::as_bytes(std::span{&params, 1}), 256);
-				bindings resources;
-				resources.set_buffer(0, guest); resources.set_buffer(1, staging); resources.set_buffer(2, uniforms.buffer, uniforms.offset);
-				m_context.keep_alive(m_conversion);
-				const auto arguments = resources.snapshot(m_context);
-				const auto encoder = m_context.compute();
-				m_context.barrier(MTLStageBlit | MTLStageDispatch, MTLStageDispatch);
-				[encoder setComputePipelineState:m_conversion]; [encoder setArgumentTable:arguments];
-				[encoder dispatchThreads:MTLSizeMake(count, 1, 1)
-					threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(256, m_conversion.maxTotalThreadsPerThreadgroup), 1, 1)];
-				++m_upload_statistics.conversion_dispatches; m_upload_statistics.conversion_blocks += count;
-				first += count;
+				const auto uniforms = prepared ? upload_slice{prepared->uniforms, uniform_offset, sizeof(params)} :
+					m_context.upload(std::as_bytes(std::span{&params, 1}), texture_upload_uniform_alignment);
+				uniform_offset += texture_upload_uniform_alignment;
+				encode_buffer_conversion(m_conversion, guest, staging, uniforms, 0, op.staging_bytes, params.count);
+				++m_upload_statistics.conversion_dispatches;
+				m_upload_statistics.conversion_blocks += params.count;
 			}
 			m_upload_statistics.converted_bytes += op.staging_bytes;
 			if (plan.codec.depth)
 			{
-				m_depth.upload(m_context, *plan.codec.depth, staging, {0, s.columns * plan.codec.block.bytes}, texture, op.region);
+				m_depth.upload_impl(m_context, *plan.codec.depth, staging, {0, s.columns * plan.codec.block.bytes}, texture, op.region,
+					prepared ? &prepared->depth_planes[plane_index++] : nullptr);
 				++m_upload_statistics.depth_subresources;
 			}
 			else
@@ -594,7 +903,7 @@ guest_texture_resolver::native_cast_input guest_texture_resolver::prepare_cast(c
 	auto tight = plan;
 	tight.swizzled = false;
 	tight.storage_bytes = packed_size;
-	tight.subresources = {{row_offset, packed_size - row_offset, packed_row, plan.width, plan.height, 1, level.columns, rows, rows, 0, 0, 0}};
+	tight.subresources = {{row_offset, packed_size - row_offset, packed_row, plan.width, plan.height, 1, level.columns, rows, rows, 0, 0, level.border}};
 	auto result=native_cast_input{plan, std::move(tight), format, source, metadata, row_offset};result.source_rectangle=rectangle;return result;
 }
 void guest_texture_resolver::prepare_display_helpers(bool morton,bool holes,bool assembly,bool banked)
@@ -638,41 +947,99 @@ guest_texture_resolver::native_cast_input guest_texture_resolver::prepare_morton
 	prepare_display_helpers(true,!patches.empty(),false);
 	return {plan, std::move(packed), format, source, {}, 0, layout, std::move(patches), std::move(patch_bytes)};
 }
-void guest_texture_resolver::encode_cast(const native_cast_input& input, id<MTLTexture> texture)
+struct guest_texture_resolver::prepared_native_cast
 {
-	if(input.assembly){encode_texture_assembly(*input.assembly,texture);return;}
-	const auto packed = make_buffer(m_context, input.packed.storage_bytes, buffer_storage::private_gpu);
+	prepared_vm_upload upload;
+	std::variant<surface_color_transfer::download_storage, surface_depth_transfer::transfer_storage> source;
+	std::optional<prepared_texture_assembly> assembly;
+};
+
+texture_region guest_texture_resolver::cast_source_region(const native_cast_input& input)
+{
 	texture_region region;
-	region.size = MTLSizeMake(input.source.width, input.source.height, 1);
-	if(input.source_rectangle.width){region.origin=MTLOriginMake(input.source_rectangle.x,input.source_rectangle.y,0);region.size=MTLSizeMake(input.source_rectangle.width,input.source_rectangle.height,1);}
+	if (input.source_rectangle.width)
+	{
+		const auto& rectangle = input.source_rectangle;
+		region.origin = MTLOriginMake(rectangle.x, rectangle.y, 0);
+		region.size = MTLSizeMake(rectangle.width, rectangle.height, 1);
+	}
+	else
+		region.size = MTLSizeMake(input.source.width, input.source.height, 1);
+	return region;
+}
+
+guest_texture_resolver::prepared_native_cast guest_texture_resolver::prepare_draw_cast(const native_cast_input& input)
+{
+	if (input.assembly)
+	{
+		auto assembly = prepare_draw_assembly(*input.assembly);
+		prepared_vm_upload output{};
+		output.texture = assembly.texture;
+		return {std::move(output), {}, std::move(assembly)};
+	}
+	const auto packed = make_buffer(m_context, input.packed.storage_bytes, buffer_storage::private_gpu);
+	auto upload = prepare_vm_upload(input.packed, allocate(input.plan), packed);
+	const auto region = cast_source_region(input);
+	const surface_byte_region bytes{0, input.packed.subresources[0].row_pitch};
+	if (const auto color = std::get_if<surface_color>(&input.format))
+		return {std::move(upload), m_color.prepare_download(m_context, *color, region, packed, bytes), {}};
+	return {std::move(upload), m_depth.prepare_transfer(m_context, std::get<surface_depth>(input.format), packed, bytes, region, true), {}};
+}
+
+void guest_texture_resolver::encode_cast(const native_cast_input& input, id<MTLTexture> texture, const prepared_native_cast* prepared)
+{
+	if (input.assembly)
+	{
+		encode_texture_assembly(*input.assembly, texture, prepared ? &*prepared->assembly : nullptr);
+		return;
+	}
+	const auto packed = prepared ? prepared->upload.source : make_buffer(m_context, input.packed.storage_bytes, buffer_storage::private_gpu);
+	const auto region = cast_source_region(input);
 	const auto packed_row = input.display_morton ? checked_texture_product(input.source.width, color_layout(std::get<surface_color>(input.format)).pixel_bytes) :
 		input.packed.subresources[0].row_pitch;
 	const auto linear = input.display_morton ? make_buffer(m_context, checked_texture_product(packed_row, input.source.height), buffer_storage::private_gpu) : packed;
 	if (const auto color = std::get_if<surface_color>(&input.format))
-		m_color.download(m_context, *color, input.source, region, linear, {0, packed_row});
+		m_color.download_impl(m_context, *color, input.source, region, linear, {0, packed_row},
+			prepared ? &std::get<surface_color_transfer::download_storage>(prepared->source) : nullptr);
 	else
-		m_depth.download(m_context, std::get<surface_depth>(input.format), input.source, region, packed, {0, packed_row});
+		m_depth.download_impl(m_context, std::get<surface_depth>(input.format), input.source, region, packed, {0, packed_row},
+			prepared ? &std::get<surface_depth_transfer::transfer_storage>(prepared->source) : nullptr);
 	if (input.display_morton)
 		m_display_swizzle->convert(m_context, packed, 0, linear, 0, *input.display_morton,
 			color_layout(std::get<surface_color>(input.format)).pixel_bytes, 0, 0, true);
-	encode_display_holes(packed,input.display_vm_patches,input.display_vm_bytes);
-	encode_upload(input.packed, packed, texture);
+	encode_display_holes(packed, input.display_vm_patches, input.display_vm_bytes);
+	encode_upload(input.packed, packed, texture, prepared ? &prepared->upload : nullptr);
 }
-void guest_texture_resolver::encode_display_holes(id<MTLBuffer> target,std::span<const display_byte_patch> holes,std::span<const std::byte> bytes)
+guest_texture_resolver::prepared_display_holes guest_texture_resolver::prepare_display_holes(
+	std::span<const display_byte_patch> holes, std::span<const std::byte> bytes)
+{
+	if (holes.empty()) return {};
+	const std::array<std::uint64_t, 2> shape{bytes.size(), holes.size()};
+	return {make_upload(m_context, bytes), make_upload(m_context, std::as_bytes(holes)),
+		make_upload(m_context, std::as_bytes(std::span{shape}))};
+}
+
+void guest_texture_resolver::encode_display_holes(id<MTLBuffer> target,std::span<const display_byte_patch> holes,std::span<const std::byte> bytes,
+	const prepared_display_holes* prepared)
 {
 	if (!holes.empty())
 	{
 		static_assert(sizeof(display_byte_patch) == 24);
-		const auto payload = m_context.upload(bytes, 256);
-		const auto patches = m_context.upload(std::as_bytes(holes), 256);
+		const auto payload = prepared ? upload_slice{prepared->payload, 0, bytes.size()} : m_context.upload(bytes, 256);
+		const auto patches = prepared ? upload_slice{prepared->patches, 0, std::as_bytes(holes).size()} :
+			m_context.upload(std::as_bytes(holes), 256);
 		const std::array<std::uint64_t, 2> shape{bytes.size(),holes.size()};
-		const auto sizes = m_context.upload(std::as_bytes(std::span{shape}), 256);
+		const auto sizes = prepared ? upload_slice{prepared->sizes, 0, sizeof(shape)} :
+			m_context.upload(std::as_bytes(std::span{shape}), 256);
 		bindings resources; resources.set_buffer(0,payload.buffer,payload.offset); resources.set_buffer(1,target);
 		resources.set_buffer(2,patches.buffer,patches.offset); resources.set_buffer(3,sizes.buffer,sizes.offset);
-		m_context.keep_alive(m_display_hole_scatter); const auto table = resources.snapshot(m_context);
-		const auto encoder = m_context.compute(); m_context.barrier(MTLStageDispatch | MTLStageBlit, MTLStageDispatch);
-		[encoder setComputePipelineState:m_display_hole_scatter]; [encoder setArgumentTable:table];
-		[encoder dispatchThreads:MTLSizeMake(shape[0],1,1) threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(256,m_display_hole_scatter.maxTotalThreadsPerThreadgroup),1,1)];
+		const std::array accesses{
+			context::accessed_resource{payload.buffer, payload.offset, payload.size},
+			context::accessed_resource{target, 0, target.length, true},
+			context::accessed_resource{patches.buffer, patches.offset, patches.size},
+			context::accessed_resource{sizes.buffer, sizes.offset, sizes.size}};
+		m_context.checked_dispatch(m_display_hole_scatter, resources, accesses, MTLSizeMake(shape[0], 1, 1),
+			MTLSizeMake(std::min<NSUInteger>(256, m_display_hole_scatter.maxTotalThreadsPerThreadgroup), 1, 1));
 	}
 }
 guest_texture_resolver::display_assembly_input guest_texture_resolver::prepare_display_assembly(const guest_texture_layout& plan,
@@ -744,36 +1111,147 @@ guest_texture_resolver::display_assembly_input guest_texture_resolver::prepare_d
 	if(next!=target_ranges.size())throw std::invalid_argument("Display assembly writes outside active AV bytes");
 	prepare_display_helpers(morton,!assembly.vm.empty(),true,banked);return result;
 }
-void guest_texture_resolver::encode_display_assembly(const display_assembly_input& input,id<MTLTexture> output)
+struct guest_texture_resolver::prepared_display_assembly
 {
-	const auto target=make_buffer(m_context,input.plan.storage_bytes,buffer_storage::private_gpu);
-	const auto raw=make_buffer(m_context,input.raw_bytes,buffer_storage::private_gpu);
-	const auto linear=input.linear_bytes?make_buffer(m_context,input.linear_bytes,buffer_storage::private_gpu):nil;
+	struct source_storage
+	{
+		std::variant<surface_color_transfer::download_storage, surface_depth_transfer::transfer_storage,
+			surface_banked_transfer::download_storage> pack;
+		id<MTLBuffer> copies, sizes;
+		std::vector<id<MTLBuffer>> morton;
+	};
+	prepared_vm_upload upload;
+	id<MTLBuffer> raw, linear;
+	std::vector<source_storage> sources;
+	prepared_display_holes holes;
+};
+
+guest_texture_resolver::prepared_display_assembly guest_texture_resolver::prepare_draw_display_assembly(
+	const display_assembly_input& input, id<MTLTexture> output)
+{
+	const auto target = make_buffer(m_context, input.plan.storage_bytes, buffer_storage::private_gpu);
+	const auto raw = make_buffer(m_context, input.raw_bytes, buffer_storage::private_gpu);
+	const auto linear = input.linear_bytes ? make_buffer(m_context, input.linear_bytes, buffer_storage::private_gpu) : nil;
+	prepared_display_assembly prepared{prepare_vm_upload(input.plan, output, target), raw, linear, {},
+		prepare_display_holes(input.vm_patches, input.vm_bytes)};
+	prepared.sources.reserve(input.native.size());
+	for (const auto& source : input.native)
+	{
+		texture_region region;
+		region.size = MTLSizeMake(source.geometry.width, source.geometry.height, 1);
+		const surface_byte_region bytes{0, source.tight_pitch};
+		const auto copies = make_upload(m_context, std::as_bytes(std::span{source.copies}));
+		const std::array<std::uint64_t, 2> shape{source.copies.back().ordinal + source.copies.back().size, source.copies.size()};
+		const auto sizes = make_upload(m_context, std::as_bytes(std::span{shape}));
+		if (source.tile)
+		{
+			auto geometry = source.geometry;
+			geometry.range = {source.tile->address, source.tile->size};
+			auto pack = m_display_banked->prepare_download(m_context, source.format, region, raw, geometry, *source.tile);
+			prepared.sources.push_back({std::move(pack), copies, sizes, {}});
+			continue;
+		}
+		const auto packed = source.geometry.morton ? linear : raw;
+		auto morton = source.geometry.morton ? m_display_swizzle->prepare_conversion(m_context,
+			*source.geometry.morton, source.geometry.pixel_bytes, true) : std::vector<id<MTLBuffer>>{};
+		if (const auto color = std::get_if<surface_color>(&source.format))
+			prepared.sources.push_back({m_color.prepare_download(m_context, *color, region, packed, bytes), copies, sizes, std::move(morton)});
+		else
+			prepared.sources.push_back({m_depth.prepare_transfer(m_context, std::get<surface_depth>(source.format), packed, bytes, region, true), copies, sizes, std::move(morton)});
+	}
+	return prepared;
+}
+
+guest_texture_resolver::prepared_assembly_slice guest_texture_resolver::prepare_assembly_source(const texture_assembly_slice& slice)
+{
+	prepared_assembly_slice result;
+	if (slice.bytes)
+	{
+		result.image = allocate(slice.plane.view);
+		result.encode_source = [this, input = slice.bytes, storage = prepare_draw_display_assembly(*slice.bytes, result.image)]
+		{
+			encode_display_assembly(*input, storage.upload.texture, &storage);
+		};
+	}
+	else if (slice.vm)
+	{
+		auto storage = prepare_vm_upload(*slice.vm);
+		result.image = storage.texture;
+		result.encode_source = [this, plan = slice.vm->m_plan, storage = std::move(storage)]
+		{
+			encode_upload(plan, storage.source, storage.texture, &storage);
+		};
+	}
+	else if (slice.cast)
+	{
+		auto storage = prepare_draw_cast(*slice.cast);
+		result.image = storage.upload.texture;
+		result.encode_source = [this, input = *slice.cast, storage = std::move(storage)]
+		{
+			encode_cast(input, storage.upload.texture, &storage);
+		};
+	}
+	else
+	{
+		const auto& rect = slice.region.pixels;
+		result.image = slice.native->texture();
+		result.source.origin = MTLOriginMake(rect.x, rect.y, 0);
+		result.source.size = MTLSizeMake(rect.width, rect.height, 1);
+		return result;
+	}
+	result.source.size = MTLSizeMake(result.image.width, result.image.height, 1);
+	return result;
+}
+
+void guest_texture_resolver::encode_display_assembly(const display_assembly_input& input,id<MTLTexture> output, const prepared_display_assembly* prepared)
+{
+	const auto target = prepared ? prepared->upload.source : make_buffer(m_context,input.plan.storage_bytes,buffer_storage::private_gpu);
+	const auto raw = prepared ? prepared->raw : make_buffer(m_context,input.raw_bytes,buffer_storage::private_gpu);
+	const auto linear = prepared ? prepared->linear : input.linear_bytes ? make_buffer(m_context,input.linear_bytes,buffer_storage::private_gpu) : nil;
+	std::size_t source_index = 0;
 	for(const auto& source:input.native)
 	{
+		const auto* storage = prepared ? &prepared->sources.at(source_index++) : nullptr;
 		texture_region region;region.size=MTLSizeMake(source.geometry.width,source.geometry.height,1);
 		if(source.tile)
 		{
-			auto storage=source.geometry;storage.range={source.tile->address,source.tile->size};
-			if(const auto* color=std::get_if<surface_color>(&source.format))m_display_banked->download_color(m_context,*color,source.texture,region,raw,storage,*source.tile);
-			else m_display_banked->download_depth(m_context,std::get<surface_depth>(source.format),source.texture,region,raw,storage,*source.tile);
+			auto geometry = source.geometry;
+			geometry.range = {source.tile->address, source.tile->size};
+			const auto* pack = storage ? &std::get<surface_banked_transfer::download_storage>(storage->pack) : nullptr;
+			if (const auto* color = std::get_if<surface_color>(&source.format))
+				m_display_banked->download_color_impl(m_context, *color, source.texture, region, raw, geometry, *source.tile, pack);
+			else
+				m_display_banked->download_depth_impl(m_context, std::get<surface_depth>(source.format), source.texture, region, raw, geometry, *source.tile, pack);
 		}
 		else
 		{
-			if(const auto* color=std::get_if<surface_color>(&source.format))m_color.download(m_context,*color,source.texture,region,source.geometry.morton?linear:raw,{0,source.tight_pitch});
-			else m_depth.download(m_context,std::get<surface_depth>(source.format),source.texture,region,source.geometry.morton?linear:raw,{0,source.tight_pitch});
-			if(source.geometry.morton)m_display_swizzle->convert(m_context,raw,0,linear,0,*source.geometry.morton,source.geometry.pixel_bytes,0,0,true);
+			const auto packed = source.geometry.morton ? linear : raw;
+			if (const auto* color = std::get_if<surface_color>(&source.format))
+				m_color.download_impl(m_context, *color, source.texture, region, packed, {0, source.tight_pitch},
+					storage ? &std::get<surface_color_transfer::download_storage>(storage->pack) : nullptr);
+			else
+				m_depth.download_impl(m_context, std::get<surface_depth>(source.format), source.texture, region, packed, {0, source.tight_pitch},
+					storage ? &std::get<surface_depth_transfer::transfer_storage>(storage->pack) : nullptr);
+			if (source.geometry.morton)
+				m_display_swizzle->convert_impl(m_context, raw, 0, linear, 0, *source.geometry.morton,
+					source.geometry.pixel_bytes, 0, 0, true, 1, storage ? std::span<const id<MTLBuffer>>{storage->morton} : std::span<const id<MTLBuffer>>{});
 		}
 		static_assert(sizeof(display_buffer_copy)==32);
-		const auto copies=m_context.upload(std::as_bytes(std::span{source.copies}),256);
+		const auto copy_bytes = std::as_bytes(std::span{source.copies});
+		const auto copies = storage ? upload_slice{storage->copies, 0, copy_bytes.size()} : m_context.upload(copy_bytes, 256);
 		const std::array<std::uint64_t,2> shape{source.copies.back().ordinal+source.copies.back().size,source.copies.size()};
-		const auto sizes=m_context.upload(std::as_bytes(std::span{shape}),256);
+		const auto sizes = storage ? upload_slice{storage->sizes, 0, sizeof(shape)} : m_context.upload(std::as_bytes(std::span{shape}), 256);
 		bindings resources;resources.set_buffer(0,raw);resources.set_buffer(1,target);resources.set_buffer(2,copies.buffer,copies.offset);resources.set_buffer(3,sizes.buffer,sizes.offset);
-		m_context.keep_alive(m_display_storage_copy);const auto table=resources.snapshot(m_context);const auto encoder=m_context.compute();
-		m_context.barrier(MTLStageDispatch|MTLStageBlit,MTLStageDispatch);[encoder setComputePipelineState:m_display_storage_copy];[encoder setArgumentTable:table];
-		[encoder dispatchThreads:MTLSizeMake(shape[0],1,1) threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(256,m_display_storage_copy.maxTotalThreadsPerThreadgroup),1,1)];
+		const std::array accesses{
+			context::accessed_resource{raw, 0, raw.length},
+			context::accessed_resource{target, 0, target.length, true},
+			context::accessed_resource{copies.buffer, copies.offset, copies.size},
+			context::accessed_resource{sizes.buffer, sizes.offset, sizes.size}};
+		m_context.checked_dispatch(m_display_storage_copy, resources, accesses, MTLSizeMake(shape[0], 1, 1),
+			MTLSizeMake(std::min<NSUInteger>(256, m_display_storage_copy.maxTotalThreadsPerThreadgroup), 1, 1));
 	}
-	encode_display_holes(target,input.vm_patches,input.vm_bytes);encode_upload(input.plan,target,output);
+	encode_display_holes(target, input.vm_patches, input.vm_bytes, prepared ? &prepared->holes : nullptr);
+	encode_upload(input.plan, target, output, prepared ? &prepared->upload : nullptr);
 }
 resolved_fragment_texture guest_texture_resolver::cast_surface(const guest_texture_layout& plan, surface_format format,
 	id<MTLTexture> source, texture_cache_state metadata, std::size_t row_offset)
@@ -846,6 +1324,14 @@ struct versioned_guest_texture_job::state
 	guest_texture_cache::pending_textures pending;
 	std::vector<std::optional<guest_texture_cache::pending_image>> indices;
 	std::optional<guest_texture_upload_job> work;
+	struct draw_uploads
+	{
+		std::vector<guest_texture_resolver::prepared_vm_upload> vm;
+		std::vector<guest_texture_resolver::prepared_native_cast> casts;
+		std::vector<guest_texture_upload_dependency> dependencies;
+		std::optional<submission> recording;
+	};
+	std::optional<draw_uploads> inline_uploads;
 	bool admitted = false, realized = false, published = false, finishing = false;
 	~state() { if (admitted) --owner->unconsumed; }
 	void check_thread() const
@@ -856,6 +1342,12 @@ struct versioned_guest_texture_job::state
 	{
 		check_thread();
 		if (guest_memory_epoch::active()) throw std::logic_error("Native versioned texture completion requires leaving VM exclusion");
+	}
+	void bind_upload_images(std::vector<versioned_guest_texture>& output, const std::vector<resolved_fragment_texture>& images) const
+	{
+		for (std::size_t i = 0; i < output.size(); ++i)
+			if (const auto& index = indices[i])
+				output[i].image.texture = images.at(index->index + (index->cast ? pending.vm.size() : 0)).texture;
 	}
 	bool current() const
 	{
@@ -878,7 +1370,14 @@ bool versioned_guest_texture_job::ready() const
 {
 	if (!m_state) throw std::logic_error("Native versioned texture job was moved");
 	m_state->check_thread();
+	if (const auto& pending = m_state->inline_uploads)
+		return pending->recording && pending->recording->ready();
 	return !m_state->work || m_state->work->ready();
+}
+bool versioned_guest_texture_job::has_completion() const
+{
+	m_state->check_thread();
+	return !m_state->inline_uploads || m_state->inline_uploads->recording.has_value();
 }
 bool versioned_guest_texture_job::cancel_pending() const
 {
@@ -897,6 +1396,74 @@ bool versioned_guest_texture_job::current() const
 	if (!m_state) throw std::logic_error("Native versioned texture job was moved");
 	m_state->check_thread();
 	return m_state->current();
+}
+std::pair<std::vector<versioned_guest_texture>, std::optional<submission>> versioned_guest_texture_job::draw_images(surface_cache& surfaces) const
+{
+	if (!m_state) throw std::logic_error("Native versioned texture job was moved");
+	auto& state = *m_state;
+	state.outside();
+	if (state.inline_uploads && std::any_of(state.inline_uploads->dependencies.begin(), state.inline_uploads->dependencies.end(),
+		[](const auto& dependency)
+		{
+			return !shared_event_reached(dependency.event, dependency.value);
+		}))
+	{
+		// Queue waits gate the entire command buffer. Retire any independent
+		// prefix before a wait that is still pending or cannot be observed on
+		// the CPU. Already fulfilled waits need no such boundary; the original
+		// GPU waits are still recorded with the upload below.
+		surfaces.synchronize();
+	}
+	for (const auto& image : state.result)
+		if (surfaces.prepare_texture_read_boundary(image.revision.m_coverage, true))
+			throw texture_revision_conflict();
+	const auto validate = [&]
+	{
+		if (!state.current()) throw texture_revision_conflict();
+	};
+	if (state.capture && !state.result.empty()) checked_cpu_capture(state.capture, validate); else validate();
+	auto images = state.result;
+	std::optional<submission> predecessor;
+	if (state.work)
+	{
+		state.bind_upload_images(images, state.work->m_state->images);
+		predecessor = state.work->m_state->work;
+	}
+	return {std::move(images), std::move(predecessor)};
+}
+void versioned_guest_texture_job::record_draw_uploads(context& ctx) const
+{
+	auto& state = *m_state;
+	state.outside();
+	if (!state.inline_uploads) return;
+	auto& pending = *state.inline_uploads;
+	const auto recording = ctx.recording_submission();
+	if (pending.recording)
+	{
+		if (!pending.recording->same_batch(recording))
+			ctx.depend_on_predecessor(*pending.recording);
+		return;
+	}
+	auto* cache = state.owner->cache;
+	if (!cache || &cache->m_resolver.m_context != &ctx)
+		throw std::logic_error("Draw texture upload lost its native resolver");
+	for (const auto& dependency : pending.dependencies) ctx.wait_event(dependency.event, dependency.value);
+	for (const auto& native : state.pending.native) native->encode(ctx);
+	for (std::size_t i = 0; i < pending.vm.size(); ++i)
+	{
+		const auto& upload = pending.vm[i];
+		cache->m_resolver.encode_upload(state.pending.vm[i].input.plan, upload.source, upload.texture, &upload);
+	}
+	for (std::size_t i = 0; i < pending.casts.size(); ++i)
+	{
+		const auto& cast = pending.casts[i];
+		cache->m_resolver.encode_cast(state.pending.casts[i], cast.upload.texture, &cast);
+	}
+	pending.recording = recording;
+	pending.dependencies.clear();
+	pending.vm.clear();
+	pending.casts.clear();
+	++cache->m_stats.upload_batches;
 }
 std::vector<versioned_guest_texture> versioned_guest_texture_job::finish(std::chrono::milliseconds timeout)
 {
@@ -917,10 +1484,15 @@ std::vector<versioned_guest_texture> versioned_guest_texture_job::finish(std::ch
 		{
 			if (!state.realized)
 			{
-				const auto images = state.work ? state.work->finish(timeout) : std::vector<resolved_fragment_texture>{};
+				if (state.inline_uploads)
+				{
+					const auto& recording = state.inline_uploads->recording;
+					if (!recording) throw std::logic_error("Draw texture upload has not been encoded");
+					recording->wait(timeout);
+				}
+				else if (state.work)
+					state.bind_upload_images(state.result, state.work->finish(timeout));
 				for (const auto& native : state.pending.native) native->completed();
-				for (std::size_t i = 0; i < state.result.size(); ++i)
-					if (state.indices[i]) state.result[i].image.texture = images.at(state.indices[i]->index + (state.indices[i]->cast ? state.pending.vm.size() : 0)).texture;
 				state.realized = true;
 			}
 			auto* cache = !state.published && state.owner->generation == state.generation ? state.owner->cache : nullptr;
@@ -1047,10 +1619,11 @@ resolved_fragment_texture guest_texture_cache::resolve(const fragment_texture_re
 {
 	return m_access.capture ? resolve_versioned_impl(words, nullptr).image : resolve_impl(words, nullptr);
 }
-resolved_fragment_texture guest_texture_cache::resolve(const fragment_texture_registers& words, surface_cache& surfaces)
+resolved_fragment_texture guest_texture_cache::resolve(const fragment_texture_registers& words, surface_cache& surfaces, const draw_publication& permit)
 {
 	surfaces.validate_texture_adapter(m_resolver.m_context, *m_resolver.m_memory);
-	return m_access.capture ? resolve_versioned_impl(words, &surfaces).image : resolve_impl(words, &surfaces);
+	return m_access.capture ? resolve_versioned_impl(words, &surfaces, nullptr, nullptr, permit).image :
+		resolve_impl(words, &surfaces, nullptr, {}, nullptr, nullptr, permit);
 }
 versioned_guest_texture guest_texture_cache::resolve_versioned(const fragment_texture_registers& words, surface_cache& surfaces)
 {
@@ -1058,8 +1631,10 @@ versioned_guest_texture guest_texture_cache::resolve_versioned(const fragment_te
 	return resolve_versioned_impl(words, &surfaces);
 }
 versioned_guest_texture_job guest_texture_cache::prepare_versioned_batch(std::span<const fragment_texture_registers> words,
-	surface_cache& surfaces, std::span<const guest_texture_upload_dependency> dependencies)
+	surface_cache& surfaces, std::span<const guest_texture_upload_dependency> dependencies, const draw_publication& permit,
+	texture_upload_path path, std::uint64_t fragment_shader_reads)
 {
+	static_assert(guest_texture_resolver::maximum_upload_images <= 64);
 	if (m_batch_owner->thread != std::this_thread::get_id()) throw std::logic_error("Native texture batch belongs to another thread");
 	if (guest_memory_epoch::active()) throw std::logic_error("Native texture batch preparation requires leaving VM exclusion");
 	surfaces.validate_texture_adapter(m_resolver.m_context, *m_resolver.m_memory);
@@ -1085,28 +1660,64 @@ versioned_guest_texture_job guest_texture_cache::prepare_versioned_batch(std::sp
 		try
 		{
 			for (std::size_t i = 0; i < words.size(); ++i)
-				state->result.push_back(resolve_versioned_impl(words[i], &surfaces, &state->pending, &state->indices[i]));
+				state->result.push_back(resolve_versioned_impl(words[i], &surfaces, &state->pending, &state->indices[i], permit,
+					bool(fragment_shader_reads & (std::uint64_t{1} << i))));
 			if (!state->pending.vm.empty() || !state->pending.casts.empty() || !state->pending.native.empty())
 			{
-				surfaces.prepare_texture_boundary(true);
+				const bool inline_draw = path == texture_upload_path::draw_batch &&
+					std::ranges::none_of(state->pending.casts, [](const auto& cast)
+					{
+						return !guest_texture_resolver::can_record_draw_cast(cast);
+					});
+				if (!inline_draw) surfaces.prepare_texture_boundary(true);
 				std::vector<captured_guest_texture> captured;
-				captured.reserve(state->pending.vm.size());
-				for (auto& upload : state->pending.vm) captured.push_back(std::move(upload.snapshot));
-				// Leave each failed native pool normally before reclaiming ready
-				// owners. No submitted job is retried or discarded on timeout.
+				if (!inline_draw)
+				{
+					captured.reserve(state->pending.vm.size());
+					for (auto& upload : state->pending.vm) captured.push_back(std::move(upload.snapshot));
+				}
+				// Leave failed allocation pools before reclaiming ready owners.
 				for (;;)
 				{
 					std::exception_ptr admission_failure;
 					@autoreleasepool
 					{
-						try { state->work.emplace(m_resolver.enqueue_mixed(captured, state->pending.casts, dependencies, state->pending.native)); }
+						try
+						{
+							if (inline_draw)
+							{
+								std::vector<guest_texture_resolver::prepared_vm_upload> vm;
+								std::vector<resolved_fragment_texture> images;
+								vm.reserve(state->pending.vm.size());
+								images.reserve(state->pending.vm.size() + state->pending.casts.size());
+								for (const auto& upload : state->pending.vm)
+								{
+									const auto& prepared = vm.emplace_back(m_resolver.prepare_vm_upload(upload.snapshot));
+									images.push_back({prepared.texture, upload.snapshot.metadata()});
+								}
+								std::vector<guest_texture_resolver::prepared_native_cast> casts;
+								casts.reserve(state->pending.casts.size());
+								for (const auto& input : state->pending.casts)
+								{
+									const auto& cast = casts.emplace_back(m_resolver.prepare_draw_cast(input));
+									images.push_back({cast.upload.texture, input.metadata});
+								}
+								state->bind_upload_images(state->result, images);
+								state->inline_uploads.emplace(std::move(vm), std::move(casts),
+									std::vector<guest_texture_upload_dependency>(dependencies.begin(), dependencies.end()), std::nullopt);
+								for (auto& upload : state->pending.vm)
+									std::vector<std::byte>{}.swap(upload.snapshot.m_bytes);
+							}
+							else
+								state->work.emplace(m_resolver.enqueue_mixed(captured, state->pending.casts, dependencies, state->pending.native));
+						}
 						catch (...) { admission_failure = std::current_exception(); }
 					}
 					if (!admission_failure) break;
 					try { std::rethrow_exception(admission_failure); }
 					catch (const heap_budget_error&) { if (!reclaim_one()) throw; }
 				}
-				++m_stats.upload_batches;
+				if (!inline_draw) ++m_stats.upload_batches;
 			}
 			++m_batch_owner->unconsumed; state->admitted = true;
 		}
@@ -1131,7 +1742,7 @@ void guest_texture_cache::check_pending_bytes(const pending_textures& pending, s
 		throw std::length_error("Native texture cache batch exceeds its combined source byte limit");
 }
 versioned_guest_texture guest_texture_cache::resolve_versioned_impl(const fragment_texture_registers& words, surface_cache* surfaces,
-	pending_textures* pending, std::optional<pending_image>* pending_index)
+	pending_textures* pending, std::optional<pending_image>* pending_index, const draw_publication& permit, bool fragment_shader_reads)
 {
 	std::optional<guest_texture_revision> ticket;
 	const auto capture = [&](const std::function<void()>& operation)
@@ -1147,7 +1758,10 @@ versioned_guest_texture guest_texture_cache::resolve_versioned_impl(const fragme
 		const auto before = m_access.io && main ? m_access.io->current() : 0;
 		auto input = m_resolver.prepare(words);
 		const auto& plan = input.plan;
-		if (input.segments.size() == 1 && plan.dimension == vertex_texture_dimension::two && plan.mips == 1 && plan.codec.block.width == 1)
+		if (plan.stored_border && !plan.swizzled &&
+			(plan.dimension == vertex_texture_dimension::one || plan.dimension == vertex_texture_dimension::two))
+			input.coverage = stored_border_texture_coverage(plan, input.segments);
+		else if (!plan.stored_border && input.segments.size() == 1 && plan.dimension == vertex_texture_dimension::two && plan.mips == 1 && plan.codec.block.width == 1)
 		{
 			const auto morton = plan.swizzled ? std::optional<swizzle_region>{{{plan.width, plan.height, 1}, {}, {plan.width, plan.height, 1}}} : std::nullopt;
 			input.coverage[0] = plan_guest_surface(input.segments[0].address, plan.width, plan.height, plan.codec.block.bytes, plan.swizzled ? 0 : plan.subresources[0].row_pitch, morton);
@@ -1175,7 +1789,7 @@ versioned_guest_texture guest_texture_cache::resolve_versioned_impl(const fragme
 	};
 	// Refresh only our pre-gather writeback,never tags after GPU upload.
 	// Otherwise a later CPU writer could bless an obsolete uploaded image.
-	auto image = resolve_impl(words, surfaces, &ticket->m_surface_revision, refresh, pending, pending_index);
+	auto image = resolve_impl(words, surfaces, &ticket->m_surface_revision, refresh, pending, pending_index, permit, fragment_shader_reads);
 	capture([&] { if (!ticket->current()) throw texture_revision_conflict(); });
 	return {std::move(image), std::move(*ticket)};
 }
@@ -1189,44 +1803,27 @@ null_texture_family guest_texture_cache::null_images()
 {
 	if (m_null_images[0].texture)
 		return m_null_images;
-	auto& ctx = m_resolver.m_context;
 	null_texture_family candidate;
 	constexpr std::array types{MTLTextureType2D, MTLTextureType2D, MTLTextureType3D, MTLTextureTypeCube};
-	for (unsigned dimension = 0; dimension < 4; ++dimension)
+	const std::array<std::byte, 4> black{};
+	const auto region = MTLRegionMake3D(0, 0, 0, 1, 1, 1);
+	// Shared Apple silicon textures are initialized before publication and
+	// remain immutable. This can run while a draw is recording or in flight.
+	for (unsigned dimension = 0; dimension < types.size(); ++dimension)
 	{
+		const auto type = types[dimension];
 		auto descriptor = [MTLTextureDescriptor new];
-		descriptor.textureType = types[dimension];
+		descriptor.textureType = type;
 		descriptor.pixelFormat = MTLPixelFormatBGRA8Unorm;
 		descriptor.width = descriptor.height = descriptor.depth = 1;
 		descriptor.mipmapLevelCount = descriptor.arrayLength = descriptor.sampleCount = 1;
-		descriptor.storageMode = MTLStorageModePrivate;
+		descriptor.storageMode = MTLStorageModeShared;
 		descriptor.usage = MTLTextureUsageShaderRead;
-		candidate[dimension].texture = m_resolver.m_budget->texture(descriptor);
-	}
-	const std::array<std::byte, 4> black{};
-	ctx.begin();
-	try
-	{
-		const auto source = ctx.upload(black, 4);
-		for (unsigned dimension = 0; dimension < 4; ++dimension)
-			for (unsigned slice = 0; slice < (dimension == 3 ? 6u : 1u); ++slice)
-			{
-				texture_region region;
-				region.slice = slice;
-				buffer_to_texture(ctx, source.buffer, source.offset, candidate[dimension].texture, region);
-			}
-		ctx.submit().wait();
-	}
-	catch (...)
-	{
-		try
-		{
-			ctx.cancel();
-		}
-		catch (...)
-		{
-		}
-		throw;
+		const auto texture = m_resolver.m_budget->texture(descriptor);
+		const auto bytes_per_image = type == MTLTextureType3D ? black.size() : 0;
+		for (unsigned slice = 0; slice < (type == MTLTextureTypeCube ? 6u : 1u); ++slice)
+			[texture replaceRegion:region mipmapLevel:0 slice:slice withBytes:black.data() bytesPerRow:black.size() bytesPerImage:bytes_per_image];
+		candidate[dimension].texture = texture;
 	}
 	m_null_images = std::move(candidate);
 	++m_stats.null_initializations;
@@ -1234,14 +1831,14 @@ null_texture_family guest_texture_cache::null_images()
 }
 resolved_fragment_texture guest_texture_cache::resolve_impl(const fragment_texture_registers& words, surface_cache* surfaces,
 	std::shared_ptr<const surface_texture_revision>* source_revision, const std::function<void()>& after_flush,
-	pending_textures* pending, std::optional<pending_image>* pending_index)
+	pending_textures* pending, std::optional<pending_image>* pending_index, const draw_publication& permit, bool fragment_shader_reads)
 {
 	if (bool(pending) != bool(pending_index)) throw std::logic_error("Native deferred texture resolution requires its pending index");
 	if (pending_index) pending_index->reset();
 	guest_texture_resolver::source input;
 	m_resolver.cpu_capture([&] { input = m_resolver.prepare(words); });
 	if (source_revision) source_revision->reset();
-	if (surfaces)
+	if (surfaces && !input.plan.stored_border)
 	{
 		auto coverage = input.coverage;
 		const auto& plan = input.plan;
@@ -1253,20 +1850,37 @@ resolved_fragment_texture guest_texture_cache::resolve_impl(const fragment_textu
 			coverage.clear();
 			for (const auto& part : project_guest_segments(geometry, input.segments, false)) coverage.push_back(part.coverage);
 		}
+		const auto packed_depth_alias = [&](surface_format format)
+		{
+			const auto depth = std::get_if<surface_depth>(&format);
+			return (plan.format == 0x85 || plan.format == 0x9e) && depth &&
+				(*depth == surface_depth::z24s8_uint || *depth == surface_depth::z24s8_float);
+		};
+		bool allow_full_multisample = true;
 		const auto mapping = [&](const cached_surface_description& description)
 		{
-			return plan_cached_texture_mapping(*m_resolver.m_memory, description, input.plan, input.segments, {}, true, true);
+			auto mapped = plan_cached_texture_mapping(*m_resolver.m_memory, description, plan, input.segments, {}, true, true);
+			if (mapped && pending && fragment_shader_reads && description.allocation.samples > 1)
+			{
+				const auto format = description.allocation.format;
+				const bool packed = packed_depth_alias(format);
+				mapped->native_multisample = supports_direct_msaa_sampling(words, packed) &&
+					(packed || surface_texture_channels(format, plan).has_value());
+			}
+			return mapped;
 		};
 		id<MTLTexture> texture = nil;
 		std::optional<surface_format> source_format;
 		std::optional<std::size_t> row_offset;
+		clear_rectangle multisample_window{};
 		for (;;)
 		{
 			try
 			{
 				if (pending)
 				{
-					const auto native = surfaces->prepare_texture_mapping(coverage,mapping,m_resolver.m_budget,false,pending->native,true,true);
+					const auto native = surfaces->prepare_texture_mapping(coverage, mapping, m_resolver.m_budget,
+						false, pending->native, true, true, {}, permit, source_revision != nullptr, &multisample_window, allow_full_multisample);
 					if (native)
 					{
 						texture = native->texture(); source_format = native->format(); row_offset = native->row_offset();
@@ -1274,11 +1888,17 @@ resolved_fragment_texture guest_texture_cache::resolve_impl(const fragment_textu
 						if (native->needs_copy() && std::find(pending->native.begin(),pending->native.end(),native) == pending->native.end()) pending->native.push_back(native);
 					}
 				}
-				else texture = surfaces->snapshot_texture_mapping(coverage, mapping, m_resolver.m_budget, source_revision, false, &source_format, &row_offset,true);
+				else texture = surfaces->snapshot_texture_mapping(coverage, mapping, m_resolver.m_budget, source_revision, false, &source_format, &row_offset,true,permit);
 				break;
 			}
 			catch (const heap_budget_error&)
 			{
+				if (allow_full_multisample && multisample_window.width)
+				{
+					// A small crop can fit even when its full native source copy cannot.
+					allow_full_multisample = false;
+					continue;
+				}
 				if (m_entries.empty())
 					throw;
 				m_entries.pop_back();
@@ -1290,16 +1910,44 @@ resolved_fragment_texture guest_texture_cache::resolve_impl(const fragment_textu
 			++m_stats.surface_snapshots;
 			texture_cache_state metadata;
 			metadata.actual_mips = 1;
+			metadata.samples = static_cast<std::uint32_t>(texture.sampleCount);
 			metadata.depth = bool(input.plan.codec.depth);
 			metadata.source_depth_format = input.plan.codec.depth ? static_cast<std::uint32_t>(*input.plan.codec.depth) : 0;
 			metadata.depth_float = input.plan.codec.depth && (*input.plan.codec.depth == surface_depth::z16_float || *input.plan.codec.depth == surface_depth::z24s8_float);
 			if (!source_format || !row_offset) throw std::logic_error("Native texture snapshot omitted its selected source metadata");
 			const auto channels = surface_texture_channels(*source_format, input.plan);
-			const bool direct = channels && !*row_offset && checked_texture_product(texture.width, surface_guest_bytes(*source_format)) == checked_texture_product(input.plan.subresources[0].columns, input.plan.codec.block.bytes);
+			const auto size = metadata.samples == 1 ? std::array<std::size_t, 2>{texture.width, texture.height} :
+				std::array{multisample_window.width, multisample_window.height};
+			const bool direct = channels && !*row_offset && checked_texture_product(size[0], surface_guest_bytes(*source_format)) == checked_texture_product(input.plan.subresources[0].columns, input.plan.codec.block.bytes);
 			metadata.native_argb_channels = direct ? *channels : input.plan.codec.base_argb;
 			if ((words.format >> 8) & 0x40)
 				metadata.coordinates = normalize_guest_pixels(input.plan.width, input.plan.height, input.plan.depth);
+			if (metadata.samples == 1 && multisample_window.width)
+				metadata.coordinates.flags |= texture_coordinate_sample_raster;
+			if (metadata.samples > 1 && (multisample_window.x || multisample_window.y ||
+				size != sample_expanded_size(texture.width, texture.height, metadata.samples)))
+			{
+				auto& coords = metadata.coordinates;
+				coords.flags |= texture_coordinate_msaa_window;
+				coords.minimum = {float(multisample_window.x), float(multisample_window.y)};
+				coords.maximum = {float(multisample_window.x + size[0]), float(multisample_window.y + size[1])};
+			}
 			if (direct) return {texture, metadata};
+			if (packed_depth_alias(*source_format))
+			{
+				// Color casts and paired shader reads expose the same packed bytes.
+				metadata.linear_filtering = false;
+				if (fragment_shader_reads && !*row_offset && size == std::array{plan.width, plan.height})
+				{
+					const auto depth = std::get<surface_depth>(*source_format);
+					metadata.depth = true;
+					metadata.depth_float = depth == surface_depth::z24s8_float;
+					metadata.source_depth_format = static_cast<std::uint32_t>(depth);
+					return {texture, metadata};
+				}
+			}
+			if (metadata.samples != 1)
+				throw std::logic_error("Multisample snapshot cannot enter a byte cast");
 			for (auto it = m_casts.begin(); it != m_casts.end();)
 			{
 				if (!it->source) { auto stale = it++; evict_cast(stale); continue; }
@@ -1352,13 +2000,13 @@ resolved_fragment_texture guest_texture_cache::resolve_impl(const fragment_textu
 			return cast;
 		}
 	}
-	if(surfaces)if(const auto assembled=resolve_assembly(words,input,*surfaces,source_revision,pending,pending_index))return *assembled;
+	if(surfaces)if(const auto assembled=resolve_assembly(words,input,*surfaces,source_revision,pending,pending_index,permit))return *assembled;
 	m_resolver.cpu_capture([&] { m_resolver.watch(input); });
 	const auto same = [&](const guest_texture_resolver::source& candidate)
 	{
 		const auto& a = candidate.plan;
 		const auto& b = input.plan;
-		return candidate.segments == input.segments && a.format == b.format && a.width == b.width && a.height == b.height && a.depth == b.depth && a.mips == b.mips && a.layers == b.layers && a.dimension == b.dimension && a.swizzled == b.swizzled && a.subresources[0].row_pitch == b.subresources[0].row_pitch;
+		return candidate.segments == input.segments && a.format == b.format && a.width == b.width && a.height == b.height && a.depth == b.depth && a.mips == b.mips && a.layers == b.layers && a.dimension == b.dimension && a.swizzled == b.swizzled && a.stored_border == b.stored_border && a.subresources[0].row_pitch == b.subresources[0].row_pitch;
 	};
 	for (auto it = m_entries.begin(); it != m_entries.end(); ++it)
 		if (same(it->input))
@@ -1382,9 +2030,9 @@ resolved_fragment_texture guest_texture_cache::resolve_impl(const fragment_textu
 			++m_stats.invalidations;
 			break;
 		}
-	if (surfaces && input.segments.size() > 1)
+	if (surfaces && input.segments.size() > 1 && !input.plan.stored_border)
 	{
-		for (const auto& part : input.segments) surfaces->prepare_cpu_read({part.address, part.size});
+		for (const auto& part : input.segments) surfaces->prepare_cpu_read_active(guest_byte_coverage({part.address, part.size}), permit);
 		if (after_flush) after_flush();
 	}
 	if (pending)

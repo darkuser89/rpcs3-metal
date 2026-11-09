@@ -31,6 +31,35 @@ std::string swizzle(const std::array<std::uint32_t, 4>& components)
 	return result;
 }
 
+bool scalar_pair_has_register_hazard(const vertex_instruction& instruction)
+{
+	const auto d0 = instruction.words[0], d3 = instruction.words[3];
+	const auto vector_temp = bits(d0, 15, 6);
+	const auto vector_mask = bits(d3, 13, 4);
+	const auto& source = instruction.sources[2];
+	if (instruction.vector_opcode == 13 || instruction.vector_opcode == 23 || instruction.vector_opcode == 24)
+	{
+		const bool indexed = (source.type == 2 && bits(d0, 27, 1)) ||
+			(source.type == 3 && bits(d3, 1, 1));
+		return indexed && (vector_temp & 1u) == bits(d0, 24, 1) &&
+			(vector_mask & (8u >> bits(d0, 0, 2)));
+	}
+	if (vector_temp == 63)
+		return false;
+	if (vector_temp == bits(d3, 7, 6) && (vector_mask & bits(d3, 17, 4)))
+		return true;
+	if (source.type != 1 || vector_temp != source.temporary)
+		return false;
+	// MOV reads the enabled result lanes. LIT reads x/y/w. The
+	// remaining scalar operations take the first swizzled component.
+	const auto scalar_lanes = instruction.scalar_opcode == 1 ? bits(d3, 17, 4) :
+		instruction.scalar_opcode == 7 ? 13u : 8u;
+	for (unsigned lane = 0; lane < source.swizzle.size(); ++lane)
+		if ((scalar_lanes & (8u >> lane)) && (vector_mask & (8u >> source.swizzle[lane])))
+			return true;
+	return false;
+}
+
 class emitter
 {
 	const vertex_program_options& m_options;
@@ -102,31 +131,31 @@ class emitter
 		case 8:
 			return "float4(1, (" + source(0) + ").y * (" + source(1) + ").y, (" + source(0) + ").z, (" + source(1) + ").w)";
 		case 9:
-			return "min(" + source(0) + ", " + source(1) + ")";
+			return "rsx_extremum(" + source(0) + ", " + source(1) + ", false)";
 		case 10:
-			return "max(" + source(0) + ", " + source(1) + ")";
+			return "rsx_extremum(" + source(0) + ", " + source(1) + ", true)";
 		case 11:
-			return "float4(" + source(0) + " < " + source(1) + ")";
+			return "rsx_set_compare(" + source(0) + ", " + source(1) + ", 1u)";
 		case 12:
-			return "float4(" + source(0) + " >= " + source(1) + ")";
+			return "rsx_set_compare(" + source(0) + ", " + source(1) + ", 6u)";
 		case 14:
-			return "fract(" + source(0) + ")";
+			return "rsx_fraction(" + source(0) + ")";
 		case 15:
-			return "floor(" + source(0) + ")";
+			return "rsx_floor(" + source(0) + ")";
 		case 16:
-			return "float4(" + source(0) + " == " + source(1) + ")";
+			return "rsx_set_compare(" + source(0) + ", " + source(1) + ", 2u)";
 		case 17:
 			return "float4(0)";
 		case 18:
-			return "float4(" + source(0) + " > " + source(1) + ")";
+			return "rsx_set_compare(" + source(0) + ", " + source(1) + ", 4u)";
 		case 19:
-			return "float4(" + source(0) + " <= " + source(1) + ")";
+			return "rsx_set_compare(" + source(0) + ", " + source(1) + ", 3u)";
 		case 20:
-			return "float4(" + source(0) + " != " + source(1) + ")";
+			return "rsx_set_compare(" + source(0) + ", " + source(1) + ", 5u)";
 		case 21:
 			return "float4(1)";
 		case 22:
-			return "sign(" + source(0) + ")";
+			return "rsx_sign(" + source(0) + ")";
 		case 25:
 		{
 			const auto id = m_instruction.texture;
@@ -156,39 +185,44 @@ class emitter
 			return "rsx_lit(" + source(2) + ")";
 		if (m_instruction.scalar_opcode == 1)
 			return source(2);
-		// Scalar ALU operands normally encode a replicate swizzle. The VK
-		// decompiler and interpreter disagree for non-replicate operands; don't
-		// silently select one interpretation until that case is established.
+		// Scalar and per-lane evaluation agree when every written lane
+		// selects the same source as x. For a pair, also require that the
+		// visible result is independent of the relative read/write timing.
 		const auto& components = m_instruction.sources[2].swizzle;
-		for (auto c : components)
+		const auto mask = bits(m_instruction.words[3], 17, 4);
+		bool non_replicate = false;
+		for (unsigned lane = 1; lane < components.size(); ++lane)
 		{
-			if (c != components[0])
-				throw std::invalid_argument("RSX scalar ALU operand has a non-replicate swizzle");
+			if (components[lane] == components[0])
+				continue;
+			non_replicate = true;
+			if (!mask || (mask & (8u >> lane)))
+				throw std::invalid_argument("RSX scalar ALU operand has an ambiguous non-replicate swizzle");
 		}
+		if (non_replicate && m_instruction.vector_opcode && scalar_pair_has_register_hazard(m_instruction))
+			throw std::invalid_argument("RSX paired scalar ALU operand has a register hazard");
 		const auto s = "(" + source(2) + ").x";
 		std::string result;
 		switch (m_instruction.scalar_opcode)
 		{
 		case 2:
-			result = "1.0f / " + s;
+			result = "rsx_reciprocal(" + s + ")";
 			break;
 		case 3:
-			result = "clamp(1.0f / " + s + ", 5.42101e-20f, 1.884467e19f)";
+			result = "rsx_rcp_clamped(" + s + ")";
 			break;
 		case 4:
-			result = "1.0f / sqrt(max(" + s + ", 1e-10f))";
+			result = "rsx_rsqrt(" + s + ")";
 			break;
 		case 5:
-			result = "exp(" + s + ")";
-			break;
+			return "rsx_exp_legacy(" + s + ")";
 		case 6:
-			result = "log(" + s + ")";
-			break;
+			return "rsx_log_legacy(" + s + ")";
 		case 13:
-			result = "log2(max(" + s + ", 1e-10f))";
+			result = "rsx_log2_scalar(" + s + ")";
 			break;
 		case 14:
-			result = "exp2(" + s + ")";
+			result = "rsx_exp2_scalar(" + s + ")";
 			break;
 		case 15:
 			result = "sin(" + s + ")";
@@ -202,24 +236,46 @@ class emitter
 		return "float4(" + result + ")";
 	}
 
-	void write(std::ostream& out, bool scalar, std::string value)
+	void write(std::ostream& out, bool scalar, std::string value, bool update_condition)
 	{
 		const auto d0 = m_instruction.words[0], d3 = m_instruction.words[3];
 		const auto temporary = scalar ? bits(d3, 7, 6) : bits(d0, 15, 6);
 		const bool output = scalar ? !bits(d0, 30, 1) : bits(d0, 30, 1);
-		if (bits(d0, 26, 1))
-			value = "clamp(" + value + ", 0.0f, 1.0f)";
-		out << "            { const float4 value = " << value << ";\n";
-		std::array<std::string, 2> destinations;
+		if (bits(d0, 26, 1) && bits(d0, 14, 1))
+		{
+			// The condition is derived from the written value. Ordered compares
+			// preserve unordered operands and the sign bit of zero during SAT.
+			out << "            { const float4 raw_value = " << value << ";\n"
+				<< "              const float4 value = rsx_saturate_ordered(raw_value);\n";
+		}
+		else
+		{
+			if (bits(d0, 26, 1))
+				value = "clamp(" + value + ", 0.0f, 1.0f)";
+			out << "            { const float4 value = " << value << ";\n";
+		}
+		std::array<std::string, 3> destinations;
 		std::size_t count = 0;
 		if (temporary != 63)
 			destinations[count++] = "r.temp[" + number(temporary) + "]";
-		if (output && bits(d3, 2, 5) < 16 && (!scalar || temporary == 63))
+		if (output && bits(d3, 2, 5) < 16)
 		{
-			destinations[count++] = "r.dst[" + number(bits(d3, 2, 5)) + "]";
-			m_program.output_register_mask |= 1u << bits(d3, 2, 5);
+			if (bits(d0, 28, 1))
+			{
+				out << "                rsx_store_output(r, long(" << bits(d3, 2, 5) << ") + long(r.address["
+					<< bits(d0, 24, 1) << "][" << bits(d0, 0, 2) << "]), value, write_mask & bool4(";
+				for (unsigned c = 0; c < 4; ++c)
+					out << (c ? ", " : "") << (bits(d3, (scalar ? 20 : 16) - c, 1) ? "true" : "false");
+				out << "));\n";
+				m_program.output_register_mask |= 65535u;
+			}
+			else
+			{
+				destinations[count++] = "r.dst[" + number(bits(d3, 2, 5)) + "]";
+				m_program.output_register_mask |= 1u << bits(d3, 2, 5);
+			}
 		}
-		if (count == 0 && !output)
+		if (update_condition || (count == 0 && !output))
 			destinations[count++] = "r.condition[" + number(bits(d0, 25, 1)) + "]";
 		for (std::size_t i = 0; i < count; ++i)
 		{
@@ -296,20 +352,47 @@ generated_vertex_program generate_vertex_program(std::span<const std::array<std:
 			continue;
 		const auto instruction = decode_vertex_instruction(instructions[i]);
 		const auto d0 = instruction.words[0], d3 = instruction.words[3];
-		if (bits(d0, 14, 1) || bits(d0, 29, 1))
+		const auto vector = instruction.vector_opcode, scalar = instruction.scalar_opcode;
+		const bool scalar_alu = (scalar >= 1 && scalar <= 7) || (scalar >= 13 && scalar <= 16);
+		const bool update_condition = bits(d0, 14, 1);
+		const bool condition_from_vector = bits(d0, 29, 1);
+		const bool address_operation = vector == 13 || vector == 23 || vector == 24;
+		const bool update_from_address = address_operation && update_condition && condition_from_vector;
+		if ((vector == 23 || vector == 24) && (bits(d0, 26, 1) || (bits(d0, 30, 1) && bits(d3, 2, 5) < 16)))
+			throw std::invalid_argument("RSX integer address operation has unsupported saturation or output routing");
+		if (update_condition || condition_from_vector)
 		{
-			throw std::invalid_argument("RSX vertex condition-update flags require further hardware validation");
+			// Curie CDST_WM and CDST_IS_VEC select one result. Paired
+			// operations use the same pre-write predicate.
+			const bool valid_result = condition_from_vector ? (vector && (!scalar || scalar_alu)) : scalar_alu;
+			if (!update_condition || !valid_result)
+				throw std::invalid_argument("RSX vertex condition-update flags require further hardware validation");
+			if (address_operation && ((update_from_address && bits(d0, 26, 1)) ||
+				(bits(d0, 30, 1) && bits(d3, 2, 5) < 16)))
+				throw std::invalid_argument("RSX address condition update has unsupported saturation or output routing");
+			if (vector && scalar)
+			{
+				const bool nonselected_implicit_condition = condition_from_vector ?
+					(bits(d0, 30, 1) && bits(d3, 7, 6) == 63 && bits(d3, 17, 4)) :
+					(!address_operation && !bits(d0, 30, 1) && bits(d0, 15, 6) == 63 && bits(d3, 13, 4));
+				if (nonselected_implicit_condition || scalar_pair_has_register_hazard(instruction))
+					throw std::invalid_argument("RSX paired vertex condition update has a register hazard");
+			}
 		}
 		if (bits(d3, 2, 5) >= 16 && bits(d3, 2, 5) != 31)
 		{
 			throw std::invalid_argument("RSX vertex output register exceeds the register file");
 		}
-		const auto scalar = instruction.scalar_opcode;
-		if (((scalar >= 1 && scalar <= 7) || (scalar >= 13 && scalar <= 16)) &&
+		if (scalar_alu &&
 			!bits(d0, 30, 1) && bits(d3, 2, 5) < 16 && bits(d3, 7, 6) != 63)
 		{
-			throw std::invalid_argument("RSX scalar instruction cannot write both temporary and output registers");
+			// Both destinations consume the same local value and write mask.
+			if (vector && scalar_pair_has_register_hazard(instruction))
+				throw std::invalid_argument("RSX scalar dual destination has a paired register hazard");
 		}
+		if (address_operation && scalar_alu && !bits(d0, 30, 1) && bits(d0, 28, 1) && bits(d3, 2, 5) < 16 && bits(d3, 17, 4) &&
+			(bits(d0, 15, 6) & 1u) == bits(d0, 24, 1) && (bits(d3, 13, 4) & (8u >> bits(d0, 0, 2))))
+			throw std::invalid_argument("RSX paired address load changes the indexed output address");
 		if (scalar == 11 || scalar >= 19)
 		{
 			throw std::invalid_argument("Unsupported RSX vertex flow opcode " + number(scalar));
@@ -329,24 +412,36 @@ generated_vertex_program generate_vertex_program(std::span<const std::array<std:
 		body << "            (void)tested; (void)write_mask;\n";
 		body << "            pc = " << i + 1 << ";\n";
 		body << "            if (" << (bits(d0, 13, 1) && !bits(d0, 10, 3) ? "false" : "true") << ") {\n";
-		if (instruction.vector_opcode == 13)
+		if (address_operation)
 		{
-			body << "            { const int4 value = rsx_address(" << emit.source(0) << ", r.fault);\n";
+			body << "            {\n";
+			if (update_from_address)
+				body << "                uint address_fault = 0;\n";
+			// ARR uses nearest-even rounding; Metal round() instead rounds
+			// halfway cases away from zero. Keep ARL's conversion separate.
+			const auto value = vector == 24 ? "r.address[" + number(bits(d0, 24, 1)) + "]" :
+				vector == 23 ? "rint(" + emit.source(0) + ")" : emit.source(0);
+			body << "                const int4 value = " << (vector == 24 ? "rsx_address_add(" : "rsx_address(") << value
+				<< (update_from_address ? ", address_fault);\n                r.fault |= address_fault;\n" : ", r.fault);\n");
 			for (unsigned c = 0; c < 4; ++c)
 			{
-				if (bits(d3, 16 - c, 1))
-					body << "                if (write_mask[" << c << "]) r.address["
-						 << (bits(d0, 15, 6) & 1) << "][" << c << "] = value[" << c << "];\n";
+				if (!bits(d3, 16 - c, 1))
+					continue;
+				body << "                if (write_mask[" << c << "]) { r.address["
+					 << (bits(d0, 15, 6) & 1) << "][" << c << "] = value[" << c << "];";
+				if (update_from_address)
+					body << " if (!address_fault) r.condition[" << bits(d0, 25, 1) << "][" << c << "] = float(value[" << c << "]);";
+				body << " }\n";
 			}
 			body << "                (void)value;\n            }\n";
 		}
-		else if (instruction.vector_opcode)
-			emit.write(body, false, emit.vector_value());
+		else if (vector)
+			emit.write(body, false, emit.vector_value(), update_condition && condition_from_vector);
 		// The current VK interpreter evaluates SCA after VEC. Dual-issue source
 		// timing is retained here and remains part of the hardware parity audit.
-		if ((scalar >= 1 && scalar <= 7) || (scalar >= 13 && scalar <= 16))
+		if (scalar_alu)
 		{
-			emit.write(body, true, emit.scalar_value());
+			emit.write(body, true, emit.scalar_value(), update_condition && !condition_from_vector);
 		}
 		else if (scalar)
 		{

@@ -14,6 +14,7 @@ namespace
 {
 using fetch_parameters = vertex_fetch_parameters;
 constexpr std::uint32_t max_chunk_vertices = 1u << 26;
+constexpr auto decoded_vertex_bytes = *vertex_fetch_bytes(vertex_fetch_request{.vertex_count = 1});
 }
 
 vertex_fetch_engine::vertex_fetch_engine(context& ctx) : m_device(ctx.device())
@@ -82,7 +83,6 @@ id<MTLBuffer> vertex_fetch_engine::decode(context& ctx, const prepared_fetch& pr
 	resources.set_buffer(0, persistent ? persistent : dummy.buffer, persistent ? 0 : dummy.offset);
 	resources.set_buffer(1, transient ? transient : dummy.buffer, transient ? 0 : dummy.offset);
 	resources.set_buffer(2, output);
-	ctx.keep_alive(m_pipeline);
 	for (std::uint32_t first = 0; first < request.vertex_count;)
 	{
 		const auto count = std::min(request.vertex_count - first, max_chunk_vertices);
@@ -91,14 +91,15 @@ id<MTLBuffer> vertex_fetch_engine::decode(context& ctx, const prepared_fetch& pr
 			request.vertex_index_offset, first, count, request.attribute_mask,0,request.element_counts};
 		const auto uniforms = ctx.upload(std::as_bytes(std::span{&params, 1}), 256);
 		resources.set_buffer(3, uniforms.buffer, uniforms.offset);
-		const auto table = resources.snapshot(ctx);
-		const auto encoder = ctx.compute();
-		ctx.barrier(MTLStageDispatch | MTLStageBlit, MTLStageDispatch);
-		[encoder setComputePipelineState:m_pipeline];
-		[encoder setArgumentTable:table];
-		const auto group = std::min<NSUInteger>(256, m_pipeline.maxTotalThreadsPerThreadgroup);
-		[encoder dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(count) * 16, 1, 1)
-			threadsPerThreadgroup:MTLSizeMake(group, 1, 1)];
+		std::array<context::accessed_resource, 4> accesses{{
+			{output, first * decoded_vertex_bytes, count * decoded_vertex_bytes, true},
+			{uniforms.buffer, uniforms.offset, uniforms.size}}};
+		std::size_t used = 2;
+		if (params.persistent_length)
+			accesses[used++] = {persistent, 0, params.persistent_length};
+		if (params.transient_length)
+			accesses[used++] = {transient, 0, params.transient_length};
+		ctx.checked_dispatch(m_pipeline, resources, std::span{accesses}.first(used), static_cast<NSUInteger>(count) * 16);
 		first += count;
 	}
 	return output;

@@ -17,6 +17,11 @@ struct pass_clause
 	bool empty() const { return command == 2 ? inline_vertex_array.empty() : !count; }
 	bool is_single_draw() const { return ranges.empty(); }
 	const auto& get_subranges() const { return ranges; }
+	draw_subrange get_range() const
+	{
+		if (command == 2 || empty()) throw std::logic_error("Inline fixture has no draw range");
+		return {first, count};
+	}
 	unsigned min_index() const { return first; }
 	unsigned get_elements_count() const { return count; }
 	void begin()

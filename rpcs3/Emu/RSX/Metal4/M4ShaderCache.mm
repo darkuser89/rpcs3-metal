@@ -22,9 +22,10 @@ struct shader_cache::implementation
 		generated_vertex_program generated;
 		std::shared_ptr<const vertex_shader> shader;
 		std::optional<compiler::prepared_library> library;
+		std::optional<compiler_job> flat_pipeline;
 		std::size_t bytes() const noexcept
 		{
-			return sizeof(*this) + sizeof(vertex_shader) + code.capacity() * sizeof(code[0]) + live.capacity() + generated.source.capacity() + 1 +
+			return sizeof(*this) + vertex_shader::host_bytes(options) + code.capacity() * sizeof(code[0]) + live.capacity() + generated.source.capacity() + 1 +
 				(library ? library->retained_bytes() : 0);
 		}
 		bool matches_options(const vertex_program_options& value) const
@@ -46,10 +47,11 @@ struct shader_cache::implementation
 		fragment_program_options options;
 		generated_fragment_program generated;
 		std::shared_ptr<const fragment_shader> shader;
+		std::shared_ptr<void> constant_identity = std::make_shared<int>(0);
 		std::optional<compiler::prepared_library> library;
 		std::size_t bytes() const noexcept
 		{
-			return sizeof(*this) + sizeof(fragment_shader) + code.capacity() + 2 * image.instructions.capacity() * sizeof(fragment_instruction) +
+			return sizeof(*this) + sizeof(fragment_shader) + sizeof(int) + code.capacity() + 2 * image.instructions.capacity() * sizeof(fragment_instruction) +
 				generated.source.capacity() + 1 + generated.constant_offsets.capacity() * sizeof(std::size_t) +
 				(library ? library->retained_bytes() : 0);
 		}
@@ -217,6 +219,15 @@ shader_cache::prepared_vertex shader_cache::prewarm_vertex(const prepared_vertex
 		else ++m_impl->vertices.stats.prewarm_refused;
 		m_impl->vertices.refresh_charge(entry, before);
 	}
+	if (options.flat_result_inputs)
+	{
+		if (entry->shader) entry->shader->prewarm_flat_pipeline();
+		else if (entry->library && !entry->flat_pipeline)
+		{
+			const auto descriptor = [MTL4ComputePipelineDescriptor new];
+			entry->flat_pipeline = m_impl->compile.tasks().compute(descriptor, entry->library->function(@"rpcs3_rsx_flat_colors"));
+		}
+	}
 	return {m_impl->identity, entry, entry->generated.texture_mask};
 }
 bool shader_cache::ready(const prepared_vertex& program) const
@@ -238,9 +249,9 @@ std::shared_ptr<const vertex_shader> shader_cache::vertex(const prepared_vertex&
 		if (entry->library && !entry->library->ready()) ++m_impl->vertices.stats.prewarm_waited;
 		id<MTLLibrary> library = nil;
 		try { if (entry->library) library = m_impl->compile.library(*entry->library); }
-		catch (...) { if (entry->library && entry->library->failed()) { entry->library.reset(); m_impl->vertices.refresh_charge(entry, before); } throw; }
-		entry->shader = std::shared_ptr<const vertex_shader>(new vertex_shader(m_impl->compile, entry->generated, options, library));
-		entry->library.reset(); m_impl->vertices.refresh_charge(entry, before);
+		catch (...) { if (entry->library && entry->library->failed()) { entry->library.reset(); entry->flat_pipeline.reset(); m_impl->vertices.refresh_charge(entry, before); } throw; }
+		entry->shader = std::shared_ptr<const vertex_shader>(new vertex_shader(m_impl->compile, entry->generated, options, library, entry->flat_pipeline));
+		entry->library.reset(); entry->flat_pipeline.reset(); m_impl->vertices.refresh_charge(entry, before);
 		++m_impl->vertices.stats.compiled;
 	}
 	return entry->shader;
@@ -276,6 +287,31 @@ bool shader_cache::ready(const prepared_fragment& program) const
 	const auto entry = std::static_pointer_cast<implementation::fragment_entry>(program.m_entry);
 	return entry->shader || (entry->library && entry->library->ready());
 }
+fragment_shader::constant_binding shader_cache::prepare_constants(context& ctx, const prepared_fragment& program,
+	std::span<const std::byte> current_code) const
+{
+	if (program.m_owner != m_impl->identity || !program.m_entry)
+		throw std::invalid_argument("Metal4 prepared fragment constants belong to another cache");
+	const auto entry = std::static_pointer_cast<implementation::fragment_entry>(program.m_entry);
+	return fragment_shader::capture_constants(ctx, m_impl->compile.device(), entry->image, entry->constant_identity, current_code);
+}
+
+std::optional<prepared_shader_stages> shader_cache::pipeline_stages(const prepared_vertex& vertex, const prepared_fragment& fragment) const
+{
+	if (vertex.m_owner != m_impl->identity || fragment.m_owner != m_impl->identity || !vertex.m_entry || !fragment.m_entry)
+		throw std::invalid_argument("Foreign prepared shader pipeline stages");
+	const auto vp = std::static_pointer_cast<implementation::vertex_entry>(vertex.m_entry);
+	const auto fp = std::static_pointer_cast<implementation::fragment_entry>(fragment.m_entry);
+	if ((!vp->shader && !vp->library) || (!fp->shader && !fp->library)) return {};
+	const auto function = [](const auto& entry, NSString* name)
+	{
+		if (entry->library) return entry->library->function(name);
+		const auto descriptor = entry->shader->function();
+		return compiler_function::from_library(descriptor.library, descriptor.name);
+	};
+	return prepared_shader_stages(function(vp,@"rpcs3_rsx_vertex"), function(fp,@"rpcs3_rsx_fragment"), fp->options);
+}
+
 std::shared_ptr<const fragment_shader> shader_cache::fragment(const prepared_fragment& program, const fragment_program_options& options)
 {
 	if (program.m_owner != m_impl->identity || !program.m_entry)
@@ -290,7 +326,8 @@ std::shared_ptr<const fragment_shader> shader_cache::fragment(const prepared_fra
 		id<MTLLibrary> library = nil;
 		try { if (entry->library) library = m_impl->compile.library(*entry->library); }
 		catch (...) { if (entry->library && entry->library->failed()) { entry->library.reset(); m_impl->fragments.refresh_charge(entry, before); } throw; }
-		entry->shader = std::shared_ptr<const fragment_shader>(new fragment_shader(m_impl->compile, entry->image, entry->generated, options, library));
+		entry->shader = std::shared_ptr<const fragment_shader>(new fragment_shader(m_impl->compile, entry->image, entry->generated, options,
+			entry->constant_identity, library));
 		entry->library.reset(); m_impl->fragments.refresh_charge(entry, before);
 		++m_impl->fragments.stats.compiled;
 	}

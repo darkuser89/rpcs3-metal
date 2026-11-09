@@ -17,11 +17,16 @@
 #include "M4SurfaceTextureRegion.h"
 #include "M4TextureBlit.h"
 #include "M4DisplayAssembly.h"
+#include "M4ScaledImageNativePlan.h"
 
 #include <functional>
 
 namespace metal4
 {
+// Texture preparation reached an operation with side effects while the
+// draw's immutable GPU report was false.
+struct predicated_texture_suppressed {};
+
 struct cached_surface_description
 {
 	std::uint32_t address = 0;
@@ -143,6 +148,9 @@ class prepared_surface_snapshot final
 	[[nodiscard]] bool matches_source(const cached_surface_ref& source, bool require_cache_epoch = true) const;
 	[[nodiscard]] bool source_current(bool require_cache_epoch=true) const;
 	[[nodiscard]] bool cache_native_epoch(std::uint64_t epoch) const;
+	[[nodiscard]] bool cache_texture_sources(std::uint64_t epoch, std::uint64_t topology,
+		std::span<const guest_surface_layout> coverage,
+		std::span<const std::shared_ptr<prepared_surface_snapshot>> retained) const;
 	[[nodiscard]] std::shared_ptr<const surface_texture_revision> revision() const;
 	[[nodiscard]] bool needs_copy() const;
 	[[nodiscard]] id<MTLTexture> opaque_view(MTLPixelFormat format) __attribute__((ns_returns_retained));
@@ -160,6 +168,7 @@ class surface_cache final
 {
 	friend class prepared_surface_snapshot;
 	friend class guest_texture_cache;
+	friend class versioned_guest_texture_job;
 	friend class display_resolver;
 	friend class draw_executor;
 	friend class scaled_image_transfer;
@@ -168,31 +177,55 @@ class surface_cache final
 	// Preserve our own recording for CPU-only epochs; close it before helpers
 	// that need new GPU work. Foreign caller recordings remain forbidden.
 	void prepare_texture_boundary(bool gpu_work);
-	// Preserve a recording for immutable reads of unrelated storage. Pending
-	// native writes,including retained physical aliases,must complete first.
-	void prepare_texture_read_boundary(std::span<const guest_surface_layout> coverage);
+	// Preserve unrelated work for immutable reads. A revision-tracked consumer
+	// can also cross a submitted batch when storage independence is proved.
+	// Returns true if an existing texture capture must be prepared again.
+	bool prepare_texture_read_boundary(std::span<const guest_surface_layout> coverage, bool revision_tracked = false);
 	[[nodiscard]] std::shared_ptr<prepared_surface_snapshot> prepare_texture_mapping(std::span<const guest_surface_layout> coverage,
 		const std::function<std::optional<surface_texture_region>(const cached_surface_description&)>& region,
 		const std::shared_ptr<heap_budget>& budget, bool allow_guest_fallback,
 		std::span<const std::shared_ptr<prepared_surface_snapshot>> pending = {}, bool allow_new = true,
-		bool defer_unsupported = false, const cached_surface_ref& source_only = {});
-	[[nodiscard]] std::vector<cached_surface_ref> texture_sources(std::span<const guest_surface_layout> coverage);
+		bool defer_unsupported = false, const cached_surface_ref& source_only = {}, const draw_publication& permit = {},
+		bool revision_tracked = false, clear_rectangle* multisample_window = nullptr, bool allow_full_multisample = true);
+	[[nodiscard]] std::vector<cached_surface_ref> texture_sources(std::span<const guest_surface_layout> coverage, bool revision_tracked = false);
 	[[nodiscard]] std::uint64_t texture_source_epoch() const;
 	[[nodiscard]] std::uint64_t texture_source_topology_epoch() const;
 	void transfer(const cached_surface_ref& source, clear_rectangle source_rectangle, const cached_surface_ref& destination,
 				  clear_rectangle destination_rectangle, texture_plane plane, std::array<bool, 3> flip, bool typeless);
 	void defer_transfer(const cached_surface_ref& source, clear_rectangle source_rectangle, const cached_surface_ref& destination,
 						clear_rectangle destination_rectangle, texture_plane plane, std::array<bool, 3> flip, bool typeless);
+	struct scaled_image_input_view
+	{
+		id<MTLTexture> image = nil;
+		clear_rectangle pixels;
+	};
 	void draw_impl(std::span<const cached_surface_use> surfaces,
 				   const std::function<void(context&, std::span<const id<MTLTexture>>)>& encode, bool snapshot_feedback,
 				   const surface_allocation_description* transient = nullptr, surface_lease* reservation = nullptr,
-				   std::function<void()> publication_check = {}, const cached_surface_ref& overwrite = {}, bool scaled_inputs = false);
+				   std::function<void()> publication_check = {}, std::span<const cached_surface_ref> full_overwrites = {}, bool scaled_inputs = false,
+					   bool frozen_scaled_inputs = false, bool version_scaled_donor = false,
+					   draw_publication publish_draw = {}, const submission* predecessor = nullptr,
+					   const std::function<void(context&)>& before_loads = {},
+					   std::span<const std::vector<clear_rectangle>> input_windows = {},
+					   std::vector<std::vector<scaled_image_input_view>>* input_views = nullptr, bool defer_scaled_completion = false,
+					   std::function<void()> after_scaled_commit = {});
 	struct scaled_image_endpoints
 	{
 		std::array<cached_surface_ref,2> surfaces;
 		std::array<clear_rectangle,2> regions;
-		bool overwrite_destination = false;
-		// A packed input assembled from disjoint native byte authorities.
+		// Disjoint native windows covering one packed output. Paired
+		// rectangles retain canonical and native sample-raster coordinates.
+		std::vector<cached_surface_ref> outputs;
+		std::vector<scaled_image_output_region> output_regions;
+		std::vector<scaled_image_output_byte_region> output_byte_regions;
+		std::vector<surface_format> output_formats;
+		std::vector<cached_surface_ref> cold_outputs;
+		bool frozen_inputs = false;
+		bool ram_only = false;
+		bool version_target = false;
+		bool prepare_version_targets = false;
+		std::optional<std::uint64_t> ownership_epoch;
+		// A packed input assembled from uniquely ordered native byte authorities.
 		// Every selected source remains a validated draw reader.
 		std::vector<cached_surface_ref> inputs;
 		std::vector<cached_surface_description> descriptions;
@@ -204,14 +237,18 @@ class surface_cache final
 		std::shared_ptr<const surface_texture_revision> input_revision;
 	};
 	[[nodiscard]] std::optional<scaled_image_endpoints> prepare_scaled_image(const scaled_image_plan& plan,
-		std::chrono::milliseconds timeout);
+		std::chrono::milliseconds timeout, std::size_t writer_limit, std::size_t byte_limit);
 	void draw_scaled_image(const scaled_image_endpoints& endpoints,
-		const std::function<void(context&,std::span<const id<MTLTexture>>)>& encode,
-		std::function<void()> publication_check,std::chrono::milliseconds timeout);
+		std::span<const std::vector<clear_rectangle>> input_windows,
+		const std::function<void(context&,std::span<const id<MTLTexture>>,std::span<const std::vector<scaled_image_input_view>>)>& encode,
+		std::function<void()> publication_check,std::chrono::milliseconds timeout,
+		const std::function<void(context&)>& before_loads = {}, bool defer_completion = false,
+		std::function<void()> after_commit = {});
 
   public:
 	surface_cache(context& ctx, std::shared_ptr<guest_surface_memory> memory, std::size_t heap_budget, std::shared_ptr<metal4::heap_budget> shared_budget = {}, cpu_capture_dispatch capture = {}, surface_metadata_limits metadata = {});
 	~surface_cache();
+	enum class predicated_draw_completion { synchronous, deferred };
 	// One owner-thread command batch. Draws reuse private native target versions;
 	// metadata becomes visible only after successful GPU/VM validation. Readback,
 	// alias/texture/producer boundaries flush automatically. Never submit/begin or
@@ -220,15 +257,23 @@ class surface_cache final
 	{
 		surface_cache* m_owner;
 		std::weak_ptr<void> m_lifetime;
-		explicit draw_batch(surface_cache& owner, std::size_t capacity);
+		explicit draw_batch(surface_cache& owner, std::size_t capacity, predicated_draw_completion completion);
 		friend class surface_cache;
 	  public:
 		~draw_batch();
 		draw_batch(const draw_batch&) = delete;
 		draw_batch& operator=(const draw_batch&) = delete;
+		void submit(); // Close the scope and leave completion to the surface cache.
 		void finish(); // A GPU timeout retains submitted work for synchronize().
 	};
-	[[nodiscard]] draw_batch batch_draws(std::size_t capacity = 64) { return draw_batch(*this, capacity); }
+	// Opening the scope allows preparation while previous GPU work is in flight.
+	// Surface access and finish() perform the necessary completion checks.
+	// A deferred predicated draw submits its own transaction inside the scope.
+	[[nodiscard]] draw_batch batch_draws(std::size_t capacity = 64,
+		predicated_draw_completion completion = predicated_draw_completion::synchronous)
+	{
+		return draw_batch(*this, capacity, completion);
+	}
 	// Allocation-only transaction outside VM exclusion. On a typed allocation
 	// failure, finish an existing prefix and retry once. The callback must unwind
 	// partial allocations and publish its outputs only after complete success.
@@ -236,8 +281,11 @@ class surface_cache final
 	// Query/report consumers must submit recorded counters before polling/waiting.
 	// Does not wait for completion or publish surface metadata.
 	void submit_draw_batch();
+	// Retire completed surface work without flushing a recording or waiting for the GPU.
+	[[nodiscard]] bool poll_submitted();
 	surface_cache(const surface_cache&) = delete;
 	surface_cache& operator=(const surface_cache&) = delete;
+	// A descriptor hit returns a handle without reading or publishing its contents.
 	[[nodiscard]] cached_surface_ref acquire(const cached_surface_description& description);
 	[[nodiscard]] cached_surface_status status(const cached_surface_ref& surface) const;
 	[[nodiscard]] cached_surface_description description(const cached_surface_ref& surface) const;
@@ -278,7 +326,8 @@ class surface_cache final
 	// order. Handles must not escape for future work: keep cached_surface_refs
 	// and prepare/register their current allocation on every use instead.
 	void draw(std::span<const cached_surface_use> surfaces,
-			  const std::function<void(context&, std::span<const id<MTLTexture>>)>& encode);
+			  const std::function<void(context&, std::span<const id<MTLTexture>>)>& encode,
+			  draw_publication publish_draw = {}, const submission* predecessor = nullptr);
 	// Explicit barrier-boundary feedback: read-only entries overlapping a write
 	// target receive immutable native snapshots of their prepared contents. Add
 	// separate read/write entries for the same surface. Duplicate read entries
@@ -296,7 +345,7 @@ class surface_cache final
 	void draw_depth_bounds(std::span<const cached_surface_use> surfaces, std::size_t depth_index,
 						   const std::function<MTL4RenderPassDescriptor*(std::span<const id<MTLTexture>>)>& descriptor,
 						   const std::function<void(context&, std::span<const id<MTLTexture>>, depth_bounds_pass&)>& encode,
-						   bool snapshot_feedback = false);
+						   bool snapshot_feedback = false, draw_publication publish_draw = {}, const submission* predecessor = nullptr);
 	// Typed providers use physical publication and an atomic virtual-watch
 	// receipt even for ordinary writeback. Untyped legacy providers retain CAS.
 	void flush(const cached_surface_ref& surface);
@@ -366,12 +415,13 @@ class surface_cache final
 		const std::shared_ptr<heap_budget>& budget,
 		std::shared_ptr<const surface_texture_revision>* source_revision = nullptr, bool allow_guest_fallback = false,
 		std::optional<surface_format>* source_format = nullptr, std::optional<std::size_t>* source_row_offset = nullptr,
-		bool defer_unsupported = false) __attribute__((ns_returns_retained));
+		bool defer_unsupported = false, const draw_publication& permit = {}) __attribute__((ns_returns_retained));
 	[[nodiscard]] guest_surface_snapshot cpu_read(guest_surface_range range);
 	// Resolve native dirty/deferred overlaps without allocating a CPU snapshot.
 	// Capture bytes later inside the caller's common CPU epoch.
 	void prepare_cpu_read(guest_surface_range range);
 	void prepare_cpu_read_active(const guest_surface_layout& coverage);
+	void prepare_cpu_read_active(const guest_surface_layout& coverage, const draw_publication& permit);
 	void cpu_write(guest_surface_range range, std::span<const std::byte> bytes);
 	// Flush native aliases before capture;store and mirror invalidation then
 	// share one CPU epoch,including a throwing store that may have written a

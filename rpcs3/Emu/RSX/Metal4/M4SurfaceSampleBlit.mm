@@ -19,12 +19,11 @@ texture_region expanded_region(texture_region region, std::uint32_t samples)
 	region.size.height = checked_texture_product(region.size.height, layout.y);
 	return region;
 }
-id<MTLTexture> expanded_texture(context& ctx, id<MTLTexture> texture)
+id<MTLTexture> sample_window_texture(context& ctx, id<MTLTexture> texture, MTLSize size)
 {
-	const auto size = sample_expanded_size(texture.width, texture.height, static_cast<std::uint32_t>(texture.sampleCount));
-	if (size[0] > max_2d_texture_dimension(ctx.device()) || size[1] > max_2d_texture_dimension(ctx.device()))
+	if (size.width > max_2d_texture_dimension(ctx.device()) || size.height > max_2d_texture_dimension(ctx.device()))
 		throw std::invalid_argument("Native expanded sample blit exceeds Apple texture dimensions");
-	auto descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:texture.pixelFormat width:size[0] height:size[1] mipmapped:NO];
+	auto descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:texture.pixelFormat width:size.width height:size.height mipmapped:NO];
 	descriptor.storageMode = MTLStorageModePrivate;
 	descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView;
 	return make_texture(ctx, descriptor);
@@ -55,18 +54,27 @@ void surface_sample_blitter::nearest(context& ctx, surface_format sf, id<MTLText
 	const auto target_region = expanded_region(dr, static_cast<std::uint32_t>(destination.sampleCount));
 	if (typeless)
 		(void)plan_typeless(sf, df, source_region.size.width, source_region.size.height, target_region.size.width, target_region.size.height);
-	const auto input = source.sampleCount == 1 ? source : expanded_texture(ctx, source);
-	const auto output = destination.sampleCount == 1 ? destination : expanded_texture(ctx, destination);
+	const auto input = source.sampleCount == 1 ? source : sample_window_texture(ctx, source, source_region.size);
+	const auto output = destination.sampleCount == 1 ? destination : sample_window_texture(ctx, destination, target_region.size);
+	auto input_region = source_region, output_region = target_region;
 	if (source.sampleCount > 1)
-		m_samples.expand(ctx, source, input, plane);
-	const bool full = dr.origin.x == 0 && dr.origin.y == 0 && dr.size.width == destination.width && dr.size.height == destination.height;
-	if (destination.sampleCount > 1 && !full)
-		m_samples.expand(ctx, destination, output, plane);
-	if (typeless)
-		m_typeless.nearest(ctx, sf, input, source_region, df, output, target_region, flip);
-	else
-		m_blits.nearest(ctx, input, source_region, output, target_region, plane, flip);
+	{
+		m_samples.expand_region(ctx, source, input, {source_region.origin.x, source_region.origin.y}, plane);
+		input_region.origin = MTLOriginMake(0, 0, 0);
+	}
 	if (destination.sampleCount > 1)
-		m_samples.import(ctx, output, destination, plane);
+		output_region.origin = MTLOriginMake(0, 0, 0);
+	const bool full = dr.origin.x == 0 && dr.origin.y == 0 && dr.size.width == destination.width && dr.size.height == destination.height;
+	if (typeless)
+		m_typeless.nearest(ctx, sf, input, input_region, df, output, output_region, flip);
+	else
+		m_blits.nearest(ctx, input, input_region, output, output_region, plane, flip);
+	if (destination.sampleCount > 1)
+	{
+		// A partial import loads the selected attachment and discards samples
+		// outside this window. Never decode or re-export its untouched background.
+		if (full) m_samples.import(ctx, output, destination, plane);
+		else m_samples.import_region(ctx, output, destination, {target_region.origin.x, target_region.origin.y}, plane);
+	}
 }
 } // namespace metal4

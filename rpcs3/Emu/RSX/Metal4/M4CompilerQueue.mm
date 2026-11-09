@@ -1,6 +1,7 @@
 #include "M4CompilerQueue.h"
 
 #include <condition_variable>
+#include <array>
 #include <algorithm>
 #include <deque>
 #include <mutex>
@@ -28,6 +29,8 @@ void validate_function(id<MTLDevice> device, MTL4FunctionDescriptor* descriptor)
 struct compiler_job_state
 {
 	compiler_job_kind kind;
+	std::shared_ptr<void> owner;
+	std::array<std::optional<compiler_function>, 2> functions;
 	std::mutex mutex;
 	std::condition_variable changed;
 	bool done = false, cancelled = false, active = false;
@@ -56,11 +59,50 @@ id<MTLLibrary> compiler_job::library(std::chrono::milliseconds timeout) const { 
 id<MTLComputePipelineState> compiler_job::compute(std::chrono::milliseconds timeout) const { return result(compiler_job_kind::compute, timeout); }
 id<MTLRenderPipelineState> compiler_job::render(std::chrono::milliseconds timeout) const { return result(compiler_job_kind::render, timeout); }
 
+compiler_function::compiler_function(std::shared_ptr<compiler_job_state> job, id<MTLLibrary> library, NSString* name)
+	: m_job(std::move(job)), m_library(library), m_name([name copy])
+{
+	if (!m_name.length || (!m_job && !m_library)) throw std::invalid_argument("Native compiler function requires a library source and name");
+}
+compiler_function compiler_job::function(NSString* name) const
+{
+	if (m_state->kind != compiler_job_kind::library) throw std::invalid_argument("Only native library jobs provide function dependencies");
+	return compiler_function(m_state, nil, name);
+}
+compiler_function compiler_function::from_library(id<MTLLibrary> library, NSString* name)
+{
+	return compiler_function({}, library, name);
+}
+bool compiler_function::ready() const
+{
+	if (!m_job) return true;
+	std::lock_guard lock(m_job->mutex); return m_job->done;
+}
+id<MTLLibrary> compiler_function::library() const
+{
+	return m_job ? compiler_job(m_job).library(std::chrono::milliseconds(0)) : m_library;
+}
+bool compiler_function::same_function(const compiler_function& other) const
+{
+	if (![m_name isEqualToString:other.m_name]) return false;
+	if (m_job && m_job == other.m_job) return true;
+	if (!m_job && !other.m_job) return m_library == other.m_library;
+	try { return ready() && other.ready() && library() == other.library(); }
+	catch (...) { return false; } // Failed sources never poison an unrelated key lookup.
+}
+MTL4LibraryFunctionDescriptor* compiler_function::descriptor() const
+{
+	auto descriptor = [MTL4LibraryFunctionDescriptor new];
+	descriptor.library = library(); descriptor.name = m_name;
+	return descriptor;
+}
+
 struct compiler_queue::implementation : std::enable_shared_from_this<implementation>
 {
 	id<MTL4Compiler> native;
 	dispatch_queue_t worker = dispatch_queue_create("rpcs3.metal4.compiler.launch", DISPATCH_QUEUE_SERIAL);
 	compiler_queue_limits limits;
+	std::shared_ptr<void> identity = std::make_shared<int>(0);
 	mutable std::mutex mutex;
 	std::condition_variable changed;
 	bool closed = false;
@@ -77,7 +119,12 @@ struct compiler_queue::implementation : std::enable_shared_from_this<implementat
 			{
 				std::lock_guard lock(mutex);
 				if (closed || stats.active == limits.active || pending.empty()) return;
-				job = pending.front(); pending.pop_front(); job->active = true;
+				const auto ready = std::find_if(pending.begin(), pending.end(), [](const auto& candidate)
+				{
+					return std::ranges::all_of(candidate->functions, [](const auto& function) { return !function || function->ready(); });
+				});
+				if (ready == pending.end()) return;
+				job = *ready; pending.erase(ready); job->active = true;
 				--stats.queued; ++stats.active;
 				stats.peak_active = std::max(stats.peak_active, stats.active);
 			}
@@ -88,17 +135,20 @@ struct compiler_queue::implementation : std::enable_shared_from_this<implementat
 	{
 		id inputs;
 		id<MTL4CompilerTask> task;
+		std::array<std::optional<compiler_function>, 2> functions;
 		{
 			std::lock_guard lock(job->mutex);
 			if (job->done) return;
 			job->value = value; job->error = error; job->cancelled = cancelled;
 			inputs = job->inputs; job->inputs = nil;
 			task = job->task; job->task = nil;
+			functions = std::move(job->functions); job->functions = {};
 			job->done = true;
 			job->changed.notify_all();
 		}
 		inputs = nil; // Retire copied descriptors outside both locks.
 		task = nil;
+		functions = {};
 		{
 			std::lock_guard lock(mutex);
 			if (job->active) --stats.active;
@@ -125,6 +175,33 @@ struct compiler_queue::implementation : std::enable_shared_from_this<implementat
 			stopped = closed;
 		}
 		if (stopped) { finish(job, nil, nil, true); return; }
+		try
+		{
+			const auto resolve = [&](const compiler_function& function)
+			{
+				auto result = [MTL4LibraryFunctionDescriptor new];
+				result.library = function.library(); result.name = function.m_name;
+				validate_function(native.device, result);
+				return result;
+			};
+			if (job->functions[0])
+			{
+				if (job->kind == compiler_job_kind::compute)
+					static_cast<MTL4ComputePipelineDescriptor*>(job->inputs).computeFunctionDescriptor = resolve(*job->functions[0]);
+				else
+				{
+					auto descriptor = static_cast<MTL4RenderPipelineDescriptor*>(job->inputs);
+					descriptor.vertexFunctionDescriptor = resolve(*job->functions[0]);
+					if (job->functions[1]) descriptor.fragmentFunctionDescriptor = resolve(*job->functions[1]);
+				}
+			}
+		}
+		catch (const std::exception& error)
+		{
+			auto message = [NSString stringWithUTF8String:error.what()] ?: @"Native Metal4 library dependency failed";
+			finish(job, nil, [NSError errorWithDomain:@"rpcs3.metal4.compiler.dependency" code:1 userInfo:@{NSLocalizedDescriptionKey:message}]);
+			return;
+		}
 		const auto owner = shared_from_this();
 		const auto completion_job = job; // Never capture a reference parameter in a late block.
 		id<MTL4CompilerTask> task;
@@ -152,6 +229,7 @@ struct compiler_queue::implementation : std::enable_shared_from_this<implementat
 	}
 	std::optional<compiler_job> admit(std::shared_ptr<compiler_job_state> job, std::chrono::milliseconds timeout)
 	{
+		job->owner = identity;
 		if (timeout.count() < 0 || job->source.size() > limits.source_bytes)
 			throw std::invalid_argument("Metal4 compiler admission timeout or source quota is invalid");
 		const auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -248,6 +326,30 @@ std::optional<compiler_job> compiler_queue::render(MTL4RenderPipelineDescriptor*
 	copy.vertexFunctionDescriptor = descriptor.vertexFunctionDescriptor;
 	copy.fragmentFunctionDescriptor = descriptor.fragmentFunctionDescriptor;
 	auto job = std::make_shared<compiler_job_state>(); job->kind = compiler_job_kind::render; job->inputs = copy;
+	return m_impl->admit(std::move(job), timeout);
+}
+std::optional<compiler_job> compiler_queue::compute(MTL4ComputePipelineDescriptor* descriptor,
+	const compiler_function& function, std::chrono::milliseconds timeout)
+{
+	if (!descriptor || descriptor.computeFunctionDescriptor) throw std::invalid_argument("Dependent native compute requires an empty function slot");
+	if ((function.m_job && function.m_job->owner != m_impl->identity) ||
+		(function.m_library && function.m_library.device != m_impl->native.device))
+		throw std::invalid_argument("Foreign native compute function dependency");
+	auto job = std::make_shared<compiler_job_state>(); job->kind = compiler_job_kind::compute;
+	job->inputs = [descriptor copy]; job->functions[0] = function;
+	return m_impl->admit(std::move(job), timeout);
+}
+std::optional<compiler_job> compiler_queue::render(MTL4RenderPipelineDescriptor* descriptor,
+	const compiler_function& vertex, const std::optional<compiler_function>& fragment, std::chrono::milliseconds timeout)
+{
+	if (!descriptor || descriptor.vertexFunctionDescriptor || descriptor.fragmentFunctionDescriptor)
+		throw std::invalid_argument("Dependent native render requires empty function slots");
+	for (const auto& function : {std::optional<compiler_function>(vertex), fragment})
+		if (function && ((function->m_job && function->m_job->owner != m_impl->identity) ||
+			(function->m_library && function->m_library.device != m_impl->native.device)))
+			throw std::invalid_argument("Foreign native render function dependency");
+	auto job = std::make_shared<compiler_job_state>(); job->kind = compiler_job_kind::render;
+	job->inputs = [descriptor copy]; job->functions = {vertex, fragment};
 	return m_impl->admit(std::move(job), timeout);
 }
 compiler_queue_statistics compiler_queue::statistics() const { std::lock_guard lock(m_impl->mutex); return m_impl->stats; }

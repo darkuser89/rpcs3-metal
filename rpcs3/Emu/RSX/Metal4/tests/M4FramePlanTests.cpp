@@ -45,6 +45,12 @@ int main()
 		rejects([]
 				{ (void)plan_drawable_extent(16384.1, 1, 1, 16384); });
 		frame_policy policy{{1280, 720}};
+		require(policy.pacing == frame_pacing::synchronized && frame_display_sync(policy.pacing));
+		require(!frame_display_sync(frame_pacing::unsynchronized));
+		require(frame_display_sync(frame_pacing::adaptive));
+		auto invalid_pacing = policy;
+		invalid_pacing.pacing = static_cast<frame_pacing>(-1);
+		rejects([&] { validate_frame_policy(invalid_pacing); });
 		require(plan_frame_rectangle({1280, 720}, {1920, 1080}, policy) == frame_rectangle{0, 0, 1920, 1080});
 		require(plan_frame_rectangle({960, 720}, {1920, 1080}, policy) == frame_rectangle{240, 0, 1440, 1080});
 		require(plan_frame_rectangle({1280, 720}, {1000, 1000}, policy) == frame_rectangle{0, 219, 1000, 562});

@@ -125,7 +125,12 @@ int main()
 									input[i] = std::byte((i * 37 + i / 7 + 73) & 255);
 								const auto src = make_upload(ctx, input), dst = make_upload(ctx, output);
 								ctx.begin();
+								const auto before_dma = ctx.encoding_statistics();
 								compute.encode(ctx, plan, src, dst);
+								const auto after_dma = ctx.encoding_statistics();
+								require(after_dma.checked_dispatches == before_dma.checked_dispatches + 1 &&
+									after_dma.dispatch_barriers == before_dma.dispatch_barriers,
+									"Independent dense DMA must use checked dispatch without an intra-pass barrier");
 								ctx.submit().wait();
 								const auto result = map_buffer(dst, 0, output.size());
 								const auto want = expected(plan, input, output);
@@ -138,6 +143,7 @@ int main()
 								++cases;
 							}
 						}
+			std::cout << cases << " checked dense DMA dispatches preserve bytes without intra-pass barriers\n";
 			for (unsigned stride = 1; stride <= 4; ++stride) for (int pitch : {-1048576, 1048576})
 			{
 				const auto plan = plan_dma({4096, 0x200000, 1, 2, 4, 2, -19, pitch, 3, stride, 0});

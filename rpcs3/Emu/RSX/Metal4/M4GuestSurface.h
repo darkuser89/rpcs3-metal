@@ -4,6 +4,7 @@
 #include "M4SwizzleLayout.h"
 
 #include <functional>
+#include <chrono>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -12,6 +13,7 @@
 
 namespace metal4
 {
+using draw_publication = std::function<bool(std::chrono::milliseconds)>;
 class physical_surface;
 class physical_identity;
 struct physical_surface_write;
@@ -202,10 +204,14 @@ class guest_surface_memory
 	[[nodiscard]] virtual guest_surface_snapshot read_surface(const guest_surface_layout& coverage) = 0;
 	// Reads only active bytes, concatenated in ascending guest address order,
 	// under the same exclusion as the returned revision. No padding is mapped.
+	// The default throws, but implementations of this virtual method return.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wmissing-noreturn"
 	[[nodiscard]] virtual guest_surface_snapshot read_surface_packed(const guest_surface_layout&)
 	{
 		throw std::logic_error("Guest memory provider lacks packed active-byte capture");
 	}
+#pragma clang diagnostic pop
 	[[nodiscard]] virtual std::uint64_t surface_revision(const guest_surface_layout& coverage) = 0;
 	[[nodiscard]] virtual std::optional<std::uint64_t> compare_write(const guest_surface_layout& coverage,
 																	 std::uint64_t expected, std::span<const std::byte> bytes) = 0;

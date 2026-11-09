@@ -95,6 +95,7 @@ enum vertex_fault : std::uint32_t
 	vertex_budget_fault = 16,
 	vertex_address_fault = 32,
 	vertex_geometry_fault = 64,
+	vertex_output_fault = 128,
 };
 
 struct generated_vertex_program

@@ -52,12 +52,14 @@ struct nearest_parameters
 	std::uint32_t source_width, source_height, source_depth;
 	std::uint32_t destination_width, destination_height, destination_depth;
 	std::uint32_t bytes, flip;
+	std::uint32_t copy_width, copy_height, copy_depth, copy_x, copy_y, copy_z;
+	std::uint32_t source_x, source_y, source_z;
 };
 
 static_assert(sizeof(copy_parameters) == 32 && offsetof(copy_parameters, swap_width) == 24);
 static_assert(sizeof(fill_parameters) == 24 && offsetof(fill_parameters, value) == 16);
 static_assert(sizeof(e4m12_parameters) == 40 && offsetof(e4m12_parameters, expand) == 24);
-static_assert(sizeof(nearest_parameters) == 96 && offsetof(nearest_parameters, source_width) == 64);
+static_assert(sizeof(nearest_parameters) == 136 && offsetof(nearest_parameters, source_width) == 64 && offsetof(nearest_parameters, source_x) == 120);
 
 void validate_buffer(context& ctx, id<MTLBuffer> buffer, std::size_t offset, std::size_t size)
 {
@@ -67,25 +69,13 @@ void validate_buffer(context& ctx, id<MTLBuffer> buffer, std::size_t offset, std
 	}
 }
 
-void dispatch(context& ctx, id<MTLComputePipelineState> pipeline, const bindings& resources, std::size_t count)
-{
-	ctx.keep_alive(pipeline);
-	auto table = resources.snapshot(ctx);
-	auto encoder = ctx.compute();
-	ctx.barrier(MTLStageDispatch | MTLStageBlit, MTLStageDispatch);
-	[encoder setComputePipelineState:pipeline];
-	[encoder setArgumentTable:table];
-	const auto group_size = std::min<NSUInteger>(256, pipeline.maxTotalThreadsPerThreadgroup);
-	[encoder dispatchThreads:MTLSizeMake(count, 1, 1) threadsPerThreadgroup:MTLSizeMake(group_size, 1, 1)];
-}
-
 } // namespace
 
 transfer_engine::transfer_engine(context& ctx)
 	: m_device(ctx.device())
 {
 	helper_catalog compiler(ctx);
-	auto library = compiler.library(transfer_kernels, @"RPCS3 Metal 4 transfers");
+	auto library = compiler.library(transfer_shader_source(), @"RPCS3 Metal 4 transfers");
 
 	m_copy_pipeline = compiler.compute(library, @"rpcs3_copy_bytes");
 	m_fill_pipeline = compiler.compute(library, @"rpcs3_fill_words");
@@ -128,7 +118,11 @@ void transfer_engine::copy(context& ctx, id<MTLBuffer> source, std::size_t sourc
 		resources.set_buffer(0, source);
 		resources.set_buffer(1, destination);
 		resources.set_buffer(2, parameters.buffer, parameters.offset);
-		dispatch(ctx, m_copy_pipeline, resources, count);
+		const std::array accesses{
+			context::accessed_resource{source, source_offset + position, count},
+			context::accessed_resource{destination, destination_offset + position, count, true},
+			context::accessed_resource{parameters.buffer, parameters.offset, parameters.size}};
+		ctx.checked_dispatch(m_copy_pipeline, resources, accesses, count);
 		position += count;
 	}
 }
@@ -161,7 +155,10 @@ void transfer_engine::fill_words(context& ctx, id<MTLBuffer> destination, std::s
 		bindings resources;
 		resources.set_buffer(0, destination);
 		resources.set_buffer(1, parameters.buffer, parameters.offset);
-		dispatch(ctx, m_fill_pipeline, resources, count);
+		const std::array accesses{
+			context::accessed_resource{destination, offset + position * 4, count * 4, true},
+			context::accessed_resource{parameters.buffer, parameters.offset, parameters.size}};
+		ctx.checked_dispatch(m_fill_pipeline, resources, accesses, count);
 		position += count;
 	}
 }
@@ -202,18 +199,23 @@ void transfer_engine::convert_e4m12(context& ctx, id<MTLBuffer> source, std::siz
 		resources.set_buffer(0, source);
 		resources.set_buffer(1, destination);
 		resources.set_buffer(2, parameters.buffer, parameters.offset);
-		dispatch(ctx, m_e4m12_pipeline, resources, count);
+		const std::array accesses{
+			context::accessed_resource{source, source_offset + position * source_width, count * source_width},
+			context::accessed_resource{destination, destination_offset + position * destination_width, count * destination_width, true},
+			context::accessed_resource{parameters.buffer, parameters.offset, parameters.size}};
+		ctx.checked_dispatch(m_e4m12_pipeline, resources, accesses, count);
 		position += count;
 	}
 }
 
 void transfer_engine::nearest(context& ctx, id<MTLBuffer> source, std::size_t source_offset, nearest_image source_image,
 							  id<MTLBuffer> destination, std::size_t destination_offset, nearest_image destination_image,
-							  std::uint32_t bytes, std::array<bool, 3> flip) const
+							  std::uint32_t bytes, std::array<bool, 3> flip, nearest_projection projection) const
 {
 	if (ctx.device() != m_device)
 		throw std::invalid_argument("Native nearest engine belongs to another device");
 	const auto layout = plan_nearest(source_image, destination_image, bytes);
+	projection=plan_nearest_input_window(source_image.size,destination_image.size,flip,projection).projection;
 	validate_buffer(ctx, source, source_offset, layout.source.allocation_size);
 	validate_buffer(ctx, destination, destination_offset, layout.destination.allocation_size);
 	if (source == destination && source_offset < destination_offset + layout.destination.allocation_size &&
@@ -224,15 +226,22 @@ void transfer_engine::nearest(context& ctx, id<MTLBuffer> source, std::size_t so
 		const auto count = std::min(layout.texels - first, max_dispatch_count);
 		const nearest_parameters params{source_offset, destination_offset,
 										layout.source.bytes_per_row, layout.source.bytes_per_image, layout.destination.bytes_per_row, layout.destination.bytes_per_image,
-										first, count, source_image.size[0], source_image.size[1], source_image.size[2],
+										first, count, projection.source_extent[0], projection.source_extent[1], projection.source_extent[2],
 										destination_image.size[0], destination_image.size[1], destination_image.size[2], bytes,
-										static_cast<std::uint32_t>(flip[0]) | (static_cast<std::uint32_t>(flip[1]) << 1) | (static_cast<std::uint32_t>(flip[2]) << 2)};
+										static_cast<std::uint32_t>(flip[0]) | (static_cast<std::uint32_t>(flip[1]) << 1) | (static_cast<std::uint32_t>(flip[2]) << 2),
+										projection.extent[0], projection.extent[1], projection.extent[2],
+										projection.offset[0], projection.offset[1], projection.offset[2],
+										projection.source_origin[0], projection.source_origin[1], projection.source_origin[2]};
 		const auto parameters = ctx.upload(std::as_bytes(std::span(&params, 1)));
 		bindings resources;
 		resources.set_buffer(0, source);
 		resources.set_buffer(1, destination);
 		resources.set_buffer(2, parameters.buffer, parameters.offset);
-		dispatch(ctx, m_nearest_pipeline, resources, count);
+		const std::array accesses{
+			context::accessed_resource{source, source_offset, layout.source.allocation_size},
+			context::accessed_resource{destination, destination_offset, layout.destination.allocation_size, true},
+			context::accessed_resource{parameters.buffer, parameters.offset, parameters.size}};
+		ctx.checked_dispatch(m_nearest_pipeline, resources, accesses, count);
 		first += count;
 	}
 }

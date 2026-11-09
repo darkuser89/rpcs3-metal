@@ -33,6 +33,7 @@ class memory_pressure_owner final
 		// Each successful step removes one cache resource owner. No entry is
 		// created here, so all passes are bounded by the entry counts at entry.
 		while (needs_room() && m_display && m_display->reclaim_one()) {}
+		while (needs_room() && m_frame && m_frame->reclaim_overlay_image()) {}
 		if (needs_room() && m_frame) (void)m_frame->reclaim_fsr();
 		while (needs_room() && m_textures.reclaim_one()) {}
 		while (needs_room() && m_surfaces.reclaim_clean()) {}

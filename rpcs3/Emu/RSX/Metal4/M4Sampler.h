@@ -63,9 +63,9 @@ class sampler_cache final
   public:
 	explicit sampler_cache(context& ctx, std::size_t capacity = 256, std::shared_ptr<heap_budget> budget = {});
 	[[nodiscard]] texture_view_cache& texture_views() noexcept { return m_views; }
-	[[nodiscard]] id<MTLTexture> border_coverage(id<MTLTexture> source);
-	[[nodiscard]] id<MTLTexture> border_shadow_view(id<MTLTexture> source, float value);
-	[[nodiscard]] id<MTLTexture> border_color_view(id<MTLTexture> source, std::array<std::uint32_t,4> channels);
+	[[nodiscard]] id<MTLTexture> border_coverage(id<MTLTexture> source, border_texture_preparation* preparation = nullptr);
+	[[nodiscard]] id<MTLTexture> border_shadow_view(id<MTLTexture> source, float value, border_texture_preparation* preparation = nullptr);
+	[[nodiscard]] id<MTLTexture> border_color_view(id<MTLTexture> source, std::array<std::uint32_t,4> channels, border_texture_preparation* preparation = nullptr);
 	// Always carry parameters into the shader input. Native descriptor bias is
 	// zero: tested Apple GPU ignored lodBias, so MSL performs bias explicitly.
 	[[nodiscard]] sampler_binding acquire(const guest_sampler_state& state, const sampler_texture_policy& policy = {});

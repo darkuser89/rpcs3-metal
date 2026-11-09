@@ -445,17 +445,24 @@ void upload_admission()
 	(void)ctx.upload(small, 16); // Failure must leave ordinary encoding usable.
 	ctx.cancel();
 	ctx.begin();
-	std::optional<upload_plan> changed = ctx.prepare_uploads(one);
-	(void)ctx.upload(small, 16);
-	bool encoded = false;
-	refuses([&] { ctx.with_uploads(*changed, [&] { encoded = true; }); }, "Changed upload arena accepted stale reservation");
-	require(!encoded, "Stale reservation encoded before validating arena bounds");
-	ctx.cancel();
+	const auto protected_plan = ctx.prepare_uploads(one);
 	context other(1);
 	other.begin();
-	refuses([&] { other.with_uploads(*changed, [] {}); }, "Foreign context accepted upload reservation");
+	refuses([&] { other.with_uploads(protected_plan, [] {}); }, "Foreign context accepted upload reservation");
 	other.cancel();
-	changed.reset();
+	const std::array<std::byte, 16> prerequisite{std::byte{0x8c}};
+	const auto early = ctx.upload(prerequisite, 16);
+	ctx.with_uploads(protected_plan, [&]
+	{
+		const auto admitted = ctx.upload(small, 16);
+		require(early.buffer != admitted.buffer || early.offset + early.size <= admitted.offset ||
+			admitted.offset + admitted.size <= early.offset, "Prerequisite upload overlapped reserved bytes");
+		copy_buffer(ctx, early.buffer, early.offset, readback, 80, prerequisite.size());
+		copy_buffer(ctx, admitted.buffer, admitted.offset, readback, 96, small.size());
+	});
+	ctx.submit().wait();
+	require(std::equal(prerequisite.begin(), prerequisite.end(), result + 80) &&
+		std::equal(small.begin(), small.end(), result + 96), "Prerequisite or admitted upload changed on GPU readback");
 	// A reservation from a recording may only cross its own completed boundary.
 	ctx.begin();
 	(void)ctx.upload(small, 16);
@@ -486,7 +493,7 @@ void upload_admission()
 	second_gate.signaledValue = 1;
 	second.wait();
 	for (unsigned i = 0; i < small.size(); ++i) require(result[i] == small[i], "Former slot reuse overwrote transferred pending upload bytes");
-	std::cout << "Upload admission:three native arena pages,GPU byte copies,no encoding allocations,completed-page reuse,trim retention andgated cross-slot completion;invalid/stale/foreign/nesting/sequence/reuse/submit/cancel guards passed\n";
+	std::cout << "Upload admission:three native arena pages,GPU byte copies,no encoding allocations,completed-page reuse,trim retention andgated cross-slot completion;protected prerequisite bytes and invalid/foreign/nesting/sequence/reuse/submit/cancel guards passed\n";
 }
 
 void admission_failure_boundaries(context& ctx)

@@ -47,21 +47,27 @@ struct vertex_inputs
 class vertex_shader final
 {
 	friend class shader_cache;
+	friend class draw_executor;
+	struct flat_pipeline_state;
 	vertex_shader(const compiler& compiler, const generated_vertex_program& program, const vertex_program_options& options,
-		id<MTLLibrary> prepared = nil);
+		id<MTLLibrary> prepared = nil, std::optional<compiler_job> flat = {});
+	[[nodiscard]] static std::size_t host_bytes(const vertex_program_options& options) noexcept;
+	void prewarm_flat_pipeline() const;
+	[[nodiscard]] id<MTLComputePipelineState> flat_pipeline() const;
 	id<MTLLibrary> m_library;
 	std::array<vertex_texture_dimension, 4> m_dimensions;
 	std::uint32_t m_texture_mask;
 	std::uint32_t m_border_mask;
 	bool m_packed_inputs;
-	bool m_flat_result_inputs;
-	id<MTLComputePipelineState> m_flat_pipeline = nil;
+	std::shared_ptr<flat_pipeline_state> m_flat_pipeline;
 
   public:
 	vertex_shader(const compiler& compiler, std::span<const std::array<std::uint32_t, 4>> instructions,
 				  const vertex_program_options& options = {});
 	[[nodiscard]] MTL4LibraryFunctionDescriptor* function() const;
 	[[nodiscard]] std::vector<upload_requirement> uploads(const vertex_inputs& inputs, const prepared_flat_colors* flat = nullptr) const;
+	[[nodiscard]] static std::vector<upload_requirement> plan_uploads(const vertex_inputs& inputs,
+		bool flat_result_inputs, const prepared_flat_colors* flat);
 	// Must run after context.begin(). The returned table omits geometry buffer
 	// 30; render_commands::draw_geometry uploads and binds that array itself.
 	// State and source references are checked before any GPU command is encoded.

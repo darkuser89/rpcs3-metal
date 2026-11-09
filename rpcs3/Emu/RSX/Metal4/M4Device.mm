@@ -1,12 +1,14 @@
 #include "M4Device.h"
 #include "M4HeapBudget.h"
 #include "M4ConstantUpload.h"
+#include "M4Resources.h"
 
 #if !__has_feature(objc_arc)
 #error "The native Metal 4 backend requires ARC."
 #endif
 
 #include <condition_variable>
+#include <array>
 #include <atomic>
 #include <algorithm>
 #include <bit>
@@ -24,6 +26,8 @@ namespace metal4
 
 struct completion_state
 {
+	explicit completion_state(std::weak_ptr<const std::byte> queue) : queue(std::move(queue)) {}
+	const std::weak_ptr<const std::byte> queue;
 	enum class phase { recording, queued, committing, finished } progress = phase::recording;
 	std::mutex mutex;
 	std::condition_variable changed;
@@ -33,6 +37,13 @@ struct completion_state
 	bool cancelled = false;
 	bool cancel_requested = false;
 	NSError* error = nil;
+	void store_query_outcome(std::byte* target) const
+	{
+		// The RSX query reducer distinguishes cancelled work (which never
+		// wrote its counter) from a GPU failure. Hold mutex while inspecting.
+		const std::uint32_t outcome = cancelled ? 0 : error ? 2 : 1;
+		std::memcpy(target, &outcome, sizeof(outcome));
+	}
 };
 
 namespace
@@ -49,6 +60,24 @@ namespace
 	throw std::runtime_error(message);
 }
 
+struct blit_range
+{
+	std::size_t offset = 0, size = 0;
+	[[nodiscard]] bool overlaps(blit_range other) const
+	{
+		return offset <= other.offset ? other.offset - offset < size : offset - other.offset < other.size;
+	}
+};
+struct compute_access
+{
+	const void* owner = nullptr;
+	const void* placement_heap = nullptr;
+	blit_range bytes, placement;
+	std::optional<std::size_t> mip, slice;
+	MTLRegion box = {};
+	MTLStages stage = 0, ordered_before = 0;
+	bool writes = false, isolated = false, texture = false, buffer_texture = false, host_buffer = false;
+};
 struct command_slot
 {
 	struct upload_page
@@ -86,6 +115,41 @@ struct command_slot
 		std::uint64_t value;
 	};
 	std::vector<event_wait> waits;
+	struct predecessor
+	{
+		std::shared_ptr<completion_state> state;
+		std::byte* query_outcome; // Backed by this slot's retained upload storage.
+	};
+	std::vector<predecessor> predecessors;
+	// Written on the encoding thread. The completion handler never edits
+	// this summary, which remains usable while the slot is in flight.
+	std::array<compute_access, 64> queued_writes;
+	std::size_t queued_write_count = 0;
+	bool opaque_writes = false;
+
+	void note_write(compute_access access)
+	{
+		if (opaque_writes) return;
+		if (access.buffer_texture)
+		{
+			opaque_writes = true;
+			return;
+		}
+		const auto history = std::span{queued_writes}.first(queued_write_count);
+		if (std::any_of(history.begin(), history.end(), [&](const auto& earlier) { return earlier.owner == access.owner; }))
+			return;
+		if (queued_write_count == queued_writes.size())
+		{
+			opaque_writes = true;
+			return;
+		}
+		// Vertex shaders can access the entire bound allocation.
+		access.bytes = {};
+		access.mip.reset();
+		access.slice.reset();
+		access.box = {};
+		queued_writes[queued_write_count++] = access;
+	}
 };
 
 }
@@ -131,12 +195,119 @@ void submission::wait(std::chrono::milliseconds timeout) const
 	std::unique_lock lock(m_state->mutex);
 	if (!m_state->changed.wait_for(lock, timeout, [this] { return m_state->completed; }))
 	{
-		fail("Timed out waiting for Metal 4 submission");
+		throw submission_wait_timeout{};
 	}
 	if (m_state->error)
 	{
 		fail("Metal 4 submission failed", m_state->error);
 	}
+}
+
+namespace
+{
+constexpr MTLStages compute_stages = MTLStageDispatch | MTLStageBlit | MTLStageAccelerationStructure;
+constexpr MTLStages checked_stages = MTLStageDispatch | MTLStageBlit;
+constexpr auto alias_visibility = MTL4VisibilityOptionDevice | MTL4VisibilityOptionResourceAlias;
+
+std::optional<std::size_t> parent_index(std::optional<std::size_t> index, std::size_t base, std::size_t extent)
+{
+	if (index && base < extent && *index < extent - base)
+		return base + *index;
+	return {};
+}
+bool uses_array_slices(MTLTextureType type)
+{
+	return type == MTLTextureType2D || type == MTLTextureType2DArray;
+}
+compute_access describe_access(id<MTLResource> resource, blit_range bytes, bool writes, MTLStages stage,
+	std::optional<std::size_t> mip, std::optional<std::size_t> slice, MTLRegion box = {})
+{
+	compute_access result;
+	result.stage = stage;
+	result.writes = writes;
+	result.texture = !bytes.size;
+	bool private_storage = false;
+	if (result.texture)
+	{
+		auto texture = static_cast<id<MTLTexture>>(resource);
+		while (auto parent = texture.parentTexture)
+		{
+			mip = parent_index(mip, texture.parentRelativeLevel, parent.mipmapLevelCount);
+			if (texture.pixelFormat != parent.pixelFormat)
+				box = {};
+			// The ordinary 2D view types use the same slice units. Other
+			// reinterpretations, such as cube-face views, keep all slices live.
+			if (uses_array_slices(texture.textureType) && uses_array_slices(parent.textureType))
+				slice = parent_index(slice, texture.parentRelativeSlice, parent.arrayLength);
+			else
+				slice.reset();
+			texture = parent;
+		}
+		if (texture.buffer)
+		{
+			// Buffer views share backing with both buffers and other views.
+			result.owner = (__bridge const void*)texture.buffer;
+			result.buffer_texture = true;
+			return result;
+		}
+		private_storage = texture.storageMode == MTLStorageModePrivate && !texture.iosurface &&
+			!texture.shareable && texture.sparseTextureTier == MTLTextureSparseTierNone;
+		if (private_storage && mip && *mip < texture.mipmapLevelCount)
+		{
+			result.mip = mip;
+			result.slice = slice;
+			if (slice && texture.pixelFormat != MTLPixelFormatDepth32Float_Stencil8)
+				result.box = box;
+		}
+		resource = texture;
+	}
+	else
+	{
+		const auto buffer = static_cast<id<MTLBuffer>>(resource);
+		// No-copy shared and sparse buffers may contain mirrored pages.
+		const bool dense = buffer.sparseBufferTier == MTLBufferSparseTierNone;
+		private_storage = dense && buffer.storageMode == MTLStorageModePrivate;
+		result.host_buffer = dense && buffer.storageMode == MTLStorageModeShared && !buffer.heap;
+		if (private_storage)
+			result.bytes = bytes;
+	}
+	result.owner = (__bridge const void*)resource;
+	const auto heap = resource.heap;
+	result.isolated = private_storage && !heap;
+	if (private_storage && heap && heap.type == MTLHeapTypePlacement && resource.allocatedSize &&
+		resource.heapOffset <= heap.size && resource.allocatedSize <= heap.size - resource.heapOffset)
+	{
+		result.placement_heap = (__bridge const void*)heap;
+		result.placement = {resource.heapOffset, resource.allocatedSize};
+	}
+	return result;
+}
+bool texture_boxes_overlap(MTLRegion a, MTLRegion b)
+{
+	if (!a.size.width || !b.size.width) return true;
+	return blit_range{a.origin.x, a.size.width}.overlaps({b.origin.x, b.size.width}) &&
+		blit_range{a.origin.y, a.size.height}.overlaps({b.origin.y, b.size.height}) &&
+		blit_range{a.origin.z, a.size.depth}.overlaps({b.origin.z, b.size.depth});
+}
+bool accesses_conflict(const compute_access& earlier, const compute_access& later)
+{
+	if (!earlier.writes && !later.writes)
+		return false;
+	if (earlier.owner == later.owner)
+	{
+		if (earlier.mip && later.mip)
+			return earlier.mip == later.mip &&
+				(!earlier.slice || !later.slice || earlier.slice == later.slice) &&
+				texture_boxes_overlap(earlier.box, later.box);
+		return !earlier.bytes.size || !later.bytes.size || earlier.bytes.overlaps(later.bytes);
+	}
+	if (earlier.placement_heap && later.placement_heap)
+		return earlier.placement_heap == later.placement_heap && earlier.placement.overlaps(later.placement);
+	// Host-backed buffers cannot name pages in a private placement heap.
+	if ((earlier.placement_heap && later.host_buffer) || (later.placement_heap && earlier.host_buffer))
+		return false;
+	return !earlier.isolated && !later.isolated;
+}
 }
 
 struct context::impl
@@ -147,11 +318,27 @@ struct context::impl
 	dispatch_queue_t submit_queue;
 	std::vector<std::shared_ptr<command_slot>> slots;
 	std::size_t next_slot = 0;
+	recording_overlap overlap = recording_overlap::unrestricted;
 	std::shared_ptr<command_slot> recording;
 	id<MTL4CommandEncoder> encoder = nil;
 	id<MTL4ComputeCommandEncoder> compute_encoder = nil;
 	id<MTL4RenderCommandEncoder> render_encoder = nil;
+	struct guest_render_pass
+	{
+		std::array<id<MTLTexture>, 6> targets;
+		id<MTLBuffer> visibility;
+		MTLVisibilityResultType visibility_type;
+		MTLVisibilityResultMode visibility_mode;
+		std::size_t visibility_offset;
+		std::array<std::size_t, 16> visibility_offsets;
+		std::size_t visibility_count = 0;
+	};
+	std::optional<guest_render_pass> guest_pass;
 	MTLStages encoder_stages = 0;
+	bool raw_compute = false;
+	MTLStages queue_stages = 0, checked_producers = 0;
+	std::array<compute_access, 64> accesses{};
+	std::size_t access_count = 0;
 	std::shared_ptr<heap_budget> buffer_budget;
 	std::shared_ptr<void> upload_identity = std::make_shared<int>(0);
 	std::shared_ptr<upload_plan_state> active_uploads;
@@ -175,7 +362,7 @@ struct context::impl
 };
 
 context::context(std::uint32_t max_in_flight, std::size_t argument_tables_per_slot,
-	std::chrono::milliseconds event_wait_timeout)
+	std::chrono::milliseconds event_wait_timeout, recording_overlap overlap)
 	: m_impl(std::make_unique<impl>())
 {
 	@autoreleasepool
@@ -189,6 +376,7 @@ context::context(std::uint32_t max_in_flight, std::size_t argument_tables_per_sl
 		if (event_wait_timeout <= std::chrono::milliseconds::zero() || event_wait_timeout > std::chrono::minutes(5))
 			throw std::invalid_argument("Metal4 shared-event deadline must be positive and at most five minutes");
 		m_impl->event_wait_timeout = event_wait_timeout;
+		m_impl->overlap = overlap;
 		m_impl->argument_tables_per_slot = argument_tables_per_slot;
 		m_impl->argument_stats.capacity = max_in_flight * argument_tables_per_slot;
 		if (@available(macOS 26.0, *))
@@ -430,9 +618,35 @@ void context::validate_begin() const
 	}
 }
 
-void context::begin()
+std::optional<submission> context::last_submission() const
+{
+	const auto index = (m_impl->next_slot + m_impl->slots.size() - 1) % m_impl->slots.size();
+	const auto& completion = m_impl->slots[index]->completion;
+	if (!completion) return {};
+	return submission(completion);
+}
+
+bool context::can_begin_after(const submission& predecessor) const
+{
+	if (m_impl->stopped || m_impl->recording) return false;
+	const auto previous = last_submission();
+	if (!previous || !previous->same_batch(predecessor)) return false;
+	const auto& next = m_impl->slots[m_impl->next_slot]->completion;
+	if (!next) return true;
+	std::lock_guard lock(next->mutex);
+	return next->completed && !next->error;
+}
+
+void context::begin(const submission* predecessor)
 {
 	validate_begin();
+	if (predecessor && predecessor->m_state->queue.lock() != m_identity)
+		throw std::invalid_argument("Metal4 prerequisite belongs to another queue");
+	if (m_impl->overlap == recording_overlap::explicit_predecessor)
+	{
+		if (const auto previous = last_submission(); previous && (!predecessor || !previous->same_batch(*predecessor)))
+			previous->wait();
+	}
 	auto slot = m_impl->slots[m_impl->next_slot];
 	if (slot->completion)
 	{
@@ -452,15 +666,44 @@ void context::begin()
 	for (auto& page : slot->upload_pages) page.used = 0;
 	slot->upload_page_index = 0;
 	slot->argument_table_index = 0;
+	slot->queued_write_count = 0;
+	slot->opaque_writes = false;
 	[slot->commands beginCommandBufferWithAllocator:slot->allocator];
 	m_impl->recording = std::move(slot);
+	if (predecessor)
+	{
+		try { depend_on_predecessor(*predecessor); }
+		catch (...) { cancel(); throw; }
+	}
 }
 
 id<MTL4ComputeCommandEncoder> context::compute()
 {
+	return compute_encoder(MTLStageAll);
+}
+
+id<MTL4ComputeCommandEncoder> context::compute_encoder(MTLStages before)
+{
 	auto& slot = m_impl->active();
+	const bool raw = before == MTLStageAll;
+	if (raw) slot.opaque_writes = true;
 	if (m_impl->compute_encoder)
 	{
+		if (!m_impl->raw_compute)
+		{
+			const auto missing = (raw ? compute_stages : before) & ~m_impl->queue_stages;
+			if (missing)
+				[m_impl->compute_encoder barrierAfterQueueStages:MTLStageAll beforeStages:missing visibilityOptions:alias_visibility];
+			m_impl->queue_stages |= missing;
+			if (raw)
+			{
+				if (m_impl->checked_producers)
+					barrier(m_impl->checked_producers, compute_stages, true);
+				++m_impl->encoding_stats.checked_blit_raw_transitions;
+				m_impl->raw_compute = true;
+				m_impl->access_count = 0;
+			}
+		}
 		return m_impl->compute_encoder;
 	}
 	end_encoding();
@@ -472,31 +715,252 @@ id<MTL4ComputeCommandEncoder> context::compute()
 	m_impl->encoder = encoder;
 	m_impl->compute_encoder = encoder;
 	++m_impl->encoding_stats.compute_encoders;
-	m_impl->encoder_stages = MTLStageDispatch | MTLStageBlit | MTLStageAccelerationStructure;
-	// Start conservatively. A resource hazard tracker can narrow this later.
-	[encoder barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll
-		visibilityOptions:MTL4VisibilityOptionDevice | MTL4VisibilityOptionResourceAlias];
+	m_impl->encoder_stages = compute_stages;
+	m_impl->raw_compute = raw;
+	m_impl->queue_stages = before;
+	[encoder barrierAfterQueueStages:MTLStageAll beforeStages:before visibilityOptions:alias_visibility];
+	return encoder;
+}
+
+id<MTL4ComputeCommandEncoder> context::checked_blit(accessed_resource source, accessed_resource destination)
+{
+	if (source.resource) use_resource(source.resource);
+	use_resource(destination.resource);
+	destination.writes = true;
+	const bool texture = !destination.size || (source.resource && !source.size);
+	const std::array resources{destination, source};
+	return checked_compute(MTLStageBlit, std::span{resources}.first(source.resource ? 2 : 1), texture);
+}
+
+void context::checked_dispatch(id<MTLComputePipelineState> pipeline, const bindings& arguments,
+	std::span<const accessed_resource> resources, MTLSize grid, MTLSize group)
+{
+	keep_alive(pipeline);
+	const auto table = arguments.snapshot(*this);
+	const auto encoder = checked_compute(MTLStageDispatch, resources, false);
+	[encoder setComputePipelineState:pipeline];
+	[encoder setArgumentTable:table];
+	[encoder dispatchThreads:grid threadsPerThreadgroup:group];
+}
+
+void context::checked_dispatch(id<MTLComputePipelineState> pipeline, const bindings& arguments,
+	std::span<const accessed_resource> resources, std::size_t threads)
+{
+	checked_dispatch(pipeline, arguments, resources, MTLSizeMake(threads, 1, 1),
+		MTLSizeMake(std::min<NSUInteger>(256, pipeline.maxTotalThreadsPerThreadgroup), 1, 1));
+}
+
+id<MTL4ComputeCommandEncoder> context::checked_compute(MTLStages stage, std::span<const accessed_resource> resources, bool texture_blit)
+{
+	std::array<compute_access, max_dispatch_accesses> accesses;
+	if (resources.empty() || resources.size() > accesses.size())
+		throw std::invalid_argument("Checked native compute requires one to sixteen resource accesses");
+	const bool dispatch = stage == MTLStageDispatch;
+	auto& stats = m_impl->encoding_stats;
+	if (!(m_impl->queue_stages & stage) && !m_impl->raw_compute)
+		++(dispatch ? stats.dispatch_queue_barriers :
+			texture_blit ? stats.texture_blit_queue_barriers : stats.buffer_blit_queue_barriers);
+	const auto encoder = compute_encoder(stage);
+	auto& barriers = dispatch ? stats.dispatch_barriers : texture_blit ? stats.texture_blit_barriers : stats.buffer_blit_barriers;
+	if (m_impl->raw_compute)
+	{
+		// An exposed encoder can still receive commands through a previously
+		// returned reference. Only a new encoder restores exact tracking.
+		barrier(compute_stages, stage, true);
+		++barriers;
+		if (!dispatch)
+			++(texture_blit ? stats.texture_blit_alias_barriers : stats.buffer_blit_alias_barriers);
+		return encoder;
+	}
+	if (dispatch)
+		++stats.checked_dispatches;
+	const auto next = std::span{accesses}.first(resources.size());
+	auto& slot = m_impl->active();
+	for (std::size_t i = 0; i < resources.size(); ++i)
+	{
+		const auto& resource = resources[i];
+		next[i] = describe_access(resource.resource, {resource.offset, resource.size}, resource.writes, stage,
+			resource.mip, resource.slice, resource.box);
+		// The native multisample blit-to-render chain needs full queue
+		// coverage. Attachment-only MSAA render passes can still be tracked.
+		if (!resource.size && static_cast<id<MTLTexture>>(resource.resource).sampleCount > 1)
+			slot.opaque_writes = true;
+		if (resource.writes)
+			slot.note_write(next[i]);
+	}
+	auto& count = m_impl->access_count;
+	const auto history = std::span{m_impl->accesses}.first(count);
+	// A buffer texture may alias private buffer writes already retired by a
+	// device-only barrier. Flush aliases before touching that view.
+	const bool buffer_texture = std::any_of(next.begin(), next.end(), [](const auto& access) { return access.buffer_texture; });
+	const bool full = count + next.size() > m_impl->accesses.size();
+	MTLStages producers = (full || buffer_texture) ? m_impl->checked_producers : 0;
+	for (const auto& earlier : history)
+		if (!(earlier.ordered_before & stage) &&
+			std::any_of(next.begin(), next.end(), [&](const auto& later) { return accesses_conflict(earlier, later); }))
+			producers |= earlier.stage;
+	if (producers)
+	{
+		const bool aliases = buffer_texture ||
+			std::any_of(history.begin(), history.end(), [&](const auto& access)
+			{
+				return (access.stage & producers) && (access.texture || !access.isolated);
+			});
+		const auto consumers = full ? checked_stages : stage;
+		barrier(producers, consumers, aliases);
+		++barriers;
+		if (!dispatch)
+			(texture_blit ? stats.texture_blit_alias_barriers : stats.buffer_blit_alias_barriers) += aliases;
+		stats.blit_to_dispatch_barriers += (producers & MTLStageBlit) && (consumers & MTLStageDispatch);
+		stats.dispatch_to_blit_barriers += (producers & MTLStageDispatch) && (consumers & MTLStageBlit);
+		if (full)
+			count = 0;
+		else
+			for (auto& access : history)
+				if (access.stage & producers)
+					access.ordered_before |= consumers;
+	}
+	else
+		++(dispatch ? stats.dispatch_barriers_elided :
+			texture_blit ? stats.texture_blit_barriers_elided : stats.buffer_blit_barriers_elided);
+	for (const auto& access : next)
+		m_impl->accesses[count++] = access;
+	m_impl->checked_producers |= stage;
 	return encoder;
 }
 
 id<MTL4RenderCommandEncoder> context::render(MTL4RenderPassDescriptor* descriptor)
+{
+	return render_encoder(descriptor, MTLStageAll, render_writes::opaque);
+}
+
+bool context::render_reads_wait_needed(const bindings& inputs, id<MTLBuffer> geometry, id<MTLBuffer> owned_visibility) const
+{
+	std::array<const command_slot*, 64> pending;
+	std::size_t used = 0;
+	for (const auto& slot : m_impl->slots)
+	{
+		if (slot != m_impl->recording && (!slot->completion || submission(slot->completion).ready()))
+			continue;
+		if (slot->opaque_writes)
+			return true;
+		if (slot->queued_write_count)
+			pending[used++] = slot.get();
+	}
+	if (!used) return false;
+	const auto counter = (__bridge const void*)owned_visibility;
+	const auto conflicts = [&](id<MTLResource> resource, std::size_t bytes)
+	{
+		const auto read = describe_access(resource, {0, bytes}, false, MTLStageAll, {}, {});
+		if (read.buffer_texture) return true;
+		for (const auto* slot : std::span{pending}.first(used))
+		{
+			const auto writes = std::span{slot->queued_writes}.first(slot->queued_write_count);
+			if (std::any_of(writes.begin(), writes.end(), [&](const auto& write)
+			{
+				// QueryPool allocates its counter storage with newBufferWithLength.
+				// Distinct resources cannot alias it. Buffer views stay conservative.
+				if (counter && write.owner == counter && read.owner != counter) return false;
+				return accesses_conflict(write, read);
+			}))
+				return true;
+		}
+		return false;
+	};
+	if (geometry && conflicts(geometry, geometry.length)) return true;
+	for (const auto& binding : inputs.m_buffers)
+		if (binding.buffer && conflicts(binding.buffer, binding.buffer.length))
+			return true;
+	for (const auto& texture : inputs.m_textures)
+		if (texture && conflicts(texture, 0))
+			return true;
+	return false;
+}
+
+id<MTL4RenderCommandEncoder> context::render_encoder(MTL4RenderPassDescriptor* descriptor, MTLStages before,
+	render_writes writes, const bindings* vertex, id<MTLBuffer> geometry, shared_guest_pass* shared)
 {
 	auto& slot = m_impl->active();
 	if (!descriptor || descriptor.rasterizationRateMap)
 	{
 		throw std::invalid_argument("Metal 4 render pass requires a descriptor without a rasterization rate map");
 	}
+	const auto owned_visibility = shared ? descriptor.visibilityResultBuffer : nil;
+	const auto retained_visibility = owned_visibility ? owned_visibility :
+		shared && m_impl->guest_pass ? m_impl->guest_pass->visibility : nil;
+	if (vertex)
+	{
+		if (!geometry || geometry.device != device() || !geometry.length)
+			throw std::invalid_argument("Checked Metal 4 draw requires native geometry storage");
+		if (!render_reads_wait_needed(*vertex, geometry, retained_visibility))
+			before = MTLStageFragment | MTLStageTile;
+	}
+	// Only DrawExecutor's load/store passes can opt in. Their descriptors
+	// always select the base subresources and have no resolves.
+	std::optional<impl::guest_render_pass> guest_pass;
+	if (shared)
+	{
+		auto& pass = guest_pass.emplace();
+		auto& targets = pass.targets;
+		for (unsigned i = 0; i < 4; ++i) targets[i] = descriptor.colorAttachments[i].texture;
+		targets[4] = descriptor.depthAttachment.texture;
+		targets[5] = descriptor.stencilAttachment.texture;
+		pass.visibility = owned_visibility;
+		pass.visibility_type = descriptor.visibilityResultType;
+		pass.visibility_mode = shared->visibility;
+		pass.visibility_offset = shared->visibility_offset;
+		const bool query_enabled = pass.visibility_mode != MTLVisibilityResultModeDisabled;
+		if (query_enabled) pass.visibility_offsets[pass.visibility_count++] = pass.visibility_offset;
+		// Reuse also requires independent fragment reads. In particular, a
+		// newly sampled view can share storage with an earlier attachment.
+		if (auto& previous = m_impl->guest_pass; before != MTLStageAll && previous && previous->targets == targets)
+		{
+			const bool same_buffer = previous->visibility == pass.visibility && previous->visibility_type == pass.visibility_type;
+			const bool disabled = !pass.visibility && !query_enabled;
+			const bool changed = previous->visibility_mode != pass.visibility_mode || previous->visibility_offset != pass.visibility_offset;
+			// A new visibility command cannot select an offset previously
+			// used in this encoder, even after disabling visibility.
+			const auto used = std::span{previous->visibility_offsets}.first(previous->visibility_count);
+			const bool can_change = previous->visibility && previous->visibility_type == MTLVisibilityResultTypeAccumulate &&
+				(!query_enabled || (used.size() < previous->visibility_offsets.size() &&
+					std::ranges::find(used, pass.visibility_offset) == used.end()));
+			if ((same_buffer || disabled) && (!changed || can_change) &&
+				!render_reads_wait_needed(shared->fragment, nil, retained_visibility))
+			{
+				previous->visibility_mode = pass.visibility_mode;
+				previous->visibility_offset = pass.visibility_offset;
+				if (changed && query_enabled)
+					previous->visibility_offsets[previous->visibility_count++] = pass.visibility_offset;
+				shared->reused = true;
+				shared->visibility_changed = changed;
+				return m_impl->render_encoder;
+			}
+		}
+	}
+	if (writes == render_writes::opaque)
+		slot.opaque_writes = true;
+	const auto attachment = [&](id<MTLTexture> texture)
+	{
+		if (!texture) return;
+		use_resource(texture);
+		if (!slot.opaque_writes)
+			slot.note_write(describe_access(texture, {}, true, MTLStageFragment, {}, {}));
+	};
 	for (NSUInteger i = 0; i < 8; ++i)
 	{
-		auto attachment = descriptor.colorAttachments[i];
-		if (attachment.texture) use_resource(attachment.texture);
-		if (attachment.resolveTexture) use_resource(attachment.resolveTexture);
+		attachment(descriptor.colorAttachments[i].texture);
+		attachment(descriptor.colorAttachments[i].resolveTexture);
 	}
-	if (descriptor.depthAttachment.texture) use_resource(descriptor.depthAttachment.texture);
-	if (descriptor.depthAttachment.resolveTexture) use_resource(descriptor.depthAttachment.resolveTexture);
-	if (descriptor.stencilAttachment.texture) use_resource(descriptor.stencilAttachment.texture);
-	if (descriptor.stencilAttachment.resolveTexture) use_resource(descriptor.stencilAttachment.resolveTexture);
-	if (descriptor.visibilityResultBuffer) use_resource(descriptor.visibilityResultBuffer);
+	attachment(descriptor.depthAttachment.texture);
+	attachment(descriptor.depthAttachment.resolveTexture);
+	attachment(descriptor.stencilAttachment.texture);
+	attachment(descriptor.stencilAttachment.resolveTexture);
+	if (const auto visibility = descriptor.visibilityResultBuffer)
+	{
+		use_resource(visibility);
+		if (!slot.opaque_writes)
+			slot.note_write(describe_access(visibility, {0, visibility.length}, true, MTLStageFragment, {}, {}));
+	}
 	end_encoding();
 	auto encoder = [slot.commands renderCommandEncoderWithDescriptor:descriptor];
 	if (!encoder)
@@ -505,10 +969,13 @@ id<MTL4RenderCommandEncoder> context::render(MTL4RenderPassDescriptor* descripto
 	}
 	m_impl->encoder = encoder;
 	m_impl->render_encoder = encoder;
+	m_impl->guest_pass = std::move(guest_pass);
 	++m_impl->encoding_stats.render_encoders;
 	m_impl->encoder_stages = MTLStageVertex | MTLStageFragment | MTLStageTile;
-	[encoder barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll
-		visibilityOptions:MTL4VisibilityOptionDevice | MTL4VisibilityOptionResourceAlias];
+	[encoder barrierAfterQueueStages:MTLStageAll beforeStages:before visibilityOptions:alias_visibility];
+	++(before == MTLStageAll ? m_impl->encoding_stats.full_render_barriers : m_impl->encoding_stats.fragment_render_barriers);
+	if (vertex)
+		++(before == MTLStageAll ? m_impl->encoding_stats.guest_draw_full_barriers : m_impl->encoding_stats.guest_draw_fragment_barriers);
 	return encoder;
 }
 
@@ -523,7 +990,16 @@ void context::end_encoding()
 	m_impl->encoder = nil;
 	m_impl->compute_encoder = nil;
 	m_impl->render_encoder = nil;
+	m_impl->guest_pass.reset();
 	m_impl->encoder_stages = 0;
+	m_impl->raw_compute = false;
+	m_impl->queue_stages = m_impl->checked_producers = 0;
+	m_impl->access_count = 0;
+}
+
+void context::end_guest_render_pass()
+{
+	if (m_impl->guest_pass) end_encoding();
 }
 
 void context::barrier(MTLStages after, MTLStages before, bool resource_alias)
@@ -624,6 +1100,28 @@ void context::wait_event(id<MTLEvent> event, std::uint64_t value)
 	slot.waits.push_back({event, value});
 }
 
+void context::depend_on_predecessor(const submission& producer, std::byte* query_outcome)
+{
+	auto& slot = m_impl->active();
+	const auto& state = producer.m_state;
+	if (state->queue.lock() != m_identity) throw std::invalid_argument("Metal4 prerequisite belongs to another queue");
+	if (state == slot.observation && !query_outcome) return;
+	{
+		std::lock_guard lock(state->mutex);
+		if (state->progress == completion_state::phase::recording)
+			throw std::invalid_argument("Metal 4 dependency is not submitted");
+		if (state->completed)
+		{
+			if (query_outcome) state->store_query_outcome(query_outcome);
+			else if (state->error) fail("Metal 4 prerequisite failed", state->error);
+			return;
+		}
+	}
+	if (query_outcome || std::ranges::none_of(slot.predecessors, [&](const auto& dependency)
+		{ return dependency.state == state && !dependency.query_outcome; }))
+		slot.predecessors.push_back({state, query_outcome});
+}
+
 upload_slice context::upload(std::span<const std::byte> bytes, std::size_t alignment)
 {
 	auto& slot = m_impl->active();
@@ -643,14 +1141,22 @@ upload_slice context::upload(std::span<const std::byte> bytes, std::size_t align
 	{
 		throw std::invalid_argument("Metal 4 upload size or alignment is invalid");
 	}
+	const auto reserved = m_impl->admitted_uploads.lock();
 	while (slot.upload_page_index < slot.upload_pages.size())
 	{
 		auto& page = slot.upload_pages[slot.upload_page_index];
+		std::size_t available = page.buffer.length;
+		// Prerequisite encoders can upload before the admitted draw consumes its slices.
+		if (reserved && !reserved->consumed)
+		{
+			const auto region = std::ranges::find(reserved->regions, page.buffer, &upload_plan_state::region::buffer);
+			if (region != reserved->regions.end()) available = region->begin;
+		}
 		const auto padding = (alignment - (page.used & (alignment - 1))) & (alignment - 1);
-		if (padding <= page.buffer.length - page.used)
+		if (page.used <= available && padding <= available - page.used)
 		{
 			const auto offset = page.used + padding;
-			if (bytes.size() <= page.buffer.length - offset)
+			if (bytes.size() <= available - offset)
 			{
 				use_resource(page.buffer);
 				std::memcpy(static_cast<std::byte*>(page.buffer.contents) + offset, bytes.data(), bytes.size());
@@ -669,6 +1175,11 @@ upload_slice context::upload(std::span<const std::byte> bytes, std::size_t align
 }
 
 upload_plan context::prepare_uploads(std::span<const upload_requirement> requirements)
+{
+	return *plan_uploads(requirements, true);
+}
+
+std::optional<upload_plan> context::plan_uploads(std::span<const upload_requirement> requirements, bool allow_recovery)
 {
 	if (m_impl->stopped || m_impl->active_uploads || requirements.empty() || requirements.size() > 256)
 		throw std::invalid_argument("Metal4 upload admission requires an idle admission scope and1..256 uploads");
@@ -717,7 +1228,10 @@ upload_plan context::prepare_uploads(std::span<const upload_requirement> require
 		if (index == pages.size())
 		{
 			const auto size = std::min<std::size_t>(limit, std::max<std::size_t>(1024 * 1024, request.size));
-			const auto buffer = allocate_buffer(size, MTLStorageModeShared);
+			id<MTLBuffer> buffer = nil;
+			if (allow_recovery) buffer = allocate_buffer(size, MTLStorageModeShared);
+			else if (m_impl->buffer_budget) buffer = m_impl->buffer_budget->try_shared_buffer(size);
+			if (!buffer) return std::nullopt;
 			pages.push_back({buffer, 0});
 		}
 		auto& page = pages[index];
@@ -786,7 +1300,7 @@ void context::with_uploads(const upload_plan& reservation, const std::function<v
 submission context::recording_submission()
 {
 	auto& slot = m_impl->active();
-	if (!slot.observation) slot.observation = std::make_shared<completion_state>();
+	if (!slot.observation) slot.observation = std::make_shared<completion_state>(m_identity);
 	return submission(slot.observation);
 }
 
@@ -799,7 +1313,7 @@ submission context::submit()
 		m_impl->active();
 		if (slot->drawable && !slot->checks.empty())
 			throw std::logic_error("GPU validation must complete before drawable presentation");
-		auto state = slot->observation ? slot->observation : std::make_shared<completion_state>();
+		auto state = slot->observation ? slot->observation : std::make_shared<completion_state>(m_identity);
 		MTL4CommitOptions* options = [MTL4CommitOptions new];
 		if (!options) fail("Metal4 commit options allocation failed");
 		// Capturing the slot keeps every GPU object alive through completion,
@@ -866,9 +1380,36 @@ submission context::submit()
 			{
 				bool expired = false;
 				bool cancelled = false;
+				NSError* prerequisite_error = nil;
+				for (const auto& [predecessor, query_outcome] : slot->predecessors)
+				{
+					for (;;)
+					{
+						{
+							std::lock_guard lock(state->mutex);
+							cancelled = state->cancel_requested || stopping->load();
+						}
+						if (cancelled) break;
+						std::unique_lock lock(predecessor->mutex);
+						if (predecessor->completed)
+						{
+							if (query_outcome) predecessor->store_query_outcome(query_outcome);
+							else prerequisite_error = predecessor->error;
+							break;
+						}
+						const auto now = std::chrono::steady_clock::now();
+						if (now >= deadline) { expired = true; break; }
+						predecessor->changed.wait_until(lock, std::min(deadline, now + std::chrono::milliseconds(10)));
+					}
+					if (cancelled || expired || prerequisite_error) break;
+				}
+				slot->predecessors.clear();
+				const bool prerequisite_expired = expired;
 				// Do not enqueue any native queue waits before cancellation is
 				// closed. Otherwise a cancelled batch could poison later commits.
 				for (const auto& wait : slot->waits)
+				{
+					if (cancelled || expired || prerequisite_error) break;
 					if ([wait.event conformsToProtocol:@protocol(MTLSharedEvent)])
 					{
 						const auto shared = static_cast<id<MTLSharedEvent>>(wait.event);
@@ -886,9 +1427,10 @@ submission context::submit()
 						}
 						if (cancelled || expired) break;
 					}
+				}
 				{
 					std::lock_guard lock(state->mutex);
-					if (expired || state->cancel_requested || stopping->load())
+					if (prerequisite_error || expired || state->cancel_requested || stopping->load())
 					{
 						// Never committed: no GPU can reference this slot. Cleanup
 						// completes before publishing the token or reusing storage.
@@ -904,8 +1446,15 @@ submission context::submit()
 							slot->upload_pages.clear();
 							slot->argument_tables.clear();
 						}
-						state->error = [NSError errorWithDomain:@"RPCS3Metal4Cancellation" code:expired ? 2 : 1
-							userInfo:@{NSLocalizedDescriptionKey:expired ? @"Shared-event deadline expired before Metal4 commit" : @"Queued batch cancelled before Metal4 commit"}];
+						state->error = prerequisite_error;
+						if (!state->error)
+						{
+							NSString* reason = @"Queued batch cancelled before Metal4 commit";
+							if (expired)
+								reason = prerequisite_expired ? @"Prerequisite deadline expired before Metal4 commit" : @"Shared-event deadline expired before Metal4 commit";
+							state->error = [NSError errorWithDomain:@"RPCS3Metal4Cancellation" code:expired ? 2 : 1
+								userInfo:@{NSLocalizedDescriptionKey:reason}];
+						}
 						state->cancelled = state->gpu_completed = state->commit_finished = state->completed = true;
 						state->progress = completion_state::phase::finished;
 						state->changed.notify_all();
@@ -956,6 +1505,7 @@ void context::cancel()
 	slot.checks.clear();
 	slot.owners.clear();
 	slot.waits.clear();
+	slot.predecessors.clear();
 	slot.drawable = nil;
 	if (const auto state = slot.observation)
 	{

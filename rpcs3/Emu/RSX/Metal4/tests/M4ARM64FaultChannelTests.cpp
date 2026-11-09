@@ -114,7 +114,7 @@ void test_admission_and_lifetime()
 			result = client.exchange({}, 0x1000, false).status;
 		});
 		while (!ready.load(std::memory_order_acquire)) std::this_thread::yield();
-		begin.store(true, std::memory_order_release); channel.close(); producer.join();
+		begin.store(true, std::memory_order_release); channel.request_close(); producer.join();
 		require(result == arm64_fault_channel::outcome::cancelled, "Native ARM admission raced close and escaped cancellation");
 	}
 	auto channel = std::make_unique<arm64_fault_channel>(0x1000, 4096, 1);
@@ -129,6 +129,40 @@ void test_admission_and_lifetime()
 	while (!ready.load(std::memory_order_acquire)) std::this_thread::yield();
 	channel.reset(); begin.store(true, std::memory_order_release); producer.join();
 	require(result == arm64_fault_channel::outcome::cancelled, "Native ARM registered slot did not outlive closed channel ownership");
+}
+
+void test_close_from_running_callback()
+{
+	using outcome = arm64_fault_channel::outcome;
+	arm64_fault_channel channel{0x1000, 4096, 2};
+	outcome running = outcome::failed;
+	outcome cancelled = outcome::failed;
+	outcome later = outcome::failed;
+	std::thread first([&]
+	{
+		auto client = channel.attach();
+		running = client.exchange({}, 0x1000, false).status;
+	});
+	await_pending(channel);
+	std::size_t drained = channel.drain([&](const auto& request) -> std::optional<arm64_memory_state>
+	{
+		std::thread second([&]
+		{
+			auto client = channel.attach();
+			cancelled = client.exchange({}, 0x1001, false).status;
+			later = client.exchange({}, 0x1002, false).status;
+		});
+		await_pending(channel);
+		channel.request_close();
+		second.join();
+		return request.before;
+	});
+	first.join();
+	channel.close();
+	require(drained == 1 && running == outcome::completed && cancelled == outcome::cancelled &&
+		later == outcome::cancelled && !channel.has_pending(),
+		"Native ARM nonblocking close left a parked request or cancelled running work");
+	std::cout << "ARM fault failure cancellation: running callback closed admission without waiting; queued and later faults cancelled; 128 admission races passed\n";
 }
 
 void test_callback_retirement()
@@ -232,7 +266,8 @@ void test_registration_and_fetch()
 } // namespace
 void test_arm64_fault_channel()
 {
-	test_owned_slots(); test_failure_and_close(); test_admission_and_lifetime(); test_callback_retirement(); test_registration_and_fetch();
+	test_owned_slots(); test_failure_and_close(); test_admission_and_lifetime(); test_close_from_running_callback();
+	test_callback_retirement(); test_registration_and_fetch();
 	std::cout << "ARM fault channel:32 owned concurrent exchanges,16 registered host producers;fixed slots/TLS identity;owner/foreign/budget refusal;unsupported/exception/pending-cancel/running-close join/reentry;128 admission-close races,registered slot and owned callback-destructor lifetime;owner kernel instruction capture/executable-only/invalid PCs;no App/guest CPU/signal installation\n";
 }
 #ifdef METAL4_ARM64_FAULT_CHANNEL_STANDALONE

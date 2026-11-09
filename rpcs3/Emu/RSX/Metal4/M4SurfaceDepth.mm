@@ -7,6 +7,7 @@
 #endif
 
 #include <algorithm>
+#include <cstring>
 
 namespace metal4
 {
@@ -71,10 +72,11 @@ surface_depth_transfer::surface_depth_transfer(context& ctx) : m_device(ctx.devi
 	const auto library = compiler.library(surface_depth_kernels, @"RPCS3 native depth/stencil surface codec");
 
 	m_pipeline = compiler.compute(library, @"rpcs3_surface_depth");
+	m_patch_pipeline = compiler.compute(library, @"rpcs3_surface_depth_patch");
 }
 
 void surface_depth_transfer::convert(context& ctx, surface_depth format, std::size_t width, std::size_t height,
-									 id<MTLBuffer> guest, surface_byte_region bytes, const depth_transfer_plane& depth, const depth_transfer_plane& stencil, bool gather) const
+									 id<MTLBuffer> guest, surface_byte_region bytes, const depth_transfer_plane& depth, const depth_transfer_plane& stencil, bool gather, id<MTLBuffer> prepared) const
 {
 	if (ctx.device() != m_device)
 		throw std::invalid_argument("Depth transfer belongs to another device");
@@ -93,12 +95,12 @@ void surface_depth_transfer::convert(context& ctx, surface_depth format, std::si
 	else if (stencil.buffer)
 		throw std::invalid_argument("Z16 surface does not have a stencil plane");
 	const std::array<std::byte, 16> zero{};
-	const auto dummy = !metadata.stencil ? ctx.upload(zero, 16) : upload_slice{};
+	const auto dummy = !metadata.stencil ?
+		(prepared ? upload_slice{prepared, 0, zero.size()} : ctx.upload(zero, 16)) : upload_slice{};
 	bindings resources;
 	resources.set_buffer(0, guest);
 	resources.set_buffer(1, depth.buffer);
 	resources.set_buffer(2, metadata.stencil ? stencil.buffer : dummy.buffer, metadata.stencil ? 0 : dummy.offset);
-	ctx.keep_alive(m_pipeline);
 	const auto pixels = checked_texture_product(width, height);
 	constexpr std::size_t max_count = 1u << 30;
 	for (std::size_t first = 0; first < pixels;)
@@ -106,15 +108,15 @@ void surface_depth_transfer::convert(context& ctx, surface_depth format, std::si
 		const auto count = std::min(pixels - first, max_count);
 		const depth_parameters parameters{bytes.offset, depth.bytes.offset, stencil.bytes.offset, gl.bytes_per_row, dl.bytes_per_row,
 										  sl.bytes_per_row, width, count, first, static_cast<std::uint32_t>(format), gather ? 1u : 0u};
-		const auto uniforms = ctx.upload(std::as_bytes(std::span{&parameters, 1}), 256);
+		const auto uniforms = prepared ? upload_slice{prepared, (first / max_count) * 256, sizeof(parameters)} :
+			ctx.upload(std::as_bytes(std::span{&parameters, 1}), 256);
 		resources.set_buffer(3, uniforms.buffer, uniforms.offset);
-		const auto table = resources.snapshot(ctx);
-		const auto encoder = ctx.compute();
-		ctx.barrier(MTLStageDispatch | MTLStageBlit, MTLStageDispatch);
-		[encoder setComputePipelineState:m_pipeline];
-		[encoder setArgumentTable:table];
-		[encoder dispatchThreads:MTLSizeMake(count, 1, 1)
-			threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(256, m_pipeline.maxTotalThreadsPerThreadgroup), 1, 1)];
+		const std::array accesses{
+			context::accessed_resource{guest, bytes.offset, gl.allocation_size, gather},
+			context::accessed_resource{depth.buffer, depth.bytes.offset, dl.allocation_size, !gather},
+			context::accessed_resource{uniforms.buffer, uniforms.offset, uniforms.size},
+			context::accessed_resource{stencil.buffer, stencil.bytes.offset, sl.allocation_size, !gather}};
+		ctx.checked_dispatch(m_pipeline, resources, std::span{accesses}.first(metadata.stencil ? 4 : 3), count);
 		first += count;
 	}
 }
@@ -129,34 +131,121 @@ void surface_depth_transfer::gather(context& ctx, surface_depth format, std::siz
 {
 	convert(ctx, format, width, height, guest, bytes, depth, stencil, true);
 }
+surface_depth_transfer::transfer_storage surface_depth_transfer::prepare_transfer(context& ctx, surface_depth format,
+	id<MTLBuffer> guest, surface_byte_region bytes, const texture_region& region, bool gather) const
+{
+	if (ctx.device() != m_device) throw std::invalid_argument("Depth transfer belongs to another device");
+	const auto metadata = describe_surface_depth(format);
+	const auto width = region.size.width, height = region.size.height;
+	const auto gl = range(ctx, {guest, bytes}, metadata.guest_bytes, width, height);
+	const auto depth = staging(ctx, metadata.depth_bytes, region);
+	const auto stencil = metadata.stencil ? staging(ctx, 1, region) : depth_transfer_plane{};
+	const auto pixels = checked_texture_product(width, height);
+	constexpr std::size_t max_count = 1u << 30;
+	static_assert(sizeof(depth_parameters) <= 256);
+	const auto uniforms = make_buffer(ctx, checked_texture_product((pixels - 1) / max_count + 1, 256), buffer_storage::shared);
+	auto* output = static_cast<std::byte*>(uniforms.contents);
+	for (std::size_t first = 0; first < pixels;)
+	{
+		const auto count = std::min(pixels - first, max_count);
+		const depth_parameters params{bytes.offset, depth.bytes.offset, stencil.bytes.offset, gl.bytes_per_row,
+			depth.bytes.row_pitch, stencil.bytes.row_pitch, width, count, first, static_cast<std::uint32_t>(format), gather ? 1u : 0u};
+		std::memcpy(output, &params, sizeof(params));
+		output += 256;
+		first += count;
+	}
+	return {depth, stencil, uniforms};
+}
+
 void surface_depth_transfer::upload(context& ctx, surface_depth format, id<MTLBuffer> guest, surface_byte_region bytes,
-									id<MTLTexture> texture, const texture_region& region) const
+	id<MTLTexture> texture, const texture_region& region, texture_plane plane) const
+{
+	upload_impl(ctx, format, guest, bytes, texture, region, nullptr, plane);
+}
+void surface_depth_transfer::upload_impl(context& ctx, surface_depth format, id<MTLBuffer> guest, surface_byte_region bytes,
+									id<MTLTexture> texture, const texture_region& region, const transfer_storage* prepared, texture_plane plane) const
 {
 	if (ctx.device() != m_device)
 		throw std::invalid_argument("Depth transfer belongs to another device");
 	const auto metadata = describe_surface_depth(format);
+	if (plane != texture_plane::all && plane != texture_plane::depth && (plane != texture_plane::stencil || !metadata.stencil))
+		throw std::invalid_argument("Native depth upload selected an unavailable plane");
 	validate_surface_texture(ctx, metadata.format, texture, region);
 	(void)range(ctx, {guest, bytes}, metadata.guest_bytes, region.size.width, region.size.height);
-	const auto depth = staging(ctx, metadata.depth_bytes, region);
-	const auto stencil = metadata.stencil ? staging(ctx, 1, region) : depth_transfer_plane{};
-	scatter(ctx, format, region.size.width, region.size.height, guest, bytes, depth, stencil);
-	buffer_to_texture(ctx, depth.buffer, 0, texture, region, depth.bytes.row_pitch, 0, texture_plane::depth);
-	if (metadata.stencil)
+	const auto depth = prepared ? prepared->depth : staging(ctx, metadata.depth_bytes, region);
+	const auto stencil = prepared ? prepared->stencil : metadata.stencil ? staging(ctx, 1, region) : depth_transfer_plane{};
+	convert(ctx, format, region.size.width, region.size.height, guest, bytes, depth, stencil, false,
+		prepared ? prepared->uniforms : nil);
+	if (plane != texture_plane::stencil)
+		buffer_to_texture(ctx, depth.buffer, 0, texture, region, depth.bytes.row_pitch, 0, texture_plane::depth);
+	if (metadata.stencil && plane != texture_plane::depth)
 		buffer_to_texture(ctx, stencil.buffer, 0, texture, region, stencil.bytes.row_pitch, 0, texture_plane::stencil);
 }
 void surface_depth_transfer::download(context& ctx, surface_depth format, id<MTLTexture> texture, const texture_region& region,
 									  id<MTLBuffer> guest, surface_byte_region bytes) const
 {
+	download_impl(ctx, format, texture, region, guest, bytes, nullptr);
+}
+void surface_depth_transfer::download_impl(context& ctx, surface_depth format, id<MTLTexture> texture,
+	const texture_region& region, id<MTLBuffer> guest, surface_byte_region bytes, const transfer_storage* prepared) const
+{
 	if (ctx.device() != m_device)
 		throw std::invalid_argument("Depth transfer belongs to another device");
 	const auto metadata = describe_surface_depth(format);
 	validate_surface_texture(ctx, metadata.format, texture, region);
 	(void)range(ctx, {guest, bytes}, metadata.guest_bytes, region.size.width, region.size.height);
-	const auto depth = staging(ctx, metadata.depth_bytes, region);
-	const auto stencil = metadata.stencil ? staging(ctx, 1, region) : depth_transfer_plane{};
+	const auto depth = prepared ? prepared->depth : staging(ctx, metadata.depth_bytes, region);
+	const auto stencil = prepared ? prepared->stencil : metadata.stencil ? staging(ctx, 1, region) : depth_transfer_plane{};
 	texture_to_buffer(ctx, texture, region, depth.buffer, 0, depth.bytes.row_pitch, 0, texture_plane::depth);
 	if (metadata.stencil)
 		texture_to_buffer(ctx, texture, region, stencil.buffer, 0, stencil.bytes.row_pitch, 0, texture_plane::stencil);
-	gather(ctx, format, region.size.width, region.size.height, depth, stencil, guest, bytes);
+	convert(ctx, format, region.size.width, region.size.height, guest, bytes, depth, stencil, true,
+		prepared ? prepared->uniforms : nil);
+}
+
+void surface_depth_transfer::patch(context& ctx, surface_depth format, id<MTLBuffer> guest, id<MTLBuffer> mask,
+	surface_byte_region bytes, id<MTLTexture> texture, const texture_region& region) const
+{
+	if (ctx.device() != m_device)
+		throw std::invalid_argument("Depth patch belongs to another device");
+	const auto metadata = describe_surface_depth(format);
+	validate_surface_texture(ctx, metadata.format, texture, region);
+	const auto width = region.size.width, height = region.size.height;
+	const auto gl = range(ctx, {guest, bytes}, metadata.guest_bytes, width, height);
+	(void)range(ctx, {mask, bytes}, metadata.guest_bytes, width, height);
+	const auto depth = staging(ctx, metadata.depth_bytes, region);
+	const auto stencil = metadata.stencil ? staging(ctx, 1, region) : depth_transfer_plane{};
+	// Retain raw native bits, including low float mantissa bits which do not
+	// survive a guest-word round trip. Stencil-only writes never recode depth.
+	texture_to_buffer(ctx, texture, region, depth.buffer, 0, depth.bytes.row_pitch, 0, texture_plane::depth);
+	if (metadata.stencil)
+		texture_to_buffer(ctx, texture, region, stencil.buffer, 0, stencil.bytes.row_pitch, 0, texture_plane::stencil);
+	const std::array<std::byte, 16> zero{};
+	const auto dummy = metadata.stencil ? upload_slice{} : ctx.upload(zero, 16);
+	bindings resources;
+	resources.set_buffer(0, guest);
+	resources.set_buffer(1, depth.buffer);
+	resources.set_buffer(2, metadata.stencil ? stencil.buffer : dummy.buffer, metadata.stencil ? 0 : dummy.offset);
+	resources.set_buffer(4, mask);
+	const auto pixels = checked_texture_product(width, height);
+	constexpr std::size_t max_count = 1u << 30;
+	for (std::size_t first = 0; first < pixels;)
+	{
+		const auto count = std::min(pixels - first, max_count);
+		const depth_parameters parameters{bytes.offset, 0, 0, gl.bytes_per_row, depth.bytes.row_pitch,
+			stencil.bytes.row_pitch, width, count, first, static_cast<std::uint32_t>(format), 0};
+		const auto uniforms = ctx.upload(std::as_bytes(std::span{&parameters, 1}), 256);
+		resources.set_buffer(3, uniforms.buffer, uniforms.offset);
+		const std::array accesses{context::accessed_resource{guest, bytes.offset, gl.allocation_size},
+			context::accessed_resource{depth.buffer, 0, depth.buffer.length, true},
+			context::accessed_resource{mask, bytes.offset, gl.allocation_size},
+			context::accessed_resource{uniforms.buffer, uniforms.offset, uniforms.size},
+			context::accessed_resource{stencil.buffer, 0, stencil.buffer.length, true}};
+		ctx.checked_dispatch(m_patch_pipeline, resources, std::span{accesses}.first(metadata.stencil ? 5 : 4), count);
+		first += count;
+	}
+	buffer_to_texture(ctx, depth.buffer, 0, texture, region, depth.bytes.row_pitch, 0, texture_plane::depth);
+	if (metadata.stencil)
+		buffer_to_texture(ctx, stencil.buffer, 0, texture, region, stencil.bytes.row_pitch, 0, texture_plane::stencil);
 }
 } // namespace metal4

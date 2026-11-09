@@ -3,6 +3,7 @@
 #include "M4GuestSegments.h"
 #include "M4BankedTile.h"
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <limits>
 #include <set>
@@ -30,6 +31,14 @@ struct display_storage_assembly
 	std::vector<display_storage_copy> copies;
 	std::vector<guest_surface_range> vm;
 };
+struct display_storage_epoch_run
+{
+	std::size_t size;
+	std::optional<std::uint64_t> epoch;
+	bool dirty;
+};
+// Optional per-source subdivision of an exact matched physical run.
+using display_storage_epochs = std::function<display_storage_epoch_run(std::size_t input, std::size_t source, std::size_t size)>;
 // Same main-memory bank permutation as the native bank transfer. Address
 // bits0..4 are preserved, so active byte runs are projected in32-byte groups
 // rather than visiting every texel. Local VRAM never enters this mapping.
@@ -119,7 +128,7 @@ struct display_storage_assembly
 // addresses from masquerading as old storage. Caller owns writer exclusion.
 [[nodiscard]] inline display_storage_assembly plan_display_storage_assembly(guest_surface_memory& memory,
 	const guest_surface_layout& display, std::span<const display_storage_source> inputs,
-	std::span<const guest_storage_segment> requested_segments = {})
+	std::span<const guest_storage_segment> requested_segments = {}, const display_storage_epochs& epochs = {})
 {
 	if (display.morton || display.column_stride || inputs.empty() || inputs.size() > 64)
 		throw std::invalid_argument("Display assembly requires linear AV bytes and one to64 native sources");
@@ -190,7 +199,8 @@ struct display_storage_assembly
 		}
 		if(position!=display.range.size)throw std::invalid_argument("Segmented assembly target is incomplete");
 	}
-	std::vector<display_storage_copy> matches;
+	struct match : display_storage_copy { std::uint64_t epoch; bool dirty; };
+	std::vector<match> matches;
 	for(const auto& requested_part:requested_parts)
 	{
 	guest_surface_byte_cursor requested(requested_part.coverage);
@@ -207,11 +217,21 @@ struct display_storage_assembly
 				if (source.maximum <= target.offset || parts[first].offset >= end) return;
 				self(self,first,middle);
 				const auto begin = std::max(source.offset,target.offset), finish = std::min(source.offset+source.size,end);
-				if (begin < finish)
+			for (auto at = begin; at < finish;)
+				{
+				const auto offset = source.logical + at - source.offset;
+				const auto remaining = finish - at;
+				const auto& input = inputs[source.input];
+				const auto run = epochs ? epochs(source.input, offset, remaining) : display_storage_epoch_run{remaining, input.epoch, input.dirty};
+				if (!run.size || run.size > remaining)
+					throw std::logic_error("Display assembly epoch subdivision exceeds its match");
+				if (run.epoch)
 				{
 					if (matches.size() == limit) throw std::length_error("Display assembly exceeds intersection budget");
-					matches.push_back({requested_part.offset+std::size_t(target.guest.address-requested_part.coverage.range.address)+begin-target.offset,
-						source.logical+begin-source.offset,finish-begin,source.input});
+					matches.push_back({{requested_part.offset+std::size_t(target.guest.address-requested_part.coverage.range.address)+at-target.offset,
+						offset,run.size,source.input},*run.epoch,run.dirty});
+				}
+				at += run.size;
 				}
 				if (source.offset < end) self(self,middle+1,last);
 			};
@@ -224,9 +244,9 @@ struct display_storage_assembly
 	std::sort(events.begin(),events.end(),[](const auto& a,const auto& b) { return a.position < b.position; });
 	const auto order = [&](std::size_t ai,std::size_t bi)
 	{
-		const auto& a = inputs[matches[ai].input]; const auto& b = inputs[matches[bi].input];
+		const auto& a = matches[ai]; const auto& b = matches[bi];
 		if (a.dirty != b.dirty) return a.dirty > b.dirty;
-		if (a.epoch != b.epoch) return a.epoch > b.epoch;
+		if (matches[ai].epoch != matches[bi].epoch) return matches[ai].epoch > matches[bi].epoch;
 		return ai < bi;
 	};
 	std::set<std::size_t,decltype(order)> live(order);
@@ -242,8 +262,8 @@ struct display_storage_assembly
 		const auto& best = matches[*live.begin()]; const auto source = best.source+position-best.target;
 		for (auto it=std::next(live.begin());it!=live.end();++it)
 		{
-			const auto& next = matches[*it]; const auto& a=inputs[best.input]; const auto& b=inputs[next.input];
-			if (a.dirty!=b.dirty || a.epoch!=b.epoch) break;
+			const auto& next = matches[*it];
+			if (best.dirty!=next.dirty || best.epoch!=next.epoch) break;
 			if (best.input!=next.input || source!=next.source+position-next.target)
 				throw std::invalid_argument("Display assembly lacks a unique native byte authority");
 		}

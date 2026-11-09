@@ -331,9 +331,15 @@ int main(int argc, char** argv)
 					auto w = instruction(23);
 					fragment_program_options options;
 					if (flags == 2)
+					{
 						options.redirected_textures = 1;
+						options.textures[0] = vertex_texture_dimension::cube;
+					}
 					if (flags == 4)
+					{
 						options.multisampled_textures = 1;
+						options.textures[0] = vertex_texture_dimension::cube;
+					}
 					std::vector<std::byte> b;
 					append(b, w);
 					(void)generate_fragment_program(b, options);

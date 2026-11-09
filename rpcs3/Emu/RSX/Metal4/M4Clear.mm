@@ -213,8 +213,7 @@ clear_result clear_engine::run(context& ctx, const clear_request& request)
 	}
 	if (fast)
 	{
-		(void)ctx.render(pass);
-		ctx.end_encoding();
+		render_commands::materialize_attachments(ctx, pass);
 		return result;
 	}
 	const auto pipe = pipeline(formats, masks, samples, result.depth);
@@ -226,14 +225,11 @@ clear_result clear_engine::run(context& ctx, const clear_request& request)
 	const auto uniforms = ctx.upload(std::as_bytes(std::span{&values, 1}), 256);
 	bindings fragment;
 	fragment.set_buffer(0, uniforms.buffer, uniforms.offset);
-	render_commands commands(ctx, pass);
 	raster_state raster;
 	raster.viewport = {0, 0, double(width), double(height), 0, 1};
 	raster.scissor = {rect.x, rect.y, rect.width, rect.height};
 	raster.front_stencil_reference = raster.back_stencil_reference = request.zstencil_value & 255;
-	commands.configure(pipe, ds, raster, {}, fragment);
-	commands.draw(MTLPrimitiveTypeTriangle, 0, 3);
-	commands.end();
+	render_commands::draw_fragment_triangle(ctx, pass, pipe, ds, raster, fragment);
 	return result;
 }
 } // namespace metal4

@@ -30,11 +30,31 @@ struct frame_geometry_statistics
 {
 	std::uint64_t epoch = 0, layer_transactions = 0, vsync_writes = 0;
 };
+enum class frame_pacing
+{
+	unsynchronized,
+	synchronized,
+	adaptive,
+};
+[[nodiscard]] inline bool frame_display_sync(frame_pacing pacing)
+{
+	switch (pacing)
+	{
+	case frame_pacing::unsynchronized: return false;
+	case frame_pacing::synchronized: return true;
+	// CAMetalLayer exposes a sync toggle. Keep sync enabled for adaptive
+	// requests until a native late-frame presentation path is available.
+	case frame_pacing::adaptive: return true;
+	}
+	throw std::invalid_argument("Invalid native frame pacing mode");
+}
 struct frame_policy
 {
 	frame_extent virtual_display;
 	double display_aspect = 16.0 / 9;
-	bool stretch = false, vsync = true, linear = true;
+	bool stretch = false;
+	frame_pacing pacing = frame_pacing::synchronized;
+	bool linear = true;
 	float gamma = 1;
 	bool limited_rgb = false;
 	stereo_output stereo;
@@ -53,16 +73,17 @@ inline frame_extent plan_drawable_extent(double width, double height, double sca
 inline void validate_frame_policy(const frame_policy& policy)
 {
 	validate_stereo_output(policy.stereo);
+	(void)frame_display_sync(policy.pacing);
 	if (!std::isfinite(policy.display_aspect) || policy.display_aspect <= 0 || !policy.virtual_display.width || !policy.virtual_display.height ||
 		!std::isfinite(policy.gamma) || policy.gamma <= 0 || !std::isfinite(policy.fsr_sharpness) || policy.fsr_sharpness < 0 || policy.fsr_sharpness > 2)
 		throw std::invalid_argument("Invalid native frame AV policy");
 }
 
 template <typename Av>
-[[nodiscard]] frame_policy capture_frame_policy(const Av& av, bool stretch, bool vsync, bool linear, bool full_rgb)
+[[nodiscard]] frame_policy capture_frame_policy(const Av& av, bool stretch, frame_pacing pacing, bool linear, bool full_rgb)
 {
 	const auto size = av.video_frame_size();
-	frame_policy policy{{size.width, size.height}, av.get_aspect_ratio(), stretch, vsync, linear, float(av.gamma), !full_rgb};
+	frame_policy policy{{size.width, size.height}, av.get_aspect_ratio(), stretch, pacing, linear, float(av.gamma), !full_rgb};
 	validate_frame_policy(policy);
 	return policy;
 }

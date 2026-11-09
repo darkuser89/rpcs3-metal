@@ -112,12 +112,22 @@ void gpu(context& ctx)
 			auto pixels=pattern(w,h,variant);upload(ctx,source,level,pixels);
 			for(float sharpness:{0.f,1.f,2.f})
 			{
-				ctx.begin();const auto result=engine.encode(ctx,{source,{level,0,MTLOriginMake(crop.x,crop.y,0),MTLSizeMake(crop.width,crop.height,1)}},out,sharpness);ctx.submit().wait();
+				ctx.begin();
+				const auto before = ctx.encoding_statistics();
+				const auto result=engine.encode(ctx,{source,{level,0,MTLOriginMake(crop.x,crop.y,0),MTLSizeMake(crop.width,crop.height,1)}},out,sharpness);
+				const auto after = ctx.encoding_statistics();
+				require(after.compute_encoders == before.compute_encoders + 1 &&
+					after.checked_dispatches == before.checked_dispatches + 2 &&
+					after.dispatch_queue_barriers == before.dispatch_queue_barriers + 1 &&
+					after.dispatch_barriers == before.dispatch_barriers + 1,
+					"Each FSR pair needs one checked compute encoder and one EASU-to-RCAS barrier");
+				ctx.submit().wait();
 				compare(download(ctx,result.texture),test_fsr::reference(pixels,{w,h},crop,out,sharpness),.004f);++profiles;
 			}
 		}
 	}
 	const auto stats=engine.statistics();require(stats.reused>stats.created&&stats.easu_dispatches==profiles&&stats.rcas_dispatches==profiles,"FSR warm cache failed");
+	std::cout << profiles << " checked FSR pairs share an encoder and preserve the EASU-to-RCAS dependency\n";
 	std::cout<<profiles<<" GPU profiles: six formats, seven patterns, full/crop/mip/single-pixel, three sharpness stops; warm resources recompute changed source\n";
 }
 pixel sample(const std::vector<pixel>& pixels,frame_extent size,double u,double v)

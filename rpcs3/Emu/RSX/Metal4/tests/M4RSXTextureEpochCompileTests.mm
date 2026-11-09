@@ -32,7 +32,6 @@ void compile_frame_service(metal4::native_frame& frame, GSFrameBase* platform)
 {
 	metal4::rsx_frame_service service(frame);
 	service.initialize(platform);
-	service.refresh();
 	service.shutdown();
 }
 
@@ -44,13 +43,11 @@ class native_texture_epoch_compile : public metal4::rsx_program_frontend<GSRende
   public:
 	std::optional<metal4::display_snapshot> freeze_display(const rsx::display_flip_info_t& info, const rsx::avconf& av)
 	{
-		auto display = metal4::capture_display_snapshot(display_buffers, display_buffers_count, info, av);
-		if (display) metal4::validate_linear_display_storage(*display, tiles);
-		return display;
+		return metal4::capture_display_snapshot(display_buffers, display_buffers_count, info, av);
 	}
 	metal4::frame_policy freeze_policy(const rsx::avconf& av)
 	{
-		return metal4::capture_frame_policy(av, false, true, true, true);
+		return metal4::capture_frame_policy(av, false, metal4::frame_pacing::adaptive, true, true);
 	}
 	struct epoch
 	{

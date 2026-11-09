@@ -1,5 +1,6 @@
 #pragma once
 
+#include <string>
 #include <string_view>
 
 namespace metal4
@@ -84,16 +85,9 @@ kernel void rpcs3_convert_e4m12(device const uchar* source [[buffer(0)]],
         destination[destination_base + byte] = uchar(value >> shift);
     }
 }
-struct nearest_parameters
-{
-    ulong source_offset, destination_offset;
-    ulong source_row, source_image, destination_row, destination_image;
-    ulong first, count;
-    uint source_width, source_height, source_depth;
-    uint destination_width, destination_height, destination_depth;
-    uint bytes, flip;
-};
+)metal";
 
+inline constexpr std::string_view nearest_axis_msl = R"metal(
 uint rpcs3_nearest_axis(uint destination, uint source_extent, uint destination_extent, bool flip)
 {
     const ulong numerator = ulong(destination) * source_extent + source_extent / 2;
@@ -103,6 +97,20 @@ uint rpcs3_nearest_axis(uint destination, uint source_extent, uint destination_e
     const uint ceil_adjustment = uint(numerator % destination_extent != 0 || (source_extent & 1) != 0);
     return flip ? source_extent - quotient - ceil_adjustment : quotient;
 }
+)metal";
+
+inline constexpr std::string_view nearest_transfer_msl = R"metal(
+struct nearest_parameters
+{
+    ulong source_offset, destination_offset;
+    ulong source_row, source_image, destination_row, destination_image;
+    ulong first, count;
+    uint source_width, source_height, source_depth;
+    uint destination_width, destination_height, destination_depth;
+    uint bytes, flip;
+    uint copy_width, copy_height, copy_depth, copy_x, copy_y, copy_z;
+    uint source_x, source_y, source_z;
+};
 
 kernel void rpcs3_nearest_bytes(device const uchar* source [[buffer(0)]],
     device uchar* destination [[buffer(1)]],
@@ -116,14 +124,21 @@ kernel void rpcs3_nearest_bytes(device const uchar* source [[buffer(0)]],
     const uint z = uint(texel / (ulong(p.destination_width) * p.destination_height));
     // floor((d + 0.5) * source/destination), without floating-point or
     // overflowing the doubled numerator. All extents are nonzero uint32.
-    const uint sx = rpcs3_nearest_axis(x, p.source_width, p.destination_width, bool(p.flip & 1));
-    const uint sy = rpcs3_nearest_axis(y, p.source_height, p.destination_height, bool(p.flip & 2));
-    const uint sz = rpcs3_nearest_axis(z, p.source_depth, p.destination_depth, bool(p.flip & 4));
-    const ulong src = p.source_offset + ulong(sz) * p.source_image + ulong(sy) * p.source_row + ulong(sx) * p.bytes;
+    const uint sx = rpcs3_nearest_axis(x + p.copy_x, p.source_width, p.copy_width, bool(p.flip & 1));
+    const uint sy = rpcs3_nearest_axis(y + p.copy_y, p.source_height, p.copy_height, bool(p.flip & 2));
+    const uint sz = rpcs3_nearest_axis(z + p.copy_z, p.source_depth, p.copy_depth, bool(p.flip & 4));
+    const ulong src = p.source_offset + ulong(sz - p.source_z) * p.source_image + ulong(sy - p.source_y) * p.source_row + ulong(sx - p.source_x) * p.bytes;
     const ulong dst = p.destination_offset + ulong(z) * p.destination_image + ulong(y) * p.destination_row + ulong(x) * p.bytes;
     for (uint byte = 0; byte < p.bytes; ++byte)
         destination[dst + byte] = source[src + byte];
 }
 )metal";
+
+[[nodiscard]] inline std::string transfer_shader_source()
+{
+	std::string source(transfer_kernels);
+	source.append(nearest_axis_msl).append(nearest_transfer_msl);
+	return source;
+}
 
 }

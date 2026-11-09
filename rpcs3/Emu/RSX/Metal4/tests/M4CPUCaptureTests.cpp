@@ -1,4 +1,5 @@
 #include "M4CPUCapture.h"
+#include "M4TransferPublication.h"
 
 #include <array>
 #include <atomic>
@@ -25,12 +26,65 @@ void refuses(F&& operation)
 	}
 	require(caught);
 }
+void completed_publication_contracts()
+{
+	using namespace metal4;
+	struct output { std::shared_ptr<int> bytes=std::make_shared<int>(37); };
+	for(unsigned phase:{1u,2u})for(unsigned mode=0;mode<3;++mode)
+	{
+		auto pending=std::make_unique<output>();std::weak_ptr<int> lifetime=pending->bytes;
+		unsigned calls=0,stores=0;std::function<void()> retained;
+		const cpu_capture_dispatch dispatch=[&](const auto& action)
+		{
+			if(++calls==phase)
+			{
+				retained=action;
+				if(mode==0)throw std::range_error("CPU entry refused");
+				if(mode==1)return;
+				std::thread foreign(action);foreign.join();return;
+			}
+			action();
+		};
+		const auto publish=[&](auto& completed,const auto& capture)
+		{
+			checked_cpu_capture(capture,[&]{require(*completed.bytes==37);});
+			checked_cpu_capture(capture,[&]{require(*completed.bytes==37);++stores;});
+		};
+		refuses<std::exception>([&]{publish_completed_transfer(pending,dispatch,publish);});
+		require(pending&&!lifetime.expired()&&!stores);retained();require(!stores);
+		publish_completed_transfer(pending,[](const auto& action){action();},publish);
+		require(!pending&&lifetime.expired()&&stores==1);retained();require(stores==1);
+	}
+	for(unsigned mode=0;mode<4;++mode)
+	{
+		auto pending=std::make_unique<output>();std::weak_ptr<int> lifetime=pending->bytes;unsigned stores=0;
+		const cpu_capture_dispatch dispatch=[&](const auto& action)
+		{
+			action();
+			if(mode==1)throw std::range_error("Dispatcher failed after action");
+			if(mode==2)action();
+		};
+		refuses<std::exception>([&]
+		{
+			publish_completed_transfer(pending,dispatch,[&](auto&,const auto& capture)
+			{
+				if(mode==3)throw std::range_error("Metadata rejected outside capture");
+				checked_cpu_capture(capture,[&]{++stores;if(mode==0)throw std::range_error("Writer failed after prefix");});
+			});
+		});
+		require(!pending&&lifetime.expired()&&stores==unsigned(mode!=3));
+	}
+	std::unique_ptr<output> absent;
+	refuses<std::logic_error>([&]{publish_completed_transfer(absent,[](const auto& action){action();},[](auto&,const auto&){});});
+	std::cout<<"Completed transfer publication: six first/second-entry refusal cases retain ownership,late/foreign/dropped callbacks cannot write,retry stores once;four started/duplicate/post-action/metadata failures retire without replay,empty owner refused\n";
+}
 } // namespace
 int main()
 {
 	try
 	{
 		using namespace metal4;
+		completed_publication_contracts();
 		const cpu_capture_dispatch immediate = [](const auto& operation)
 		{ operation(); };
 		unsigned calls = 0;

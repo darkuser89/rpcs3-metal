@@ -18,6 +18,23 @@ int main()
 													 surface_color::rgba16f, surface_color::rgba32f, surface_color::r32f, surface_color::xbgr8_zero,
 													 surface_color::xbgr8_one, surface_color::abgr8, surface_depth::z16_uint, surface_depth::z24s8_uint,
 													 surface_depth::z16_float, surface_depth::z24s8_float};
+        std::size_t window_cases=0;
+        for(const auto sf:formats)for(const auto df:formats)for(unsigned flip=0;flip<4;++flip)for(unsigned x=0;x<13;++x)
+        {
+            const auto a=surface_guest_bytes(sf),b=surface_guest_bytes(df);const unsigned sw=64/a,words=64/b;
+            const nearest_projection projection{{17,13,1},{x,5,0}};
+            const auto selected=plan_typeless_source_window(sf,df,sw,9,3,2,{bool(flip&1),bool(flip&2),false},projection);
+            require(selected.origin[0]+selected.extent[0]<=sw&&selected.origin[1]+selected.extent[1]<=9,"Typeless source crop exceeds native donor");
+            const auto oracle=[](unsigned d,unsigned src,unsigned dst,bool flip){const auto den=__uint128_t(dst)*2;auto num=(__uint128_t(d)*2+1)*src;if(flip)num=__uint128_t(src)*den-num;return unsigned(num/den);};
+            for(unsigned y=0;y<2;++y)for(unsigned i=0;i<3;++i)
+            {
+                const auto sx=oracle(x+i,words,17,flip&1),sy=oracle(5+y,9,13,flip&2);
+                require(sx*b>=selected.origin[0]*a&&(sx+1)*b<=(selected.origin[0]+selected.extent[0])*a&&sy>=selected.origin[1]&&sy<selected.origin[1]+selected.extent[1],"Typeless crop omitted a rational source word");
+            }
+            const auto again=plan_typeless_source_window(sf,df,selected.extent[0],selected.extent[1],3,2,{bool(flip&1),bool(flip&2),false},selected.projection);
+            require(again.origin==std::array<std::size_t,2>{}&&again.extent==selected.extent,"Typeless cropped source lost packed-word alignment or phase");++window_cases;
+        }
+        std::cout<<window_cases<<" typeless native source-window plans across all 18x18 format pairs, aligned edge words and rational re-cropping passed\n";
 		std::size_t count = 0;
 		for (const auto a : formats)
 			for (const auto b : formats)

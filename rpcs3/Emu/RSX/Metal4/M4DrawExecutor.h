@@ -47,6 +47,7 @@ class versioned_draw_texture_job final
 	[[nodiscard]] const fragment_texture_snapshot& fragment_words() const;
 	[[nodiscard]] const texture_cache_state& metadata(bool vertex, unsigned unit) const;
 	[[nodiscard]] bool ready() const;
+	[[nodiscard]] bool has_completion() const;
 	[[nodiscard]] bool cancel_pending() const;
 	// CPU-only,inside the same producer epoch as the independent draw capture.
 	[[nodiscard]] bool current(const vertex_texture_snapshot& vertex, const fragment_texture_snapshot& fragment) const;
@@ -77,6 +78,7 @@ struct draw_request
 	bool alpha_to_coverage = false, alpha_to_one = false;
 	bool allow_output_rounding = true, force_disable_blending = false;
 	query_pool* queries = nullptr;
+	std::optional<report_predicate> predicate;
 };
 // Runtime encoder/dependency overrides that are not owned RSX input captures.
 // Geometry,packed streams,constants and shader environment come from packet.
@@ -86,6 +88,7 @@ struct draw_execution_state
 	std::vector<draw_request::wait_dependency> waits;
 	bool allow_output_rounding = true, force_disable_blending = false;
 	query_pool* queries = nullptr;
+	std::optional<report_predicate> predicate;
 };
 // One native draw boundary: resolve frozen textures before writer preparation,
 // then compile/import stages,fetch vertices and encode through SurfaceCache's
@@ -103,30 +106,48 @@ class draw_executor final
 	render_pipeline_cache m_pipelines;
 	shader_cache m_shaders;
 	sampler_cache m_samplers;
+	std::shared_ptr<const geometry_index_plan> m_recent_geometry;
+	std::uint64_t m_geometry_plans_created = 0;
 	const bool m_native_depth_bounds_supported;
+	[[nodiscard]] draw_publication publication_for(const report_predicate* predicate) const;
 	void execute_owned(const rsx_draw_packet& packet, const draw_targets& targets, const draw_execution_state& state,
-					   framebuffer_extent_policy extent_policy, const draw_texture_epoch* textures = nullptr);
+					   framebuffer_extent_policy extent_policy, const draw_texture_epoch* textures = nullptr, const submission* predecessor = nullptr,
+					   const versioned_guest_texture_job* draw_uploads = nullptr);
 	void execute_framebuffer(const rsx_draw_packet& packet, const framebuffer_snapshot& framebuffer, const draw_execution_state& state,
-							 const draw_texture_epoch* textures);
-	void execute_draw(const rsx_draw_snapshot& snapshot, const draw_targets& targets, const draw_request& request,
-					  const draw_texture_epoch* textures);
+							 const draw_texture_epoch* textures, const submission* predecessor = nullptr,
+							 const versioned_guest_texture_job* draw_uploads = nullptr);
+	void execute_draw(const rsx_draw_snapshot& snapshot, const draw_targets& targets, const draw_request& request, const converted_geometry& geometry,
+					  const draw_texture_epoch* textures, const submission* predecessor = nullptr,
+					  const versioned_guest_texture_job* draw_uploads = nullptr, const vertex_data_snapshot* vertices = nullptr);
 
   public:
 	draw_executor(context& context, surface_cache& surfaces, guest_texture_cache& textures);
+	draw_executor(context& context, surface_cache& surfaces, guest_texture_cache& textures, id<MTL4Compiler> compiler);
 	[[nodiscard]] shader_cache_statistics vertex_statistics() const noexcept { return m_shaders.vertex_statistics(); }
 	[[nodiscard]] shader_cache_statistics fragment_statistics() const noexcept { return m_shaders.fragment_statistics(); }
 	[[nodiscard]] render_pipeline_cache_statistics pipeline_statistics() const noexcept { return m_pipelines.statistics(); }
 	[[nodiscard]] library_cache_statistics library_statistics() const noexcept { return m_compiler.library_statistics(); }
 	[[nodiscard]] compiler_queue_statistics compilation_statistics() const { return m_compiler.tasks().statistics(); }
+	[[nodiscard]] std::uint64_t geometry_plans_created() const noexcept { return m_geometry_plans_created; }
 	[[nodiscard]] draw_texture_epoch prepare_textures(const vertex_texture_snapshot& vertex, const fragment_texture_snapshot& fragment);
 	[[nodiscard]] versioned_draw_texture_epoch prepare_versioned_textures(const vertex_texture_snapshot& vertex, const fragment_texture_snapshot& fragment);
 	[[nodiscard]] versioned_draw_texture_job enqueue_versioned_textures(const vertex_texture_snapshot& vertex, const fragment_texture_snapshot& fragment,
-		std::span<const guest_texture_upload_dependency> dependencies = {});
+		std::span<const guest_texture_upload_dependency> dependencies = {}, const report_predicate* predicate = nullptr,
+		texture_upload_path path = texture_upload_path::separate);
+	// Starts stages from frozen metadata and queues their dependent pipeline.
+	// Native PSO compilation starts after both libraries complete, independently
+	// of stage materialization. Keep the returned owner alive through execute().
+	// Draw execution still validates the source epoch and the complete key.
+	[[nodiscard]] std::optional<render_pipeline_cache::prepared_pipeline> prewarm_stages(const rsx_draw_packet& packet, const framebuffer_snapshot& framebuffer,
+		const versioned_draw_texture_job& textures, const draw_execution_state& state = {});
 	void execute(const rsx_draw_snapshot& snapshot, const draw_targets& targets, const draw_request& request);
 	void execute(const rsx_draw_snapshot& snapshot, const draw_targets& targets, const draw_request& request, const draw_texture_epoch& textures);
 	void execute(const rsx_draw_packet& packet, const draw_targets& targets, const draw_execution_state& state = {});
 	void execute(const rsx_draw_packet& packet, const framebuffer_snapshot& framebuffer, const draw_execution_state& state = {});
 	void execute(const rsx_draw_packet& packet, const draw_targets& targets, const draw_texture_epoch& textures, const draw_execution_state& state = {});
 	void execute(const rsx_draw_packet& packet, const framebuffer_snapshot& framebuffer, const draw_texture_epoch& textures, const draw_execution_state& state = {});
+	// Records against frozen private images and encodes or depends on their
+	// upload. Finish the job separately for cache publication.
+	void execute(const rsx_draw_packet& packet, const framebuffer_snapshot& framebuffer, const versioned_draw_texture_job& textures, const draw_execution_state& state = {});
 };
 } // namespace metal4

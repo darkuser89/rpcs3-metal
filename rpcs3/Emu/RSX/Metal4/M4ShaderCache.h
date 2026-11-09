@@ -5,6 +5,17 @@
 
 namespace metal4
 {
+// Only a validated shader-cache entry can create this immutable function and
+// fragment-contract pair. It never materializes a stage or waits for a job.
+class prepared_shader_stages final
+{
+	friend class shader_cache;
+	friend class render_pipeline_cache;
+	compiler_function m_vertex, m_fragment;
+	fragment_program_options m_contract;
+	prepared_shader_stages(compiler_function vertex, compiler_function fragment, const fragment_program_options& contract)
+		: m_vertex(std::move(vertex)), m_fragment(std::move(fragment)), m_contract(contract) {}
+};
 struct shader_cache_statistics
 {
 	std::size_t entries = 0, capacity = 0, host_bytes = 0, host_budget = 0;
@@ -50,6 +61,12 @@ class shader_cache final
 	[[nodiscard]] prepared_fragment prewarm_fragment(const prepared_fragment& program, const fragment_program_options& options);
 	[[nodiscard]] bool ready(const prepared_vertex& program) const;
 	[[nodiscard]] bool ready(const prepared_fragment& program) const;
+	[[nodiscard]] std::optional<prepared_shader_stages> pipeline_stages(const prepared_vertex& vertex,
+		const prepared_fragment& fragment) const;
+	// Upload current literals from the validated CPU program. The binding
+	// belongs to the shader materialized from this exact program and options.
+	[[nodiscard]] fragment_shader::constant_binding prepare_constants(context& ctx, const prepared_fragment& program,
+		std::span<const std::byte> current_code) const;
 	[[nodiscard]] std::shared_ptr<const vertex_shader> vertex(const prepared_vertex& program, const vertex_program_options& options);
 	[[nodiscard]] std::shared_ptr<const fragment_shader> fragment(const prepared_fragment& program, const fragment_program_options& options);
 	explicit shader_cache(const compiler& compiler, std::size_t capacity = 256, std::size_t host_budget = 16u << 20);

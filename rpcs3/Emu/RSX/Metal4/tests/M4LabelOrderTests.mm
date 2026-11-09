@@ -138,6 +138,7 @@ int main()
 				require(done.bytes[i] == std::byte(i >= 4 && i < 8 ? std::array{0x12u, 0x34u, 0x56u, 0x78u}[i - 4] : std::array{255u, 17u, 34u, 51u}[i % 4]), "Normal label bytes/padding differ");
 			// Flip release is CPU-only even while native GPU work is gated.
 			surfaces.prepare(surface);
+			const auto before_flip = surfaces.status(surface);
 			const auto event = [ctx.device() newSharedEvent];
 			struct release
 			{
@@ -177,7 +178,12 @@ int main()
 			{
 				failed = true;
 			}
-			require(failed && !surfaces.status(surface).pending && !surfaces.status(surface).faulted && surfaces.status(surface).spilled && !surfaces.status(surface).initialized &&
+			const auto restored = surfaces.status(surface);
+			// A native version restores the old lease. A budget-constrained
+			// rollback can instead retain a raw snapshot of the same revision.
+			require(failed && !restored.pending && !restored.faulted && !restored.dirty &&
+				restored.initialized != restored.spilled && restored.guest_revisions == before_flip.guest_revisions &&
+				restored.content_generation == before_flip.content_generation &&
 				memory->read({address, 4}).bytes == word, "GPU completion accepted a flip-invalidated surface or overwrote the label");
 			surfaces.flush(surface);
 			require(memory->read({address, 4}).bytes == word, "Rejected GPU output was published by a later flush");
@@ -217,7 +223,7 @@ int main()
 				failed = true;
 			}
 			require(failed && provider->bytes == snapshot, "Failed flip writer changed bytes");
-			std::cout << "Native label producer:blocked DMA/same-value/MM failure/DMA exception refuse before store,dirty target flush or cache invalidation;success MM-DMA-reports-store ordering/BE padding;flip release publishes during gated GPU work with physical alias revisions/same-value notification,GPU completion rejects stale revision and faults output before later writeback/reuse;misaligned/missing/failing writers refused;no App/UI/guest VM initialized\n";
+			std::cout << "Native label producer:blocked DMA/same-value/MM failure/DMA exception refuse before store,dirty target flush or cache invalidation;success MM-DMA-reports-store ordering/BE padding;flip release publishes during gated GPU work with physical alias revisions/same-value notification,GPU completion rejects stale revision and rolls back before later writeback/reuse;misaligned/missing/failing writers refused;no App/UI/guest VM initialized\n";
 		}
 		catch (const std::exception& e)
 		{

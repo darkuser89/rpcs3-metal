@@ -51,7 +51,7 @@ std::string precision(std::string value, std::uint32_t mode)
 	}
 }
 
-std::string texture_type(vertex_texture_dimension dimension, bool shadow = false)
+std::string texture_type(vertex_texture_dimension dimension, bool shadow = false, bool atlas = false)
 {
 	switch (dimension)
 	{
@@ -61,6 +61,7 @@ std::string texture_type(vertex_texture_dimension dimension, bool shadow = false
 	case vertex_texture_dimension::three:
 		return "texture3d<float>";
 	case vertex_texture_dimension::cube:
+		if (atlas) return shadow ? "depth2d_array<float>" : "texture2d_array<float>";
 		return shadow ? "depthcube<float>" : "texturecube<float>";
 	}
 	throw std::invalid_argument("Unknown RSX fragment texture dimension");
@@ -279,17 +280,18 @@ class generator
 		case 49:
 		{
 			const auto unit = instruction.texture;
-			if ((m_options.redirected_textures | m_options.multisampled_textures) & (1u << unit))
-			{
-				throw std::invalid_argument("RSX fragment sampling needs unimplemented depth/MSAA texture emulation");
-			}
 			m_output.texture_mask |= 1u << unit;
 			const auto dimension = m_options.textures[unit];
 			const bool shadow = m_options.shadow_textures & (1u << unit);
 			const bool depth = m_options.depth_textures & (1u << unit);
+			const bool stored_repeat = m_options.stored_repeat_textures & (1u << unit);
+			const bool stored_mixed = m_options.stored_mixed_filter_textures & (1u << unit);
+			const bool atlas = m_options.stored_border_atlas_textures & (1u << unit);
 
 			if (shadow && (dimension == vertex_texture_dimension::three || (dimension == vertex_texture_dimension::cube && op == 24)))
 				throw std::invalid_argument("3D/projected-cube RSX shadows require a separate native sampling policy");
+			if ((stored_repeat || stored_mixed) && dimension != vertex_texture_dimension::two)
+				throw std::invalid_argument("Unsupported stored-border shader sampling dimension");
 			const auto suffix = dimension == vertex_texture_dimension::two ? ".xy" : ".xyz";
 			const auto coordinate = [&](unsigned operand, bool project, bool gradient)
 			{
@@ -302,11 +304,94 @@ class generator
 				const auto components = value + suffix + (project ? " / " + value + ".w" : "");
 				return gradient ? components : "rsx_texture_coordinate(" + components + ", texture_state[" + n(unit) + "])";
 			};
+			const auto process_texel = [&](const std::string& sample)
+			{
+				return "rsx_process_texel(" + sample + ", texel_state[" + n(unit) + "], " + (instruction.expand_texture ? "true" : "false") + ", r.killed, r.fault)";
+			};
+			const auto depth_remap = [&]
+			{
+				const auto& remap = m_options.depth_remap[unit];
+				validate_depth_sample_remap(remap);
+				return "uint4(" + n(static_cast<unsigned>(remap[0])) + ", " + n(static_cast<unsigned>(remap[1])) +
+					", " + n(static_cast<unsigned>(remap[2])) + ", " + n(static_cast<unsigned>(remap[3])) + ")";
+			};
+			if ((m_options.multisampled_textures | m_options.sample_raster_textures) & (1u << unit))
+			{
+				const auto image = "ftex" + n(unit);
+				const auto arguments = ", " + coordinate(0, op == 24, false) + ", sampler_state[" + n(unit) +
+					"], texture_state[" + n(unit) + "]";
+				if (shadow)
+				{
+					const auto reference = "(" + s(0) + ").z" + (op == 24 ? " / (" + s(0) + ").w" : "");
+					return "rsx_multisample_shadow(" + image + arguments + ", " + reference + ")";
+				}
+				if (m_options.redirected_textures & (1u << unit))
+					return process_texel("rsx_multisample_redirected(" + image + ", fstencil" + n(unit) + arguments + ")");
+				// The single-level reconstruction stays in screen space. Only a
+				// mixed filter uses the opcode's LOD or gradients to choose Min/Mag.
+				std::string filter = ", rsx_multisample_filter_control{}";
+				if (op == 25)
+				{
+					const auto transform = "texture_state[" + n(unit) + "]";
+					const auto scale = " * float2(" + transform + ".scale_x, " + transform + ".scale_y)";
+					filter = ", rsx_multisample_filter_control{" + coordinate(1, false, true) + scale + ", " +
+						coordinate(2, false, true) + scale + ", 0.0f, 1u}";
+				}
+				if (op == 47 || op == 49)
+					filter = ", rsx_multisample_filter_control{float2(0), float2(0), (" + s(1) + ").x, " +
+						std::string(op == 47 ? "2u}" : "0u}");
+				if (depth)
+					return process_texel("rsx_multisample_depth(" + image + arguments + filter + ", " + depth_remap() + ")");
+				return process_texel("rsx_multisample_color(" + image + arguments + filter + ")");
+			}
+			if (m_options.redirected_textures & (1u << unit))
+			{
+				// The redirected binding has one level and point filtering.
+				return process_texel("rsx_redirected_depth(ftex" + n(unit) + ", fstencil" + n(unit) + ", " +
+					coordinate(0, op == 24, false) + ", sampler_state[" + n(unit) + "])");
+			}
+			const auto stored_sample = [&](const std::string& reference)
+			{
+				const auto image = "ftex" + n(unit);
+				const auto parameters = "texture_state[" + n(unit) + "]";
+				const auto arguments = image + ", fsampler" + n(unit) + ", " +
+					coordinate(0, op == 24, stored_mixed || atlas) + ", " + parameters + ", " + reference;
+				if (atlas)
+				{
+					const auto sampling = "sampler_state[" + n(unit) + "]";
+					const auto raw = coordinate(0, op == 24, true);
+					const bool gradients = !shadow && op == 25;
+					const auto dx = gradients ? coordinate(1, false, true) : "dfdx(" + raw + ")";
+					const auto dy = gradients ? coordinate(2, false, true) : "dfdy(" + raw + ")";
+					const bool cube_atlas = dimension == vertex_texture_dimension::cube;
+					if (!shadow && op == 47)
+						return std::string(cube_atlas ? "rsx_sample_border_cube(" : "rsx_sample_border_atlas(") +
+							arguments + ", " + sampling + ", (" + s(1) + ").x)";
+					const auto bias = !shadow && op == 49 ? "(" + s(1) + ").x" : "0.0f";
+					return std::string(cube_atlas ? "rsx_sample_border_cube_anisotropic(" : "rsx_sample_border_anisotropic(") +
+						arguments + ", " + sampling + ", " + dx + ", " + dy + ", " + bias + ")";
+				}
+				if (!stored_mixed)
+					return "rsx_sample_stored_repeat(" + arguments + ")";
+				auto bias = "sampler_state[" + n(unit) + "].bias";
+				if (!shadow && op == 47)
+					return "rsx_sample_stored_mixed(" + arguments + ", ((" + s(1) + ").x + " + bias + " > 0.0f))";
+				const auto raw = coordinate(0, op == 24, true);
+				const bool gradients = !shadow && op == 25;
+				const auto dx = gradients ? coordinate(1, false, true) : "dfdx(" + raw + ")";
+				const auto dy = gradients ? coordinate(2, false, true) : "dfdy(" + raw + ")";
+				if (!shadow && op == 49)
+					bias += " + (" + s(1) + ").x";
+				return "rsx_sample_stored_mixed(" + arguments + ", rsx_stored_minifies(" +
+					image + ", " + parameters + ", " + dx + ", " + dy + ", " + bias + "))";
+			};
 			std::string sample = "ftex" + n(unit) + (shadow ? ".sample_compare(fsampler" : ".sample(fsampler") + n(unit) + ", " + coordinate(0, op == 24, false);
 			if (shadow)
 			{
 				const auto reference = "(" + s(0) + ")" + (dimension == vertex_texture_dimension::cube ? ".w" : ".z") + (op == 24 ? " / (" + s(0) + ").w" : "");
 				const auto adjusted_reference = "rsx_shadow_reference(" + reference + ", sampler_state[" + n(unit) + "])";
+				if (stored_repeat || stored_mixed || atlas)
+					return "float4(" + stored_sample(adjusted_reference) + ")";
 				sample += ", " + adjusted_reference;
 				// VK's shadow redirection discards the original LOD/gradient/bias
 				// opcode distinction. Sampler bias still applies; projection is
@@ -323,29 +408,32 @@ class generator
 				}
 				return "float4(" + sample + ")";
 			}
-			if (op == 47 || op == 49)
-				sample += op == 47 ? ", level(clamp((" + s(1) + ").x + sampler_state[" + n(unit) + "].bias, sampler_state[" + n(unit) + "].min_lod, sampler_state[" + n(unit) + "].max_lod))" : ", bias((" + s(1) + ").x + sampler_state[" + n(unit) + "].bias)";
-			if (op == 25)
+			if (stored_repeat || stored_mixed || atlas)
+				sample = stored_sample("false");
+			else
 			{
-				const auto gradient = dimension == vertex_texture_dimension::three ? "gradient3d" : dimension == vertex_texture_dimension::cube ? "gradientcube"
-																																				: "gradient2d";
-				sample += ", " + std::string(gradient) + "(" + coordinate(1, false, true) + " * exp2(sampler_state[" + n(unit) + "].bias), " + coordinate(2, false, true) + " * exp2(sampler_state[" + n(unit) + "].bias))";
+				if (op == 47 || op == 49)
+					sample += op == 47 ? ", level(clamp((" + s(1) + ").x + sampler_state[" + n(unit) + "].bias, sampler_state[" + n(unit) + "].min_lod, sampler_state[" + n(unit) + "].max_lod))" : ", bias((" + s(1) + ").x + sampler_state[" + n(unit) + "].bias)";
+				if (op == 25)
+				{
+					const auto gradient = dimension == vertex_texture_dimension::three ? "gradient3d" :
+						dimension == vertex_texture_dimension::cube ? "gradientcube" : "gradient2d";
+					sample += ", " + std::string(gradient) + "(" + coordinate(1, false, true) + " * exp2(sampler_state[" + n(unit) + "].bias), " + coordinate(2, false, true) + " * exp2(sampler_state[" + n(unit) + "].bias))";
+				}
+				else if (op != 47 && op != 49)
+					sample += ", bias(sampler_state[" + n(unit) + "].bias)";
+				sample += ")";
 			}
-			else if (op != 47 && op != 49)
-				sample += ", bias(sampler_state[" + n(unit) + "].bias)";
-			sample += ")";
 			auto coverage = sample;
 			coverage.replace(0, ("ftex" + n(unit)).size(), "fborder" + n(unit));
 			if (depth)
 			{
 				if(dimension==vertex_texture_dimension::three)sample="("+sample+").r";
-				validate_depth_sample_remap(m_options.depth_remap[unit]);
-				const auto& remap = m_options.depth_remap[unit];
-				sample = "rsx_depth_texel(" + sample + ", uint4(" + n(static_cast<unsigned>(remap[0])) + ", " + n(static_cast<unsigned>(remap[1])) + ", " + n(static_cast<unsigned>(remap[2])) + ", " + n(static_cast<unsigned>(remap[3])) + "))";
+				sample = "rsx_depth_texel(" + sample + ", " + depth_remap() + ")";
 			}
 			if (m_options.border_textures & (1u << unit))
 				sample = "rsx_border_color(" + sample + ", (" + coverage + ").r, sampler_state[" + n(unit) + "])";
-			return "rsx_process_texel(" + sample + ", texel_state[" + n(unit) + "], " + (instruction.expand_texture ? "true" : "false") + ", r.killed, r.fault)";
+			return process_texel(sample);
 		}
 		default:
 			throw std::invalid_argument("Unsupported RSX fragment opcode " + n(op));
@@ -585,14 +673,30 @@ generated_fragment_program generate_fragment_program(std::span<const std::byte> 
 	for (auto remap : options.color_remap)
 		if (remap > color_export_remap::rgb_one)
 			throw std::invalid_argument("Invalid RSX surface color export remap");
-	if ((options.border_textures | options.shadow_textures | options.depth_textures | options.redirected_textures | options.multisampled_textures) & ~0xffffu)
+	const auto stored_single = options.stored_repeat_textures | options.stored_mixed_filter_textures;
+	const auto stored_border = stored_single | options.stored_border_atlas_textures;
+	const auto msaa_sampling = options.multisampled_textures | options.sample_raster_textures;
+	if (stored_single & options.stored_border_atlas_textures)
+		throw std::invalid_argument("Stored-border single-level and atlas sampling are mutually exclusive");
+	if ((options.border_textures | stored_border | options.shadow_textures | options.depth_textures | options.redirected_textures | msaa_sampling) & ~0xffffu)
 	{
 		throw std::invalid_argument("RSX fragment sampling mask exceeds sixteen texture units");
 	}
 	if (options.shadow_textures & options.depth_textures)
 		throw std::invalid_argument("A native texture unit cannot use both depth-read and shadow-comparison bindings");
-	for (auto dimension : options.textures)
-		(void)texture_type(dimension);
+	if (options.redirected_textures & (options.shadow_textures | options.depth_textures | options.border_textures | stored_border))
+		throw std::invalid_argument("Redirected depth requires exclusive depth and stencil bindings");
+	if ((msaa_sampling & (options.border_textures | stored_border)) ||
+		(options.multisampled_textures & options.sample_raster_textures))
+		throw std::invalid_argument("MSAA sampling requires one storage type and its own border handling");
+	if (options.border_textures & stored_border)
+		throw std::invalid_argument("Stored-border shader sampling cannot use a constant border sampler");
+	for (unsigned unit = 0; unit < options.textures.size(); ++unit)
+	{
+		(void)texture_type(options.textures[unit]);
+		if (((options.redirected_textures | msaa_sampling) & (1u << unit)) && options.textures[unit] != vertex_texture_dimension::two)
+			throw std::invalid_argument("Redirected depth and multisample sampling require native 2D textures");
+	}
 	const auto decoded = decode_fragment_program(bytes);
 	generated_fragment_program program;
 	generator emit(decoded, options, program);
@@ -603,8 +707,38 @@ generated_fragment_program generate_fragment_program(std::span<const std::byte> 
 	if (program.texture_mask)
 	{
 		out << texture_coordinates_msl;
-		if (program.texture_mask & options.depth_textures)
+		if (program.texture_mask & stored_border)
+			out << stored_border_repeat_msl;
+		if (program.texture_mask & (options.stored_mixed_filter_textures | options.stored_border_atlas_textures))
+			out << stored_border_mixed_filter_msl;
+		const auto atlas_units = program.texture_mask & options.stored_border_atlas_textures;
+		if (atlas_units || (program.texture_mask & msaa_sampling))
+			out << anisotropic_footprint_msl;
+		if (atlas_units)
+		{
+			out << stored_border_atlas_msl;
+			bool volume = false, cube = false;
+			for (unsigned i = 0; i < options.textures.size(); ++i)
+				if (atlas_units & (1u << i))
+				{
+					volume |= options.textures[i] == vertex_texture_dimension::three;
+					cube |= options.textures[i] == vertex_texture_dimension::cube;
+				}
+			if (volume) out << stored_border_volume_msl;
+			if (cube) out << stored_border_cube_msl;
+			out << stored_border_anisotropic_msl;
+			if (cube) out << stored_border_cube_anisotropic_msl;
+		}
+		if (program.texture_mask & (options.depth_textures | msaa_sampling))
 			out << depth_sampling_msl;
+		if (program.texture_mask & (options.redirected_textures | msaa_sampling))
+			out << point_sampling_msl;
+		if (program.texture_mask & options.redirected_textures)
+			out << redirected_depth_sampling_msl;
+		if (program.texture_mask & msaa_sampling)
+			out << multisample_sampling_msl;
+		if (program.texture_mask & options.redirected_textures & msaa_sampling)
+			out << multisample_redirected_depth_msl;
 		out << texel_processing_msl;
 	}
 	if (logic_fetch)
@@ -622,10 +756,22 @@ generated_fragment_program generate_fragment_program(std::span<const std::byte> 
 	{
 		if (!(program.texture_mask & (1u << i)))
 			continue;
-		const auto type = texture_type(options.textures[i], (options.shadow_textures | options.depth_textures) & (1u << i));
+		const auto bit = 1u << i;
+		const bool depth = (options.shadow_textures | options.depth_textures | options.redirected_textures) & bit;
+		const bool multisampled = options.multisampled_textures & bit;
+		const auto type = multisampled ? (depth ? "depth2d_ms<float>" : "texture2d_ms<float>") :
+			(!depth && (options.sample_raster_textures & bit)) ? "texture2d<float, access::read>" :
+			texture_type(options.textures[i], depth, options.stored_border_atlas_textures & bit);
 		texture_arguments += ", " + type + " ftex" + n(i) + ", sampler fsampler" + n(i);
 		texture_entry += ", " + type + " ftex" + n(i) + " [[texture(" + n(i) + ")]], sampler fsampler" + n(i) + " [[sampler(" + n(i) + ")]]";
 		texture_values += ", ftex" + n(i) + ", fsampler" + n(i);
+		if (options.redirected_textures & bit)
+		{
+			const auto stencil = std::string(multisampled ? "texture2d_ms<uint> fstencil" : "texture2d<uint, access::read> fstencil") + n(i);
+			texture_arguments += ", " + stencil;
+			texture_entry += ", " + stencil + " [[texture(" + n(16 + i) + ")]]";
+			texture_values += ", fstencil" + n(i);
+		}
 		if (options.border_textures & (1u << i))
 		{
 			const auto coverage_type = texture_type(options.textures[i], options.shadow_textures & (1u << i));

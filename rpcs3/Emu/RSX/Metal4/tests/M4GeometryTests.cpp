@@ -49,6 +49,7 @@ void check_index_plan(const metal4::converted_geometry& geometry, bool flat)
 	using namespace metal4;
 	const auto plan = plan_indexed_references(geometry,flat);
 	require(plan.count() == geometry.vertices.size() && plan.references().topology == geometry.topology);
+	require(plan.matches(geometry, flat));
 	std::set<std::pair<unsigned,unsigned>> unique;
 	for (auto reference : geometry.vertices)
 	{
@@ -152,11 +153,27 @@ int main()
 		require(plan.index_width() == (count <= 65535 ? 2 : 4));
 		require(plan.references().source_range == std::pair{0u,count - 1});
 		check_index_plan(boundary,true);
+		boundary.vertices.back() = {1,1};
+		require(!plan.matches(boundary, true));
 	}
 	const converted_geometry pair_identity{list_topology::triangles,{{0xffffffffu,0},{0xffffffffu,1},{0xffffffffu,0}},std::nullopt};
 	require(plan_indexed_references(pair_identity,true).references().vertices.size() == 2);
 	require(plan_indexed_references(pair_identity,false).references().vertices.size() == 1);
 	check_index_plan(pair_identity,true); check_index_plan(pair_identity,false);
+	const auto flat_plan = plan_indexed_references(pair_identity, true);
+	const auto smooth_plan = plan_indexed_references(pair_identity, false);
+	auto changed_pair = pair_identity;
+	changed_pair.vertices[1].flat_vertex = 3;
+	require(!flat_plan.matches(changed_pair, true) && smooth_plan.matches(changed_pair, false) &&
+		!smooth_plan.matches(changed_pair, true));
+	changed_pair.topology = list_topology::points;
+	require(!smooth_plan.matches(changed_pair, false));
+	auto unindexed = convert_array_geometry(guest_topology::points, 0, 3, provoking_vertex::last);
+	const auto unindexed_plan = plan_indexed_references(unindexed);
+	require(!unindexed_plan.index_width() && unindexed_plan.matches(unindexed, true));
+	std::swap(unindexed.vertices.front(), unindexed.vertices.back());
+	require(!unindexed_plan.matches(unindexed, true));
+	std::cout << "Geometry plan reuse: exact corner order, topology and effective Flat Color sources verified for unindexed, 16-bit and 32-bit packets\n";
 	require(plan_flat_color_sources(std::array{vertex_reference{9,0xffffffffu},vertex_reference{0,7},vertex_reference{7,7},vertex_reference{1,7}})==std::vector<unsigned>{7,0xffffffffu});
 	require(flat_color_bytes(0,0)==0 && flat_color_bytes(1,84)==80 && !flat_color_bytes(1,83));
 	require(!flat_color_bytes(std::numeric_limits<std::size_t>::max(),std::numeric_limits<std::size_t>::max()));

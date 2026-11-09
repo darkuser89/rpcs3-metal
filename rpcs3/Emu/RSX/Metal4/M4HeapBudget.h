@@ -41,6 +41,7 @@ class heap_budget final
 {
 	struct impl;
 	std::unique_ptr<impl> m_impl;
+	[[nodiscard]] id<MTLBuffer> allocate_buffer_once(std::size_t bytes, MTLStorageMode storage) __attribute__((ns_returns_retained));
 
   public:
 	heap_budget(context& ctx, std::size_t bytes);
@@ -59,6 +60,8 @@ class heap_budget final
 	[[nodiscard]] id<MTLHeap> allocate(MTLHeapDescriptor* descriptor) __attribute__((ns_returns_retained));
 	[[nodiscard]] id<MTLTexture> texture(MTLTextureDescriptor* descriptor) __attribute__((ns_returns_retained));
 	[[nodiscard]] id<MTLBuffer> shared_buffer(std::size_t bytes) __attribute__((ns_returns_retained));
+	// Capacity and native-allocation failures return nil without invoking reclaimers.
+	[[nodiscard]] id<MTLBuffer> try_shared_buffer(std::size_t bytes) __attribute__((ns_returns_retained));
 	[[nodiscard]] id<MTLBuffer> buffer(std::size_t bytes, MTLStorageMode storage) __attribute__((ns_returns_retained));
 };
 } // namespace metal4

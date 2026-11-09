@@ -25,7 +25,21 @@ class surface_banked_transfer final
 	[[nodiscard]] id<MTLBuffer> staging(context& ctx, id<MTLBuffer> guest,
 		const guest_surface_layout& image, const banked_tile_layout& tile, const texture_region& region, std::size_t pitch = 0) const;
 	void convert(context& ctx, const guest_surface_layout& image, const banked_tile_layout& tile,
-		id<MTLBuffer> guest, id<MTLBuffer> linear, bool encode, std::size_t pitch = 0, std::uint32_t element_bytes = 1) const;
+		id<MTLBuffer> guest, id<MTLBuffer> linear, bool encode, std::size_t pitch = 0,
+		std::uint32_t element_bytes = 1, id<MTLBuffer> prepared = nil) const;
+
+	friend class guest_texture_resolver;
+	struct download_storage
+	{
+		id<MTLBuffer> linear, uniforms;
+		std::optional<surface_depth_transfer::transfer_storage> depth;
+	};
+	[[nodiscard]] download_storage prepare_download(context& ctx, surface_format format, const texture_region& region,
+		id<MTLBuffer> guest, const guest_surface_layout& image, const banked_tile_layout& tile) const;
+	void download_color_impl(context& ctx, surface_color format, id<MTLTexture> texture, const texture_region& region,
+		id<MTLBuffer> guest, const guest_surface_layout& image, const banked_tile_layout& tile, const download_storage* prepared) const;
+	void download_depth_impl(context& ctx, surface_depth format, id<MTLTexture> texture, const texture_region& region,
+		id<MTLBuffer> guest, const guest_surface_layout& image, const banked_tile_layout& tile, const download_storage* prepared) const;
 
   public:
 	explicit surface_banked_transfer(context& ctx);
@@ -35,7 +49,8 @@ class surface_banked_transfer final
 	void download_color(context& ctx, surface_color format, id<MTLTexture> texture, const texture_region& region,
 		id<MTLBuffer> guest, const guest_surface_layout& image, const banked_tile_layout& tile) const;
 	void upload_depth(context& ctx, surface_depth format, id<MTLBuffer> guest, const guest_surface_layout& image,
-		const banked_tile_layout& tile, id<MTLTexture> texture, const texture_region& region) const;
+		const banked_tile_layout& tile, id<MTLTexture> texture, const texture_region& region,
+		texture_plane plane = texture_plane::all) const;
 	void download_depth(context& ctx, surface_depth format, id<MTLTexture> texture, const texture_region& region,
 		id<MTLBuffer> guest, const guest_surface_layout& image, const banked_tile_layout& tile) const;
 };

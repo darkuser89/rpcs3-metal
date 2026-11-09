@@ -117,6 +117,73 @@ struct guest_texture_layout
 	guest_texture_format codec;
 	std::vector<guest_texture_subresource> subresources;
 };
+// Morton coordinates name stored blocks, including paired-color words.
+// S3TC volume interleaving remains a separate layout.
+[[nodiscard]] inline bool guest_texture_morton_blocks(const guest_texture_layout& plan)
+{
+	return plan.swizzled && plan.codec.block.height == 1 &&
+		(plan.codec.block.width == 1 || plan.codec.block.width == 2);
+}
+[[nodiscard]] inline bool supports_stored_border_storage(const guest_texture_layout& plan)
+{
+	return (plan.dimension != vertex_texture_dimension::cube || (plan.width == plan.height && plan.layers == 6)) &&
+		plan.codec.block.height == 1 &&
+		(plan.codec.block.width == 1 || plan.codec.block.width == 2);
+}
+
+[[nodiscard]] inline std::array<std::uint32_t, 2> guest_texture_stored_border_extent(const guest_texture_layout& plan)
+{
+	if (!plan.stored_border)
+		return {};
+	return {static_cast<std::uint32_t>(plan.width), static_cast<std::uint32_t>(plan.height)};
+}
+
+[[nodiscard]] inline std::uint32_t guest_texture_stored_border_depth(const guest_texture_layout& plan)
+{
+	return plan.stored_border && plan.dimension == vertex_texture_dimension::three ? static_cast<std::uint32_t>(plan.depth) : 0;
+}
+
+// The native image includes the innermost texel ring. The guest logical extent stays
+// in the original plan for the sampler transform and cache identity.
+[[nodiscard]] inline guest_texture_subresource guest_texture_image_subresource(
+	const guest_texture_layout& plan, guest_texture_subresource level)
+{
+	if (plan.stored_border)
+	{
+		level.width += 2;
+		level.columns += 2;
+		if (plan.dimension != vertex_texture_dimension::one)
+		{
+			level.height += 2;
+			level.rows += 2;
+		}
+		else if (!plan.swizzled)
+		{
+			// The stored layout still includes top and bottom padding rows.
+			// The X sampler uses only the middle row and its two end texels.
+			level.offset += level.row_pitch;
+			level.storage_rows = 1;
+			level.storage_bytes = checked_texture_product(level.columns, plan.codec.block.bytes);
+		}
+	}
+	return level;
+}
+// The GPU conversion and RTT planner address the same ring within the guest
+// Morton allocation. The outer border texels are outside the sampler footprint.
+[[nodiscard]] inline swizzle_region guest_texture_swizzle_region(
+	const guest_texture_layout& plan, const guest_texture_subresource& image)
+{
+	const std::array extent{image.columns, image.rows, image.depth};
+	if (!plan.stored_border) return {extent, {}, extent};
+	const std::size_t inset = image.border - 1;
+	const auto row = plan.dimension == vertex_texture_dimension::one ? image.border : inset;
+	return {{image.row_pitch / plan.codec.block.bytes, image.storage_rows, image.depth}, {inset, row, 0}, extent};
+}
+[[nodiscard]] inline std::size_t guest_texture_morton_index(const swizzle_region& region,
+	const std::array<std::uint32_t, 3>& bits, std::size_t x, std::size_t y, std::size_t z)
+{
+	return morton_index({x + region.origin[0], y + region.origin[1], z + region.origin[2]}, bits);
+}
 // RG32Float volume: R keeps native depth precision;G keeps the stencil
 // byte as an exact float integer. Ordinary depth sampling consumes R only.
 [[nodiscard]] inline bool guest_texture_depth_volume(const guest_texture_layout& plan)
@@ -133,9 +200,22 @@ inline std::size_t checked_texture_sum(std::size_t a, std::size_t b)
 		throw std::overflow_error("Guest texture layout sum overflow");
 	return a + b;
 }
+[[nodiscard]] inline bool uses_stored_border_mip_atlas(const guest_texture_layout& plan)
+{
+	return plan.stored_border && (plan.mips > 1 || plan.dimension == vertex_texture_dimension::one ||
+		plan.dimension == vertex_texture_dimension::cube);
+}
+[[nodiscard]] inline stored_border_mip_atlas plan_stored_border_mip_atlas(const guest_texture_layout& plan)
+{
+	if (!uses_stored_border_mip_atlas(plan) || !supports_stored_border_storage(plan) || plan.subresources.size() != checked_texture_product(plan.mips, plan.layers))
+		throw std::invalid_argument("A stored-border atlas requires supported complete texel chains");
+	return plan_stored_border_atlas(plan.width, plan.height, plan.mips, plan.dimension == vertex_texture_dimension::one);
+}
 // NV_texture_compression_vtc Appendix: four consecutive S3TC blocks per
 // (Xblock,Yblock,Z/4),then planar one/two/three-slice tail storage. Pitch is
 // retained in the row/slice strides;only active blocks are projected.
+// For a stored border, supply guest_texture_image_subresource so (0,0)
+// addresses the top-left texel of the sampled ring.
 [[nodiscard]] inline std::size_t guest_texture_block_offset(const guest_texture_layout& plan,
 	const guest_texture_subresource& s,std::size_t x,std::size_t y,std::size_t z)
 {
@@ -144,8 +224,12 @@ inline std::size_t checked_texture_sum(std::size_t a, std::size_t b)
 	std::size_t offset;
 	if(guest_texture_vtc(plan)&&z<(s.depth&~std::size_t(3)))
 		offset=checked_texture_sum(checked_texture_product(z&~std::size_t(3),image),checked_texture_sum(checked_texture_product(4,checked_texture_sum(row,pixel)),checked_texture_product(z&3,plan.codec.block.bytes)));
-	else if(plan.swizzled&&plan.codec.block.width==1)
-		offset=checked_texture_product(morton_index({x,y,z},plan_swizzle({{s.columns,s.rows,s.depth},{},{s.columns,s.rows,s.depth}},plan.codec.block.bytes).log2),plan.codec.block.bytes);
+	else if(guest_texture_morton_blocks(plan))
+	{
+		const auto region = guest_texture_swizzle_region(plan, s);
+		const auto shape = plan_swizzle(region, plan.codec.block.bytes);
+		offset = checked_texture_product(guest_texture_morton_index(region, shape.log2, x, y, z), plan.codec.block.bytes);
+	}
 	else offset=checked_texture_sum(checked_texture_product(z,image),checked_texture_sum(row,pixel));
 	if(offset>s.storage_bytes||plan.codec.block.bytes>s.storage_bytes-offset)throw std::out_of_range("Texture block exceeds owned storage");
 	return checked_texture_sum(s.offset,offset);
@@ -179,17 +263,30 @@ inline std::size_t checked_texture_sum(std::size_t a, std::size_t b)
 	plan.swizzled = !(raw_format & 0x20);
 	plan.stored_border = !(words.format & 8) && !dxt;
 	std::size_t pitch = words.control3 & 0xfffff;
-	const auto packed_pitch = checked_texture_product((plan.width + plan.codec.block.width - 1) / plan.codec.block.width + (!(words.format & 8) ? 2 : 0), plan.codec.block.bytes);
+	const auto border_blocks = plan.stored_border ? 2u : 0u;
+	const auto packed_pitch = checked_texture_product((plan.width + plan.codec.block.width - 1) / plan.codec.block.width + border_blocks, plan.codec.block.bytes);
 	if (!plan.swizzled && pitch < packed_pitch)
 	{
 		plan.adjusted_pitch = true;
 		if (pitch)
-			plan.width = std::max<std::size_t>(1, (pitch / plan.codec.block.bytes) * plan.codec.block.width);
+		{
+			const auto row_blocks = pitch / plan.codec.block.bytes;
+			if (row_blocks <= border_blocks)
+				throw std::invalid_argument("Guest texture pitch cannot hold one complete interior block");
+			plan.width = (row_blocks - border_blocks) * plan.codec.block.width;
+		}
 		else
 		{
 			plan.height = plan.depth = 1;
 			pitch = packed_pitch;
 		}
+		if (plan.dimension == vertex_texture_dimension::cube && plan.width != plan.height)
+			throw std::invalid_argument("Adjusted guest cube texture faces must be square");
+		// The original register extent may describe more levels than the
+		// corrected native texture can own.
+		const auto extent = dxt ? std::max<std::size_t>(1, std::min(plan.width / 4, plan.height / 4))
+			: std::max({plan.width, plan.height, plan.depth});
+		plan.mips = std::min<std::size_t>(plan.mips, std::bit_width(extent));
 	}
 	std::size_t position = 0;
 	for (unsigned face = 0; face < plan.layers; ++face)

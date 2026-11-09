@@ -63,6 +63,26 @@ kernel void banked_surface(device uchar* tile [[buffer(0)]],device uchar* linear
     }
 }
 )metal";
+
+std::size_t banked_color_pitch(const guest_surface_layout& image)
+{
+	return (checked_texture_product(image.width, image.pixel_bytes) + 255) & ~std::size_t(255);
+}
+
+banked_parameters make_banked_parameters(const guest_surface_layout& image, const banked_tile_layout& tile,
+	bool encode, std::size_t pitch, std::uint32_t element_bytes)
+{
+	banked_parameters params{static_cast<std::uint32_t>(image.width), static_cast<std::uint32_t>(image.height), static_cast<std::uint32_t>(image.pixel_bytes),
+		tile.address, tile.size, tile.pitch, tile.bank, tile.offset, banked_tile_factor(tile.pitch), tile.pitch / 256, bool(image.morton), 0, 0, 0, 0, encode,
+		static_cast<std::uint32_t>(pitch ? pitch : checked_texture_product(image.width, image.pixel_bytes)), element_bytes};
+	if (image.morton)
+	{
+		const auto plan = plan_swizzle(*image.morton, image.pixel_bytes);
+		params.log_x = plan.log2[0]; params.log_y = plan.log2[1];
+		params.origin_x = image.morton->origin[0]; params.origin_y = image.morton->origin[1];
+	}
+	return params;
+}
 } // namespace
 surface_banked_transfer::surface_banked_transfer(context& ctx)
 	: m_device(ctx.device()), m_depth(ctx)
@@ -88,31 +108,37 @@ id<MTLBuffer> surface_banked_transfer::staging(context& ctx, id<MTLBuffer> guest
 	return buffer;
 }
 void surface_banked_transfer::convert(context& ctx, const guest_surface_layout& image, const banked_tile_layout& tile,
-	id<MTLBuffer> guest, id<MTLBuffer> linear, bool encode, std::size_t pitch, std::uint32_t element_bytes) const
+	id<MTLBuffer> guest, id<MTLBuffer> linear, bool encode, std::size_t pitch, std::uint32_t element_bytes, id<MTLBuffer> prepared) const
 {
-	banked_parameters params{static_cast<std::uint32_t>(image.width), static_cast<std::uint32_t>(image.height), static_cast<std::uint32_t>(image.pixel_bytes),
-		tile.address, tile.size, tile.pitch, tile.bank, tile.offset, banked_tile_factor(tile.pitch), tile.pitch / 256, bool(image.morton), 0, 0, 0, 0, encode,
-		static_cast<std::uint32_t>(pitch ? pitch : checked_texture_product(image.width, image.pixel_bytes)), element_bytes};
-	if (image.morton)
-	{
-		const auto plan = plan_swizzle(*image.morton, image.pixel_bytes);
-		params.log_x = plan.log2[0]; params.log_y = plan.log2[1];
-		params.origin_x = image.morton->origin[0]; params.origin_y = image.morton->origin[1];
-	}
 	bindings resources;
 	resources.set_buffer(0, guest); resources.set_buffer(1, linear);
-	const auto uniforms = ctx.upload(std::as_bytes(std::span(&params, 1)), 256);
+	upload_slice uniforms{prepared, 0, sizeof(banked_parameters)};
+	if (!prepared)
+	{
+		const auto params = make_banked_parameters(image, tile, encode, pitch, element_bytes);
+		uniforms = ctx.upload(std::as_bytes(std::span{&params, 1}), 256);
+	}
 	resources.set_buffer(2, uniforms.buffer, uniforms.offset);
-	ctx.keep_alive(m_pipeline);
-	const auto arguments = resources.snapshot(ctx);
-	const auto encoder = ctx.compute();
-	ctx.barrier(MTLStageBlit | MTLStageDispatch, MTLStageDispatch);
-	[encoder setComputePipelineState:m_pipeline];
-	[encoder setArgumentTable:arguments];
 	const auto count = checked_texture_product(image.width, image.height);
-	[encoder dispatchThreads:MTLSizeMake(count, 1, 1) threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(256, m_pipeline.maxTotalThreadsPerThreadgroup), 1, 1)];
+	const std::array accesses{
+		context::accessed_resource{guest, 0, tile.size, encode},
+		context::accessed_resource{linear, 0, linear.length, !encode},
+		context::accessed_resource{uniforms.buffer, uniforms.offset, uniforms.size}};
+	ctx.checked_dispatch(m_pipeline, resources, accesses, count);
 	++m_statistics.dispatches; m_statistics.texels += count;
 	m_statistics.active_bytes += checked_texture_product(count, image.pixel_bytes);
+}
+surface_banked_transfer::download_storage surface_banked_transfer::prepare_download(context& ctx, surface_format format,
+	const texture_region& region, id<MTLBuffer> guest, const guest_surface_layout& image, const banked_tile_layout& tile) const
+{
+	const auto* color = std::get_if<surface_color>(&format);
+	const auto pitch = color ? banked_color_pitch(image) : 0;
+	const auto linear = staging(ctx, guest, image, tile, region, pitch);
+	const auto params = make_banked_parameters(image, tile, true, pitch, color ? color_layout(*color).endian_element_bytes : 1);
+	download_storage prepared{linear, make_upload(ctx, std::as_bytes(std::span{&params, 1})), {}};
+	if (!color)
+		prepared.depth = m_depth.prepare_transfer(ctx, std::get<surface_depth>(format), linear, {}, region, true);
+	return prepared;
 }
 void surface_banked_transfer::upload_color(context& ctx, surface_color format, id<MTLBuffer> guest, const guest_surface_layout& image,
 	const banked_tile_layout& tile, id<MTLTexture> texture, const texture_region& region) const
@@ -120,7 +146,7 @@ void surface_banked_transfer::upload_color(context& ctx, surface_color format, i
 	const auto metadata = describe_surface_color(format);
 	validate_surface_texture(ctx, metadata.format, texture, region);
 	if (image.pixel_bytes != metadata.layout.pixel_bytes) throw std::invalid_argument("Banked color byte width differs from its format");
-	const auto pitch = (checked_texture_product(image.width, image.pixel_bytes) + 255) & ~std::size_t(255);
+	const auto pitch = banked_color_pitch(image);
 	const auto linear = staging(ctx, guest, image, tile, region, pitch);
 	convert(ctx, image, tile, guest, linear, false, pitch, metadata.layout.endian_element_bytes);
 	buffer_to_texture(ctx, linear, 0, texture, region, pitch);
@@ -129,33 +155,43 @@ void surface_banked_transfer::upload_color(context& ctx, surface_color format, i
 void surface_banked_transfer::download_color(context& ctx, surface_color format, id<MTLTexture> texture, const texture_region& region,
 	id<MTLBuffer> guest, const guest_surface_layout& image, const banked_tile_layout& tile) const
 {
+	download_color_impl(ctx, format, texture, region, guest, image, tile, nullptr);
+}
+void surface_banked_transfer::download_color_impl(context& ctx, surface_color format, id<MTLTexture> texture, const texture_region& region,
+	id<MTLBuffer> guest, const guest_surface_layout& image, const banked_tile_layout& tile, const download_storage* prepared) const
+{
 	const auto metadata = describe_surface_color(format);
 	validate_surface_texture(ctx, metadata.format, texture, region);
 	if (image.pixel_bytes != metadata.layout.pixel_bytes) throw std::invalid_argument("Banked color byte width differs from its format");
-	const auto pitch = (checked_texture_product(image.width, image.pixel_bytes) + 255) & ~std::size_t(255);
-	const auto linear = staging(ctx, guest, image, tile, region, pitch);
+	const auto pitch = banked_color_pitch(image);
+	const auto linear = prepared ? prepared->linear : staging(ctx, guest, image, tile, region, pitch);
 	texture_to_buffer(ctx, texture, region, linear, 0, pitch);
-	convert(ctx, image, tile, guest, linear, true, pitch, metadata.layout.endian_element_bytes);
+	convert(ctx, image, tile, guest, linear, true, pitch, metadata.layout.endian_element_bytes, prepared ? prepared->uniforms : nil);
 	++m_statistics.fused_color_downloads;
 }
 void surface_banked_transfer::upload_depth(context& ctx, surface_depth format, id<MTLBuffer> guest, const guest_surface_layout& image,
-	const banked_tile_layout& tile, id<MTLTexture> texture, const texture_region& region) const
+	const banked_tile_layout& tile, id<MTLTexture> texture, const texture_region& region, texture_plane plane) const
 {
 	const auto metadata = describe_surface_depth(format);
 	validate_surface_texture(ctx, metadata.format, texture, region);
 	if (image.pixel_bytes != metadata.guest_bytes) throw std::invalid_argument("Banked depth byte width differs from its format");
 	const auto linear = staging(ctx, guest, image, tile, region);
 	convert(ctx, image, tile, guest, linear, false);
-	m_depth.upload(ctx, format, linear, {}, texture, region);
+	m_depth.upload(ctx, format, linear, {}, texture, region, plane);
 }
 void surface_banked_transfer::download_depth(context& ctx, surface_depth format, id<MTLTexture> texture, const texture_region& region,
 	id<MTLBuffer> guest, const guest_surface_layout& image, const banked_tile_layout& tile) const
 {
+	download_depth_impl(ctx, format, texture, region, guest, image, tile, nullptr);
+}
+void surface_banked_transfer::download_depth_impl(context& ctx, surface_depth format, id<MTLTexture> texture, const texture_region& region,
+	id<MTLBuffer> guest, const guest_surface_layout& image, const banked_tile_layout& tile, const download_storage* prepared) const
+{
 	const auto metadata = describe_surface_depth(format);
 	validate_surface_texture(ctx, metadata.format, texture, region);
 	if (image.pixel_bytes != metadata.guest_bytes) throw std::invalid_argument("Banked depth byte width differs from its format");
-	const auto linear = staging(ctx, guest, image, tile, region);
-	m_depth.download(ctx, format, texture, region, linear, {});
-	convert(ctx, image, tile, guest, linear, true);
+	const auto linear = prepared ? prepared->linear : staging(ctx, guest, image, tile, region);
+	m_depth.download_impl(ctx, format, texture, region, linear, {}, prepared ? &*prepared->depth : nullptr);
+	convert(ctx, image, tile, guest, linear, true, 0, 1, prepared ? prepared->uniforms : nil);
 }
 } // namespace metal4

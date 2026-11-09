@@ -11,6 +11,7 @@ namespace metal4
 {
 struct fragment_program_options;
 class fragment_shader;
+class prepared_shader_stages;
 
 struct render_pipeline_configuration
 {
@@ -102,11 +103,17 @@ class render_pipeline_cache final
 	  public:
 		[[nodiscard]] bool ready() const;
 	};
+  private:
+	[[nodiscard]] std::optional<prepared_pipeline> prewarm_ready(const render_pipeline_configuration& config,
+		MTL4LibraryFunctionDescriptor* vertex, MTL4LibraryFunctionDescriptor* fragment);
+  public:
 	// Nonblocking native PSO admission, with at most64 indexed pending owners.
 	// Exact effective keys deduplicate even completed but unconsumed jobs. Tickets
 	// freeze dynamic stencil references separately and survive clear/eviction.
 	[[nodiscard]] std::optional<prepared_pipeline> prewarm(const render_pipeline_configuration& config,
 		MTL4FunctionDescriptor* vertex, const fragment_shader& fragment);
+	[[nodiscard]] std::optional<prepared_pipeline> prewarm(const render_pipeline_configuration& config,
+		const prepared_shader_stages& stages);
 	[[nodiscard]] render_pipeline_bundle get(const prepared_pipeline& prepared,
 		std::chrono::milliseconds timeout = std::chrono::seconds(30));
 	[[nodiscard]] render_pipeline_cache_statistics statistics() const noexcept;

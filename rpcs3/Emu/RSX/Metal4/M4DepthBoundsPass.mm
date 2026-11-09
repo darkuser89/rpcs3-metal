@@ -126,8 +126,7 @@ depth_bounds_pass depth_bounds_engine::prepare(context& ctx, MTL4RenderPassDescr
 			clear.stencilAttachment = descriptor.stencilAttachment;
 			clear.stencilAttachment.storeAction = MTLStoreActionStore;
 		}
-		(void)ctx.render(clear);
-		ctx.end_encoding();
+		render_commands::materialize_attachments(ctx, clear);
 		descriptor.depthAttachment.loadAction = MTLLoadActionLoad;
 		if (clear_stencil)
 			descriptor.stencilAttachment.loadAction = MTLLoadActionLoad;
@@ -144,13 +143,10 @@ depth_bounds_pass depth_bounds_engine::prepare(context& ctx, MTL4RenderPassDescr
 	initialize.colorAttachments[0].storeAction = MTLStoreActionStore;
 	bindings inputs;
 	inputs.set_texture(0, source);
-	render_commands draw(ctx, initialize);
 	raster_state raster;
 	raster.viewport = {0, 0, double(width), double(height), 0, 1};
 	raster.scissor = {0, 0, width, height};
-	draw.configure(pipeline, nil, raster, {}, inputs);
-	draw.draw(MTLPrimitiveTypeTriangle, 0, 3);
-	draw.end();
+	render_commands::draw_fragment_triangle(ctx, initialize, pipeline, nil, raster, inputs);
 	descriptor.colorAttachments[4].texture = mirror;
 	descriptor.colorAttachments[4].loadAction = MTLLoadActionLoad;
 	descriptor.colorAttachments[4].storeAction = MTLStoreActionStore;
@@ -167,13 +163,17 @@ void depth_bounds_pass::configure_pipeline(render_pipeline_configuration& pipeli
 	fragment.depth_mirror = pipeline.depth_mirror;
 	configure_output_rops(pipeline, fragment);
 }
-void depth_bounds_pass::begin_render()
+void depth_bounds_pass::begin_render(const bindings* guest_vertex, id<MTLBuffer> geometry, bool conditional)
 {
 	if (m_ended)
 		throw std::logic_error("Native stored-depth mirror pass already ended");
 	if (!m_commands)
 	{
-		m_commands = std::make_unique<render_commands>(m_context, m_descriptor);
+		if (guest_vertex)
+			m_commands.reset(new render_commands(m_context, m_descriptor, MTLStageAll,
+				context::render_writes::attachments, conditional ? nullptr : guest_vertex, geometry));
+		else
+			m_commands = std::make_unique<render_commands>(m_context, m_descriptor);
 		if (m_visibility) m_commands->visibility(m_visibility->first, m_visibility->second);
 	}
 }
@@ -191,7 +191,17 @@ void depth_bounds_pass::draw_geometry(const prepared_geometry& geometry, const r
 {
 	draw_geometry_impl(geometry.references(),&geometry,pipeline,fragment,vertex,state,code,inputs,raster,instances,base_instance,constants);
 }
-void depth_bounds_pass::draw_geometry_impl(const converted_geometry& geometry, const prepared_geometry* prepared, const render_pipeline_bundle& pipeline, const fragment_shader& fragment, const bindings& vertex, fragment_context state, std::span<const std::byte> code, const fragment_inputs& inputs, raster_state raster, std::size_t instances, std::size_t base_instance, const fragment_shader::constant_binding* constants)
+void depth_bounds_pass::draw_guest_geometry(const prepared_geometry& geometry, const render_pipeline_bundle& pipeline,
+	const fragment_shader& fragment, const bindings& vertex, fragment_context state, std::span<const std::byte> code,
+	const fragment_inputs& inputs, raster_state raster, const fragment_shader::constant_binding* constants,
+	const conditional_draw* conditional)
+{
+	if (m_commands || m_ended)
+		throw std::logic_error("Checked Metal 4 depth mirror requires an unused pass");
+	draw_geometry_impl(geometry.references(), &geometry, pipeline, fragment, vertex, state, code, inputs, raster, 1, 0, constants, true, conditional);
+}
+
+void depth_bounds_pass::draw_geometry_impl(const converted_geometry& geometry, const prepared_geometry* prepared, const render_pipeline_bundle& pipeline, const fragment_shader& fragment, const bindings& vertex, fragment_context state, std::span<const std::byte> code, const fragment_inputs& inputs, raster_state raster, std::size_t instances, std::size_t base_instance, const fragment_shader::constant_binding* constants, bool guest, const conditional_draw* conditional)
 {
 	if (pipeline.depth_mirror.encoding != m_encoding || pipeline.state.sample_count != m_samples || pipeline.depth_mirror.write != pipeline.state.depth_write || fragment.depth_mirror() != pipeline.depth_mirror || fragment.raster_sample_count() != m_samples)
 		throw std::invalid_argument("Native stored-depth pass requires matching verified shader/pipeline contracts");
@@ -204,8 +214,12 @@ void depth_bounds_pass::draw_geometry_impl(const converted_geometry& geometry, c
 	raster.depth_bounds_enabled = false; // Test actual stored depth in color(4), never incoming depth.
 	raster.front_stencil_reference = pipeline.state.front.reference;
 	raster.back_stencil_reference = pipeline.state.back.reference;
-	begin_render();
-	if (prepared) m_commands->draw_geometry(*prepared, pipeline.pipeline, pipeline.depth_stencil, raster, vertex, bindings, instances, base_instance);
+	if (guest)
+		begin_render(&vertex, prepared->buffer(), conditional != nullptr);
+	else
+		begin_render();
+	if (conditional) m_commands->draw_geometry(*conditional, pipeline.pipeline, pipeline.depth_stencil, raster, vertex, bindings);
+	else if (prepared) m_commands->draw_geometry(*prepared, pipeline.pipeline, pipeline.depth_stencil, raster, vertex, bindings, instances, base_instance);
 	else m_commands->draw_geometry(geometry, pipeline.pipeline, pipeline.depth_stencil, raster, vertex, bindings, instances, base_instance);
 }
 void depth_bounds_pass::end()

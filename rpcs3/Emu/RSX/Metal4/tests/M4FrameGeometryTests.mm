@@ -14,7 +14,7 @@ namespace metal4
 class frame_geometry_test_access
 {
   public:
-	static auto prepare(native_frame& frame,bool vsync=true) { return frame.prepare_acquisition(vsync); }
+	static auto prepare(native_frame& frame, frame_pacing pacing = frame_pacing::synchronized) { return frame.prepare_acquisition(pacing); }
 	template<typename Ticket> static bool current(const native_frame& frame,const Ticket& ticket) { return frame.current_acquisition(ticket); }
 };
 }
@@ -154,14 +154,36 @@ void observed_frame(context& ctx)
 	const auto reads=view.reads;
 	std::thread renderer([&]{for(unsigned i=0;i<10000;++i){require(frame.attached()&&frame.extent()==frame_extent{961,721},"Published geometry read differs");}});renderer.join();
 	require(view.reads==reads,"Render snapshot reads called host/UI selectors");
-	(void)frame_geometry_test_access::prepare(frame,false);const auto unsynced=frame.geometry_statistics();
-	for(unsigned i=0;i<10000;++i)require(bool(frame_geometry_test_access::prepare(frame,false)),"Repeated visible acquisition metadata disappeared");
+	(void)frame_geometry_test_access::prepare(frame,frame_pacing::unsynchronized);const auto unsynced=frame.geometry_statistics();
+	for(unsigned i=0;i<10000;++i)require(bool(frame_geometry_test_access::prepare(frame,frame_pacing::unsynchronized)),"Repeated visible acquisition metadata disappeared");
 	require(same(unsynced,frame.geometry_statistics())&&frame_geometry_test_access::current(frame,*ticket),"Identical Vsync policy rewrote layer or invalidated geometry");
-	(void)frame_geometry_test_access::prepare(frame,true);
+	(void)frame_geometry_test_access::prepare(frame,frame_pacing::adaptive);
 	require(frame.geometry_statistics().vsync_writes==initial.vsync_writes+2,"Vsync changes did not write exactly once each");
+	struct pacing_profile { frame_pacing request; bool sync; };
+	const std::array profiles{
+		pacing_profile{frame_pacing::unsynchronized, false},
+		pacing_profile{frame_pacing::synchronized, true},
+		pacing_profile{frame_pacing::adaptive, true}};
+	for (const auto& from : profiles)
+		for (const auto& to : profiles)
+		{
+			require(bool(frame_geometry_test_access::prepare(frame, from.request)), "Starting pacing request did not acquire metadata");
+			require(frame.layer().displaySyncEnabled == from.sync, "Starting pacing used the wrong layer synchronization");
+			const auto before = frame.geometry_statistics();
+			require(bool(frame_geometry_test_access::prepare(frame, to.request)), "Pacing transition did not acquire metadata");
+			const auto after = frame.geometry_statistics();
+			require(frame.layer().displaySyncEnabled == to.sync && after.vsync_writes == before.vsync_writes + (from.sync != to.sync) &&
+				after.epoch == before.epoch && after.layer_transactions == before.layer_transactions,
+				"Pacing transition changed the wrong layer state");
+		}
+	const auto before_invalid_pacing = frame.geometry_statistics();
+	rejects([&] { (void)frame_geometry_test_access::prepare(frame, static_cast<frame_pacing>(-1)); });
+	require(same(before_invalid_pacing, frame.geometry_statistics()), "Invalid pacing changed layer state");
 	const auto before_ancestor=frame.geometry_statistics();view.ancestorHidden=YES;tick();
-	require(!frame_geometry_test_access::prepare(frame)&&!frame_geometry_test_access::current(frame,*ticket)&&
-		frame.geometry_statistics().layer_transactions==before_ancestor.layer_transactions,"Hidden ancestor retained visible acquisition or rewrote layer");
+	require(!frame_geometry_test_access::prepare(frame, frame_pacing::unsynchronized)&&!frame_geometry_test_access::current(frame,*ticket)&&
+		frame.geometry_statistics().layer_transactions==before_ancestor.layer_transactions&&
+		frame.geometry_statistics().vsync_writes==before_ancestor.vsync_writes,"Hidden ancestor retained visible acquisition or rewrote layer");
+	std::cout << "Native pacing: nine CAMetalLayer transitions, synchronized adaptive mode, no redundant writes, hidden and invalid guards passed\n";
 	view.ancestorHidden=NO;tick();require(bool(frame_geometry_test_access::prepare(frame)),"Ancestor reveal did not restore acquisition metadata");
 	for(unsigned i=0;i<36;++i)
 	{

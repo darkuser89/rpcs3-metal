@@ -26,6 +26,7 @@ class surface_typeless_transfer final
 	explicit surface_typeless_transfer(context& ctx);
 	void nearest(context& ctx, surface_format source_format, id<MTLTexture> source, const texture_region& source_region,
 				 surface_format destination_format, id<MTLTexture> destination, const texture_region& destination_region,
-				 std::array<bool, 3> flip = {}) const;
+				 std::array<bool, 3> flip = {}, nearest_projection projection = {},
+				 texture_plane destination_plane = texture_plane::all) const;
 };
 } // namespace metal4

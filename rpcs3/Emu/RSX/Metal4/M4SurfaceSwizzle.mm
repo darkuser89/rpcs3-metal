@@ -45,13 +45,13 @@ void surface_swizzle_transfer::download_color(context& ctx, surface_color format
 }
 
 void surface_swizzle_transfer::upload_depth(context& ctx, surface_depth format, id<MTLBuffer> guest, std::size_t offset,
-	const swizzle_region& layout, id<MTLTexture> texture, const texture_region& region) const
+	const swizzle_region& layout, id<MTLTexture> texture, const texture_region& region, texture_plane plane) const
 {
 	const auto metadata = describe_surface_depth(format);
 	validate_surface_texture(ctx, metadata.format, texture, region);
 	const auto linear = staging(ctx, guest, offset, layout, metadata.guest_bytes, region);
 	m_swizzle.convert(ctx, guest, offset, linear, 0, layout, metadata.guest_bytes);
-	m_depth.upload(ctx, format, linear, {}, texture, region);
+	m_depth.upload(ctx, format, linear, {}, texture, region, plane);
 }
 
 void surface_swizzle_transfer::download_depth(context& ctx, surface_depth format, id<MTLTexture> texture, const texture_region& region,

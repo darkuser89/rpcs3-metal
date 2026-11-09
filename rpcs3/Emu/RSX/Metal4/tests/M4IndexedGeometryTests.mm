@@ -4,6 +4,7 @@
 #include "M4Varyings.h"
 #include "M4ConstantUpload.h"
 #include "M4HeapBudget.h"
+#include "M4Query.h"
 
 #include <algorithm>
 #include <bit>
@@ -167,13 +168,22 @@ void flat_only_and_fresh_sources(unsigned color_source,vertex_texture_dimension 
 				buffer_to_texture(ctx,upload,0,data.textures[0],{0,face,MTLOriginMake(0,0,0),MTLSizeMake(2,descriptor.height,descriptor.depth)},256,512);
 			ctx.submit().wait();
 		}
-		data.packed->persistent=make_upload(ctx,raw);
+		const auto input = make_upload(ctx, raw);
+		data.packed->persistent = make_buffer(ctx, raw.size(), buffer_storage::private_gpu);
 		vertex_context state;state.vertex_base=base;state.vertex_count=8;state.constant_count=1;state.output_mask=1|(1u<<14)|(1u<<15);
 		const auto before=ctx.geometry_uploads().statistics();const auto reused=prepared_geometry::prepare(ctx,plan);
 		require(reused.buffer()==native.buffer() && ctx.geometry_uploads().statistics().created==before.created,"Fresh source inputs rebuilt immutable geometry");
 		auto flat=prepared_flat_colors::admit(ctx,reused.references(),84);
 		require(flat.source_ids().size()==1 && flat.source_ids()[0]==base+7 && flat.results().length==80,"Flat-only quad did not admit one compact color result");
-		ctx.begin();const auto vb=vertex.prepare(ctx,state,reused.references(),data,&flat);
+		ctx.begin();
+		copy_buffer(ctx, input, 0, data.packed->persistent, 0, raw.size());
+		const auto before_flat = ctx.encoding_statistics();
+		const auto vb = vertex.prepare(ctx, state, reused.references(), data, &flat);
+		const auto after_flat = ctx.encoding_statistics();
+		require(after_flat.checked_dispatches == before_flat.checked_dispatches + 1 &&
+			after_flat.blit_to_dispatch_barriers == before_flat.blit_to_dispatch_barriers + 1 &&
+			after_flat.compute_encoders == before_flat.compute_encoders,
+			"Flat result prepass must wait for its packed stream blit in the same encoder");
 		{render_commands draw(ctx,pass(image));draw.draw_geometry(reused,pipeline.pipeline,pipeline.depth_stencil,raster(),vb,{});draw.end();}
 		texture_to_buffer(ctx,image,{0,0,MTLOriginMake(0,0,0),MTLSizeMake(16,16,1)},output,0,256);ctx.submit().wait();
 		const auto expected=color_source==0 ? (round ? std::array<float,4>{.15625,.8125,.4375,1.0625} : std::array<float,4>{.75,.0625,.15625,.875}) :
@@ -182,7 +192,7 @@ void flat_only_and_fresh_sources(unsigned color_source,vertex_texture_dimension 
 		for(unsigned pixel=0;pixel<256;++pixel)for(unsigned c=0;c<4;++c)
 			require(static_cast<const float*>(output.contents)[pixel*4+c]==expected[c],"Native paired geometry changed diagonal/flat-only color or reused old attributes/texture/constants");
 	}
-	std::cout<<"Native indexed/separated flat-only quad:color-source="<<color_source<<"(attribute/texture/constant),dimension="<<unsigned(dimension)<<",fourpairedrefs/sixindices/44bytes,source7outsidecorners0..3,one80byteflatresult;512RGBA32Fpixels independently exact;unchanged geometry buffer with fresh attribute/vertextexture/constant versions,including above-one color passed\n";
+	std::cout<<"Native indexed/separated flat-only quad:color-source="<<color_source<<"(attribute/texture/constant),dimension="<<unsigned(dimension)<<",fourpairedrefs/sixindices/44bytes,source7outsidecorners0..3,one80byteflatresult;512RGBA32Fpixels independently exact;two checked Blit-to-Dispatch dependencies;unchanged geometry buffer with fresh attribute/vertextexture/constant versions,including above-one color passed\n";
 }
 
 std::string point_shader = R"metal(
@@ -193,8 +203,111 @@ struct output { float4 position [[position]]; float point_size [[point_size]]; }
 vertex output indexed_point(uint id [[vertex_id]],device const reference* references [[buffer(30)]],constant uint& selected [[buffer(0)]]) {
  return {float4(references[id].source == selected ? 0.f : 4.f,0,.5f,1),1};
 }
+vertex output conditional_point(uint id [[vertex_id]], uint instance [[instance_id]],
+    device const reference* references [[buffer(30)]], constant uint& selected [[buffer(0)]])
+{
+    const bool visible = references[id].source == selected && (instance == 7 || instance == 8);
+    return {float4(visible ? (instance == 7 ? -.25f : .25f) : 4.f, 0, .5f, 1), 1};
+}
 fragment float4 point_color(output in [[stage_in]]) { return float4(1,2,3,4); }
 )metal";
+
+void conditional_native_geometry()
+{
+	context ctx;
+	compiler compile(ctx);
+	const auto library = compile.library(point_shader);
+	render_pipeline_configuration configuration;
+	configuration.colors[0] = MTLPixelFormatRGBA32Float;
+	configuration.topology = MTLPrimitiveTopologyClassPoint;
+	const auto pipeline = make_render_pipeline(compile, configuration, library_function(library, @"conditional_point"),
+		library_function(library, @"point_color"));
+	const auto image = target(ctx);
+	constexpr std::size_t image_bytes = 4096;
+	const auto output = make_buffer(ctx, 3 * image_bytes, buffer_storage::shared);
+	const auto read = [&](std::size_t slot)
+	{
+		texture_to_buffer(ctx, image, {0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(16, 16, 1)}, output, slot * image_bytes, 256);
+	};
+	query_pool sources(ctx, 2, 2);
+	const std::uint32_t visible[]{0}, hidden[]{1};
+	for (const unsigned width : {0u, 2u, 4u})
+	{
+		const unsigned count = width == 4 ? 65537u : 3u;
+		converted_geometry original{list_topology::points, {}, std::nullopt};
+		for (unsigned id = 0; id < count; ++id)
+			original.vertices.push_back({id, id});
+		if (width) original.vertices.push_back({0, 0});
+		auto geometry = std::make_optional(prepared_geometry::prepare(ctx, plan_indexed_references(original)));
+		require(geometry->index_width() == width, "Conditional draw fixture did not select the requested Metal index width");
+		const auto selected = count - 1;
+		const auto selection = make_upload(ctx, std::as_bytes(std::span{&selected, 1}));
+		bindings vertex;
+		vertex.set_buffer(0, selection);
+		ctx.begin();
+		sources.begin(0, true);
+		auto descriptor = pass(image);
+		const auto query = sources.attach(ctx, descriptor);
+		require(query.has_value(), "Direct geometry did not attach its query");
+		{
+			render_commands commands(ctx, descriptor);
+			commands.visibility(query->mode, query->offset);
+			commands.draw_geometry(*geometry, pipeline.pipeline, pipeline.depth_stencil, raster(), vertex, {}, 2, 7);
+			commands.end();
+		}
+		sources.end(0);
+		sources.begin(1, true);
+		sources.end(1);
+		read(0);
+		std::optional<conditional_draw> on, off;
+		if (width == 4)
+		{
+			ctx.submit().wait();
+			ctx.begin();
+			const report_query_source positive[]{{0}}, negative[]{{1}};
+			const auto on_value = sources.capture_report_predicate({positive, 0, true});
+			const auto off_value = sources.capture_report_predicate({negative, 0, true});
+			require(on_value && off_value, "UInt32 draw report capture was unavailable");
+			(void)ctx.submit();
+			ctx.begin();
+			on = sources.encode_predicated_draw(*on_value, *geometry, 2, 7);
+			off = sources.encode_predicated_draw(*off_value, *geometry, 2, 7);
+		}
+		else
+		{
+			on = sources.encode_conditional_draw(visible, *geometry, 2, 7);
+			off = sources.encode_conditional_draw(hidden, *geometry, 2, 7);
+		}
+		require(on && off, "Prepared geometry failed to produce native indirect arguments");
+		geometry.reset();
+		ctx.geometry_uploads().clear();
+		{
+			render_commands commands(ctx, pass(image));
+			commands.draw_geometry(*on, pipeline.pipeline, pipeline.depth_stencil, raster(), vertex, {});
+			commands.end();
+		}
+		read(1);
+		{
+			render_commands commands(ctx, pass(image));
+			commands.draw_geometry(*off, pipeline.pipeline, pipeline.depth_stencil, raster(), vertex, {});
+			commands.end();
+		}
+		read(2);
+		on.reset();
+		off.reset();
+		ctx.submit().wait();
+		const auto bytes = map_buffer(output, 0, 3 * image_bytes);
+		const auto expected = bytes.first(image_bytes);
+		const auto drawn = bytes.subspan(image_bytes, image_bytes);
+		const auto cleared = bytes.last(image_bytes);
+		require(sources.consume(0) == 2 && sources.consume(1) == 0, "Conditional geometry sources did not produce exact visibility");
+		require(std::ranges::equal(expected, drawn), "Indirect geometry changed pixels, index selection or base instance");
+		require(std::ranges::all_of(cleared, [](std::byte byte) { return byte == std::byte{}; }),
+			"False conditional geometry changed cleared pixels");
+	}
+	std::cout << "Native conditional prepared geometry: array/UInt16 and retained UInt32, two instances starting at 7, 24576 exact compared bytes, packet/cache/command release passed\n";
+}
+
 void native_index_width_and_lifetime()
 {
 	std::shared_ptr<heap_budget> ledger;
@@ -246,13 +359,20 @@ void native_index_width_and_lifetime()
 	std::cout << "Native indexed geometry:actual UInt16/UInt32 boundary65535/65536/65537,last source pixel exact;100immutable hits,64entry/8MiB LRU;event-gated indexed draw survives cache/packet/bindings/context destruction andtimeout,all native charges retire passed\n";
 }
 }
-int main()
+int main(int argc, char** argv)
 {
 	std::cout.setf(std::ios::unitbuf);
 	@autoreleasepool
 	{
 		try
 		{
+			if (argc == 2 && std::string_view(argv[1]) == "--conditional-only")
+			{
+				conditional_native_geometry();
+				return 0;
+			}
+			require(argc == 1, "Unknown native indexed geometry test selector");
+			conditional_native_geometry();
 			compare_native_draws();for(unsigned source=0;source<3;++source)flat_only_and_fresh_sources(source);
 			for(auto dimension:{vertex_texture_dimension::one,vertex_texture_dimension::three,vertex_texture_dimension::cube})flat_only_and_fresh_sources(1,dimension);
 			native_index_width_and_lifetime();return 0;

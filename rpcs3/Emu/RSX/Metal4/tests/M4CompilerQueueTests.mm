@@ -11,72 +11,7 @@
 #include <mutex>
 #include <thread>
 
-// Test-only callback gate around the real native compiler. It never fabricates
-// a library/PSO: every result below comes from an actual MTL4CompilerTask.
-@interface M4GatedCompiler : NSObject
-{
-	id<MTL4Compiler> _native;
-	std::mutex _mutex;
-	std::condition_variable _changed;
-	std::deque<dispatch_block_t> _callbacks;
-	bool _holding;
-	std::atomic<bool> _mainThreadLaunch;
-}
-- (instancetype)initWithNative:(id<MTL4Compiler>)native;
-- (id<MTLDevice>)device;
-- (void)deliver:(dispatch_block_t)callback;
-- (void)waitForCallbacks:(std::size_t)count;
-- (void)releaseCallbacks;
-- (bool)mainThreadLaunch;
-@end
-
-@implementation M4GatedCompiler
-- (instancetype)initWithNative:(id<MTL4Compiler>)native
-{
-	if ((self = [super init])) { _native = native; _holding = true; _mainThreadLaunch = false; }
-	return self;
-}
-- (id<MTLDevice>)device { return _native.device; }
-- (void)deliver:(dispatch_block_t)callback
-{
-	{
-		std::lock_guard lock(_mutex);
-		if (_holding) { _callbacks.push_back([callback copy]); _changed.notify_all(); return; }
-	}
-	callback();
-}
-- (void)waitForCallbacks:(std::size_t)count
-{
-	std::unique_lock lock(_mutex);
-	if (!_changed.wait_for(lock, std::chrono::seconds(10), [&] { return _callbacks.size() >= count; }))
-		throw std::runtime_error("Timed out waiting for real native compiler callbacks");
-}
-- (void)releaseCallbacks
-{
-	std::deque<dispatch_block_t> callbacks;
-	{ std::lock_guard lock(_mutex); _holding = false; callbacks.swap(_callbacks); }
-	for (auto callback : callbacks) callback();
-}
-- (bool)mainThreadLaunch { return _mainThreadLaunch; }
-- (id<MTL4CompilerTask>)newLibraryWithDescriptor:(MTL4LibraryDescriptor*)descriptor completionHandler:(MTLNewLibraryCompletionHandler)completion
-{
-	if ([NSThread isMainThread]) _mainThreadLaunch = true;
-	return [_native newLibraryWithDescriptor:descriptor completionHandler:^(id<MTLLibrary> result, NSError* error)
-		{ [self deliver:^{ completion(result, error); }]; }];
-}
-- (id<MTL4CompilerTask>)newComputePipelineStateWithDescriptor:(MTL4ComputePipelineDescriptor*)descriptor compilerTaskOptions:(MTL4CompilerTaskOptions*)options completionHandler:(MTLNewComputePipelineStateCompletionHandler)completion
-{
-	if ([NSThread isMainThread]) _mainThreadLaunch = true;
-	return [_native newComputePipelineStateWithDescriptor:descriptor compilerTaskOptions:options completionHandler:^(id<MTLComputePipelineState> result, NSError* error)
-		{ [self deliver:^{ completion(result, error); }]; }];
-}
-- (id<MTL4CompilerTask>)newRenderPipelineStateWithDescriptor:(MTL4PipelineDescriptor*)descriptor compilerTaskOptions:(MTL4CompilerTaskOptions*)options completionHandler:(MTLNewRenderPipelineStateCompletionHandler)completion
-{
-	if ([NSThread isMainThread]) _mainThreadLaunch = true;
-	return [_native newRenderPipelineStateWithDescriptor:descriptor compilerTaskOptions:options completionHandler:^(id<MTLRenderPipelineState> result, NSError* error)
-		{ [self deliver:^{ completion(result, error); }]; }];
-}
-@end
+#include "M4CompilerGateFixture.h"
 
 namespace
 {
@@ -102,6 +37,34 @@ id<MTL4Compiler> native(context& ctx)
 	const auto result = [ctx.device() newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&error];
 	if (!result) throw std::runtime_error(error.localizedDescription.UTF8String);
 	return result;
+}
+
+void verify_native_pipelines(context& ctx,id<MTLComputePipelineState> cp,id<MTLRenderPipelineState> rp)
+{
+	const auto out = make_buffer(ctx, 4, buffer_storage::shared), pixels = make_buffer(ctx, 1024, buffer_storage::shared);
+	auto description = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:4 height:4 mipmapped:NO];
+	description.storageMode = MTLStorageModePrivate;
+	description.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+	const auto target = make_texture(ctx, description);
+	ctx.begin();
+	bindings buffers; buffers.set_buffer(0, out);
+	const auto table = buffers.snapshot(ctx);
+	const auto encoder = ctx.compute();
+	ctx.keep_alive(cp);
+	[encoder setComputePipelineState:cp]; [encoder setArgumentTable:table];
+	[encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+	auto pass = [MTL4RenderPassDescriptor new];
+	pass.colorAttachments[0].texture = target; pass.colorAttachments[0].loadAction = MTLLoadActionClear; pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+	render_commands draw(ctx, pass);
+	raster_state raster; raster.viewport = {0, 0, 4, 4, 0, 1}; raster.scissor = {0, 0, 4, 4};
+	draw.configure(rp, nil, raster, {}, {}); draw.draw(MTLPrimitiveTypeTriangle, 0, 3); draw.end();
+	texture_region region; region.size = MTLSizeMake(4, 4, 1);
+	texture_to_buffer(ctx, target, region, pixels, 0, 256);
+	ctx.submit().wait();
+	require(*static_cast<unsigned*>(out.contents) == 37, "Queued compute borrowed mutated function descriptor");
+	const auto* bytes = static_cast<const unsigned char*>(pixels.contents);
+	for (unsigned y = 0; y < 4; ++y) for (unsigned x = 0; x < 4; ++x)
+		for (unsigned c = 0; c < 4; ++c) require(bytes[y * 256 + x * 4 + c] == std::array{64u, 128u, 191u, 255u}[c], "Queued render borrowed mutated function/attachment descriptor");
 }
 
 void bounded_and_deduplicated(context& ctx)
@@ -164,30 +127,7 @@ void frozen_pipeline_inputs(context& ctx)
 	const auto cp = compute_job->compute();
 	const auto rp = render_job->render();
 	require(queue.shutdown(), "Native pipeline queue did not drain");
-	const auto out = make_buffer(ctx, 4, buffer_storage::shared), pixels = make_buffer(ctx, 1024, buffer_storage::shared);
-	auto description = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:4 height:4 mipmapped:NO];
-	description.storageMode = MTLStorageModePrivate;
-	description.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
-	const auto target = make_texture(ctx, description);
-	ctx.begin();
-	bindings buffers; buffers.set_buffer(0, out);
-	const auto table = buffers.snapshot(ctx);
-	const auto encoder = ctx.compute();
-	ctx.keep_alive(cp);
-	[encoder setComputePipelineState:cp]; [encoder setArgumentTable:table];
-	[encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
-	auto pass = [MTL4RenderPassDescriptor new];
-	pass.colorAttachments[0].texture = target; pass.colorAttachments[0].loadAction = MTLLoadActionClear; pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-	render_commands draw(ctx, pass);
-	raster_state raster; raster.viewport = {0, 0, 4, 4, 0, 1}; raster.scissor = {0, 0, 4, 4};
-	draw.configure(rp, nil, raster, {}, {}); draw.draw(MTLPrimitiveTypeTriangle, 0, 3); draw.end();
-	texture_region region; region.size = MTLSizeMake(4, 4, 1);
-	texture_to_buffer(ctx, target, region, pixels, 0, 256);
-	ctx.submit().wait();
-	require(*static_cast<unsigned*>(out.contents) == 37, "Queued compute borrowed mutated function descriptor");
-	const auto* bytes = static_cast<const unsigned char*>(pixels.contents);
-	for (unsigned y = 0; y < 4; ++y) for (unsigned x = 0; x < 4; ++x)
-		for (unsigned c = 0; c < 4; ++c) require(bytes[y * 256 + x * 4 + c] == std::array{64u, 128u, 191u, 255u}[c], "Queued render borrowed mutated function/attachment descriptor");
+	verify_native_pipelines(ctx,cp,rp);
 	std::cout << "Queued native compute/render descriptors survive caller function/write-mask changes:GPU37 and16 exact RGBA pixels passed\n";
 }
 
@@ -356,6 +296,140 @@ void productive_wrapper(context& ctx)
 	std::cout << "Productive compiler native async wrappers:one process-library-cache miss_us=" << std::chrono::duration_cast<std::chrono::microseconds>(cold-begin).count()
 		<< ";100 exact-source cache hits_us=" << std::chrono::duration_cast<std::chrono::microseconds>(warm-cold).count() << ";no FPS/device-cache-cold claim\n";
 }
+
+void dependent_pipeline_jobs(context& ctx)
+{
+	const auto gate = [[M4GatedCompiler alloc] initWithNative:native(ctx)];
+	compiler_queue queue((id<MTL4Compiler>)gate,{2,4,4*source.size()});
+	const auto library = queue.library(source);
+	NSMutableString* name = [NSMutableString stringWithString:@"queued_compute"];
+	const auto function = library->function(name);
+	auto compute = [MTL4ComputePipelineDescriptor new];
+	const auto compute_job = queue.compute(compute,function);
+	auto render = [MTL4RenderPipelineDescriptor new];
+	render.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+	render.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+	const auto render_job = queue.render(render,library->function(@"queued_vertex"),library->function(@"queued_fragment"));
+	const auto independent = queue.library(source+"\n//independent behind dependencies");
+	require(library && compute_job && render_job && independent,"Dependent compiler admission failed");
+	[gate waitForCallbacks:2];
+	const auto pending = queue.statistics();
+	require(pending.active==2 && pending.queued==2 && pending.admitted==4 && [gate libraryLaunches]==2 &&
+		![gate computeLaunches] && ![gate renderLaunches] && !function.ready() && !compute_job->ready() && !render_job->ready(),
+		"Pending library dependency occupied a compiler slot or blocked independent work");
+	require(!queue.compute(compute,function),"Dependent pipeline bypassed bounded queue capacity");
+	refuses([&] { (void)compute_job->compute(std::chrono::milliseconds(1)); },"Dependent compute timeout was not preserved");
+	refuses([&] { (void)compute_job->function(@"queued_compute"); },"Nonlibrary job became a function dependency");
+	compiler_queue foreign(native(ctx)); const auto foreign_library=foreign.library(source);
+	refuses([&] { (void)queue.compute(compute,foreign_library->function(@"queued_compute")); },"Foreign compiler dependency accepted");
+	(void)foreign_library->library();
+	[name appendString:@"_mutated"];render.colorAttachments[0].writeMask=MTLColorWriteMaskNone;
+	compute.computeFunctionDescriptor=[MTL4LibraryFunctionDescriptor new];
+	refuses([&] { (void)queue.compute(compute,function); },"Dependent compute accepted an occupied function slot");
+	render.vertexFunctionDescriptor=[MTL4LibraryFunctionDescriptor new];
+	refuses([&] { (void)queue.render(render,function,{}); },"Dependent render accepted an occupied function slot");
+	[gate releaseCallbacks];
+	const auto cp=compute_job->compute(); const auto rp=render_job->render();(void)independent->library();
+	auto ready_descriptor=[MTL4ComputePipelineDescriptor new];
+	const auto ready_job=queue.compute(ready_descriptor,compiler_function::from_library(library->library(),@"queued_compute"));
+	require(ready_job.has_value(),"Resolved library dependency refused");
+	const auto ready_cp=ready_job->compute();
+	require(queue.shutdown(),"Dependent native compiler queue did not drain");
+	const auto done=queue.statistics();
+	require(done.admitted==5 && done.completed==5 && !done.failed && !done.cancelled && !done.active && !done.queued && !done.source_bytes &&
+		done.peak_active==2 && [gate computeLaunches]==2 && [gate renderLaunches]==1 && ![gate mainThreadLaunch],"Dependent compiler counts or launch thread differ");
+	verify_native_pipelines(ctx,cp,rp);verify_native_pipelines(ctx,ready_cp,rp);
+	std::cout<<"Dependent native pipelines: two pending libraries, two queued PSOs, independent work bypass, bounded capacity, copied names/descriptors, timeout/kind/foreign/occupied-slot guards; five jobs, two compute37 results and32 exact RGBA pixels passed\n";
+}
+
+void dependent_failure_and_shutdown(context& ctx)
+{
+	const auto gate = [[M4GatedCompiler alloc] initWithNative:native(ctx)]; [gate releaseCallbacks];
+	compiler_queue queue((id<MTL4Compiler>)gate,{1,4,1<<20});
+	const auto bad=queue.library("#include <metal_stdlib>\ninvalid dependency source;");
+	auto descriptor=[MTL4ComputePipelineDescriptor new];
+	const auto dependent=queue.compute(descriptor,bad->function(@"queued_compute"));
+	require(bad && dependent,"Failed-source dependency was not admitted");
+	refuses([&] { (void)dependent->compute(); },"Failed library launched a dependent pipeline");
+	const auto good=queue.library(source);
+	const auto missing=queue.compute(descriptor,good->function(@"missing_entry"));
+	require(good && missing,"Missing-name dependency was not admitted");
+	refuses([&] { (void)missing->compute(); },"Missing dependent entry was not rejected");
+	require(!good->function(@"queued_compute").same_function(bad->function(@"queued_compute")),"Failed library poisoned unrelated function identity");
+	const auto retry=queue.compute(descriptor,good->function(@"queued_compute"));
+	require(retry && retry->compute() && queue.shutdown(),"Healthy compiler work did not recover after dependency failure");
+	const auto failed=queue.statistics();
+	require(failed.admitted==5 && failed.failed==3 && failed.completed==2 && !failed.cancelled && !failed.active && !failed.queued &&
+		[gate computeLaunches]==1,"Library/name failure launched a native child or corrupted queue accounting");
+	const auto held = [[M4GatedCompiler alloc] initWithNative:native(ctx)];
+	compiler_queue closing((id<MTL4Compiler>)held,{1,3,1<<20});
+	const auto live=closing.library(source);
+	const auto cancelled_compute=closing.compute(descriptor,live->function(@"queued_compute"));
+	auto render=[MTL4RenderPipelineDescriptor new];render.colorAttachments[0].pixelFormat=MTLPixelFormatRGBA8Unorm;
+	const auto cancelled_render=closing.render(render,live->function(@"queued_vertex"),live->function(@"queued_fragment"));
+	require(live && cancelled_compute && cancelled_render,"Shutdown dependency setup failed");
+	[held waitForCallbacks:1];
+	require(!closing.shutdown(std::chrono::milliseconds(1)) && cancelled_compute->cancelled() && cancelled_render->cancelled() &&
+		![held computeLaunches] && ![held renderLaunches],"Shutdown launched or retained dependent native PSOs");
+	refuses([&] { (void)cancelled_compute->compute(); },"Cancelled dependency returned a compute pipeline");
+	[held releaseCallbacks];require(live->library() && closing.shutdown(),"Committed library did not finish after dependent shutdown");
+	const auto stopped=closing.statistics();
+	require(stopped.admitted==3 && stopped.completed==1 && stopped.cancelled==2 && !stopped.failed && !stopped.active && !stopped.queued && !stopped.source_bytes,
+		"Dependent shutdown accounting differs");
+	M4GatedCompiler* late;
+	std::optional<compiler_job> retained, retired;
+	{
+		auto context_owner=std::make_unique<context>();
+		late=[[M4GatedCompiler alloc] initWithNative:native(*context_owner)];
+		auto owner=std::make_unique<compiler_queue>((id<MTL4Compiler>)late,compiler_queue_limits{1,2,1<<20});
+		retained=owner->library(source);retired=owner->compute(descriptor,retained->function(@"queued_compute"));
+		require(retained && retired,"Destroyed-owner dependency setup failed");
+		[late waitForCallbacks:1];context_owner.reset();owner.reset();
+	}
+	require(retired->ready() && retired->cancelled() && !retained->ready() && ![late computeLaunches],
+		"Destroyed owner/context lost queued-dependent cancellation or retained native callback");
+	[late releaseCallbacks];
+	require(retained->library() && retired->cancelled() && ![late computeLaunches],"Late library completion revived a destroyed owner's dependent PSO");
+	std::cout<<"Dependent native failure/lifecycle: failed library and missing entry launch no native child, healthy retry succeeds; shutdown cancels two waiting PSOs with exact terminal accounting; destroyed owner/context cancels its dependent compute while the real library callback survives and never revives the child\n";
+}
+
+void prepared_source_budget(context& ctx)
+{
+	const auto first = source + "\n//first";
+	const auto second = source + "\n//other";
+	const auto third = source + "\n//third";
+	const auto budget = first.size() + second.size();
+	compiler compile(ctx, 2, budget);
+	auto original = compile.prewarm_library(first);
+	require(original && compile.library(*original), "Prepared budget fixture lost its first library");
+	compile.clear_libraries();
+	auto current = compile.prewarm_library(second);
+	auto duplicate = compile.prewarm_library(second);
+	require(current && duplicate && compile.library(*current), "Prepared budget fixture lost its second library");
+	require(!compile.prewarm_library(third) && compile.library_statistics().prepared_source_bytes == budget &&
+		compile.library_statistics().prepared_source_budget == budget,
+		"Completed prepared tickets escaped the logical source budget");
+	// A regular demand lookup still succeeds without another prepared ticket.
+	require(compile.library(third) != nil, "Prepared source quota blocked the ordinary compiler getter");
+	compile.clear_libraries();
+	original.reset();
+	require(compile.library_statistics().prepared_source_bytes == second.size(),
+		"Releasing a ticket from an old cache epoch did not return its source charge");
+	{
+		const auto admitted = compile.prewarm_library(third);
+		require(admitted && compile.library(*admitted) && compile.library_statistics().prepared_source_bytes == budget,
+			"Prepared source admission did not recover after ticket retirement");
+	}
+	current.reset();
+	require(compile.library_statistics().prepared_source_bytes == second.size(),
+		"Releasing one alias prematurely returned a shared prepared charge");
+	duplicate.reset();
+	require(compile.library_statistics().prepared_source_bytes == 0, "Prepared source charge survived its last owner");
+	require(compile.tasks().shutdown(), "Prepared source budget fixture could not stop its compiler");
+	refuses([&] { (void)compile.prewarm_library(first); }, "Stopped compiler accepted a prepared source");
+	require(compile.library_statistics().prepared_source_bytes == 0, "Failed native admission leaked a prepared source charge");
+	std::cout << "Prepared source byte budget: completed and old-epoch owners bounded, duplicate charge shared, cold demand succeeds and retirement/admission failure recover quota\n";
+}
 }
 int main()
 {
@@ -371,6 +445,9 @@ int main()
 			shutdown_and_failure(ctx);
 			prepared_library_contracts(ctx);
 			productive_wrapper(ctx);
+			prepared_source_budget(ctx);
+			dependent_pipeline_jobs(ctx);
+			dependent_failure_and_shutdown(ctx);
 			return 0;
 		}
 		catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

@@ -1,5 +1,6 @@
 #include "M4DMA.h"
 #include "M4DMAKernels.h"
+#include "M4TransferPublication.h"
 namespace metal4
 {
 namespace
@@ -55,8 +56,10 @@ void dma_compute::encode(context& ctx, const dma_plan& plan, id<MTLBuffer> sourc
 	validate_dma(plan, m_limit, packed);
 	const auto active = plan_dma_active(plan.destination, plan.columns, plan.rows);
 	const auto source_active = packed ? plan_dma_active(plan.source, plan.columns, plan.rows) : dma_active_layout{};
+	const auto source_bytes = packed ? source_active.bytes : plan.source.range.size;
+	const auto destination_bytes = packed ? active.bytes : plan.destination.range.size;
 	if (ctx.device() != m_device || !source || !destination || source.device != m_device || destination.device != m_device || source == destination ||
-		source.length < (packed ? source_active.bytes : plan.source.range.size) || destination.length < (packed ? active.bytes : plan.destination.range.size))
+		source.length < source_bytes || destination.length < destination_bytes)
 		throw std::invalid_argument("Native DMA requires distinct adequately sized buffers on its own device");
 	// Identical relative byte geometry makes the packed permutation an identity,
 	// including overlapping rows. Metal's aligned native blit needs no shader.
@@ -75,13 +78,11 @@ void dma_compute::encode(context& ctx, const dma_plan& plan, id<MTLBuffer> sourc
 	resources.set_buffer(0, source);
 	resources.set_buffer(1, destination);
 	resources.set_buffer(2, uniforms.buffer, uniforms.offset);
-	const auto table = resources.snapshot(ctx);
-	ctx.keep_alive(m_pipeline);
-	const auto encoder = ctx.compute();
-	ctx.barrier(MTLStageDispatch | MTLStageBlit, MTLStageDispatch);
-	[encoder setComputePipelineState:m_pipeline];
-	[encoder setArgumentTable:table];
-	[encoder dispatchThreads:MTLSizeMake(active.bytes, 1, 1) threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(256, m_pipeline.maxTotalThreadsPerThreadgroup), 1, 1)];
+	const std::array accesses{
+		context::accessed_resource{source, 0, source_bytes},
+		context::accessed_resource{destination, 0, destination_bytes, true},
+		context::accessed_resource{uniforms.buffer, uniforms.offset, uniforms.size}};
+	ctx.checked_dispatch(m_pipeline, resources, accesses, active.bytes);
 }
 struct dma_transfer::pending
 {
@@ -160,21 +161,23 @@ void dma_transfer::synchronize(std::chrono::milliseconds timeout)
 				m_pending.reset();
 			throw;
 		}
-		auto completed = std::move(m_pending);
-		if (completed->validate)
-			checked_cpu_capture(m_capture, completed->validate);
+		publish_completed_transfer(m_pending,m_capture,[&](auto& completed,const cpu_capture_dispatch& capture)
+		{
+		if (completed.validate)
+			checked_cpu_capture(capture, completed.validate);
 		std::vector<guest_surface_layout> coverage;
-		for (const auto& part : completed->segments)
+		for (const auto& part : completed.segments)
 			coverage.push_back(part.coverage);
 		// Resolve Metal properties before entering the CPU publication epoch.
-		for (std::size_t i = 0; i < completed->parts.size(); ++i)
-			completed->parts[i].bytes = map_buffer(completed->output, completed->segments[i].packed_offset, guest_surface_active_bytes(completed->segments[i].coverage));
+		for (std::size_t i = 0; i < completed.parts.size(); ++i)
+			completed.parts[i].bytes = map_buffer(completed.output, completed.segments[i].packed_offset, guest_surface_active_bytes(completed.segments[i].coverage));
 		m_surfaces.cpu_write_active(coverage, [&]
 		{
-			if (completed->validate) completed->validate();
-			if (!m_memory->compare_write_many(completed->parts)) throw texture_revision_conflict();
-		}, m_capture);
+			if (completed.validate) completed.validate();
+			if (!m_memory->compare_write_many(completed.parts)) throw texture_revision_conflict();
+		}, capture);
 		for (const auto& part : coverage) m_textures.invalidate_active(part);
+		});
 	}
 }
 } // namespace metal4

@@ -22,5 +22,14 @@ class prepared_geometry final
 	[[nodiscard]] std::uint32_t count() const noexcept { return m_count; }
 	[[nodiscard]] std::uint32_t index_width() const noexcept { return m_index_width; }
 	[[nodiscard]] std::size_t index_offset() const noexcept { return m_references.vertices.size() * sizeof(vertex_reference); }
+	[[nodiscard]] MTLPrimitiveType primitive() const noexcept
+	{
+		switch (m_references.topology)
+		{
+		case list_topology::points: return MTLPrimitiveTypePoint;
+		case list_topology::lines: return MTLPrimitiveTypeLine;
+		default: return MTLPrimitiveTypeTriangle;
+		}
+	}
 };
 } // namespace metal4

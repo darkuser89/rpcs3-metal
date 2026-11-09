@@ -304,6 +304,107 @@ void pending_and_physical(context& device)
 	require(cache.invalidate_mapping({4096, 64}, surface_mapping_event::unmap) == 1, "Dirty old physical allocation was not reconciled");
 	std::cout << "Physical aliases,old-allocation reconciliation and real pending MTL4 completion protected during metadata retirement\n";
 }
+void batched_cpu_write_aliases(context& device)
+{
+	auto provider = std::make_shared<test::host_access_fixture>();
+	provider->pin_first_alias();
+	auto memory = std::make_shared<guarded_guest_memory>(provider, 16);
+	const cpu_capture_dispatch capture = [&](const auto& op) { provider->execute([&](auto&) { op(); }); };
+	surface_cache cache(device, memory, 16 << 20, {}, capture, {8, 8});
+	const auto first = cache.acquire(description(4096, 32));
+	const auto second = cache.acquire(description(8192));
+	const auto padding = cache.acquire(description(12288, 32));
+	const auto unrelated = cache.acquire(description(16384));
+	for (const auto& surface : {first, second, padding, unrelated}) cache.prepare(surface);
+	const std::array coverage{
+		guest_byte_coverage({0x43010, 8}), guest_byte_coverage({0x42004, 4}),
+		guest_byte_coverage({0x41004, 4}), guest_byte_coverage({0x42004, 4}),
+		guest_byte_coverage({0x4f000, 4})};
+	const auto before = cache.metadata_statistics();
+	unsigned stores = 0;
+	cache.cpu_write_active(coverage, [&]
+	{
+		require(guest_memory_epoch::active(), "Segmented CPU store escaped mapping exclusion");
+		++stores;
+	});
+	const auto after = cache.metadata_statistics();
+	require(stores == 1 && !cache.status(first).initialized && !cache.status(second).initialized &&
+		cache.status(padding).initialized && cache.status(unrelated).initialized, "Segmented physical CPU store selected the wrong active aliases");
+	require(after.physical_candidates - before.physical_candidates == 2 * before.entries,
+		"Segmented physical CPU store collected candidates more than once per mapping phase");
+	std::cout << "5 CPU store pieces, 4 cached surfaces: 8 physical candidates across both mapping phases; duplicates and padding handled\n";
+}
+void draw_alias_preflight(context& device)
+{
+	auto provider = std::make_shared<test::host_access_fixture>();
+	provider->pin_first_alias();
+	auto memory = std::make_shared<guarded_guest_memory>(provider, 64);
+	const cpu_capture_dispatch capture = [&](const auto& op) { provider->execute([&](auto&) { op(); }); };
+	surface_cache cache(device, memory, 16 << 20, {}, capture);
+	std::array<cached_surface_use, 25> uses;
+	for (unsigned i = 0; i < 24; ++i)
+		uses[i] = {cache.acquire(description(4096 + i * 256)), i >= 20};
+	uses.back() = {cache.acquire(description(0x41000 + 23 * 256)), true};
+	for (const auto feedback : {false, true})
+	{
+		const auto captures = provider->captures;
+		const auto submitted = cache.transaction_statistics().submitted;
+		bool encoded = false;
+		bool rejected = false;
+		const auto encode = [&](context&, auto) { encoded = true; };
+		try
+		{
+			if (feedback) cache.draw_feedback(uses, encode);
+			else cache.draw(uses, encode);
+		}
+		catch (const std::invalid_argument& error)
+		{
+			rejected = std::string_view(error.what()) == "Native cache draw write targets overlap guest storage";
+		}
+		require(rejected && !encoded && cache.transaction_statistics().submitted == submitted,
+			"Late physical draw alias did not fail before encoding or submission");
+		require(provider->captures == captures + 1, "Draw pair preflight entered VM exclusion more than once");
+	}
+	std::cout << "25-use draw preflight: 110 ordinary pairs and 10 feedback pairs each used one VM capture; final physical alias refused before encoding\n";
+}
+void batched_writeback_search(context& device)
+{
+	auto provider = std::make_shared<test::host_access_fixture>();
+	provider->pin_first_alias();
+	auto memory = std::make_shared<guarded_guest_memory>(provider, 32);
+	const cpu_capture_dispatch capture = [&](const auto& op) { provider->execute([&](auto&) { op(); }); };
+	surface_cache cache(device, memory, 16 << 20, {}, capture);
+	const auto target = cache.acquire(description(4096));
+	cache.prepare(target);
+	const auto initial = provider->captures;
+	cache.prepare(target);
+	const auto warm_captures = provider->captures - initial;
+
+	std::array<cached_surface_ref, 16> unrelated;
+	for (unsigned i = 0; i < unrelated.size(); ++i)
+	{
+		unrelated[i] = cache.acquire(description(8192 + i * 256));
+		cache.clear(unrelated[i], 0xf0, 0xff010203, 0, 255, {0, 0, 4, 4});
+	}
+	const auto before = provider->captures;
+	cache.prepare(target);
+	require(provider->captures - before == warm_captures + 1,
+		"Preparing a non-overlapping target repeatedly captured its dirty neighbours");
+	require(std::ranges::all_of(unrelated, [&](const auto& item) { return cache.status(item).dirty; }),
+		"Disjoint dirty native surfaces were flushed during the alias search");
+
+	const auto mirror = cache.acquire(description(0x41000));
+	cache.clear(mirror, 0xf0, 0xff123456, 0, 255, {0, 0, 4, 4});
+	cache.prepare(target);
+	const auto bytes = memory->read({4096, 64}).bytes;
+	constexpr std::array pixel{std::byte{0xff}, std::byte{0x12}, std::byte{0x34}, std::byte{0x56}};
+	for (std::size_t i = 0; i < bytes.size(); ++i)
+		require(bytes[i] == pixel[i % pixel.size()], "Preparing an alias lost dirty native writeback bytes");
+	require(!cache.status(mirror).dirty && cache.status(target).initialized &&
+		std::ranges::all_of(unrelated, [&](const auto& item) { return cache.status(item).dirty; }),
+		"Physical writeback did not publish only the matching native surface");
+	std::cout << "Writeback search: 16 disjoint dirty surfaces used one additional VM capture; late physical alias published 64 exact bytes\n";
+}
 void guarded_churn(context& device)
 {
 	auto provider = std::make_shared<test::host_access_fixture>();
@@ -335,7 +436,8 @@ int main()
 			context device(1);
 			bounded_churn(device); handles_and_parts(device); ranges_and_precision(device);
 			unreferenced_precision_and_deferred(device); interval_oracle(device); mapping_churn(device); partial_registration(device);
-			pending_and_physical(device); guarded_churn(device); device.wait_idle();
+			pending_and_physical(device); batched_cpu_write_aliases(device); draw_alias_preflight(device);
+			batched_writeback_search(device); guarded_churn(device); device.wait_idle();
 		}
 		catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 	}

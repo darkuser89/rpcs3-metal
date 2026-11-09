@@ -287,8 +287,31 @@ struct fixture
 		auto bytes = program(source, 1);
 		const auto vo = vertex_image.options(false);
 		fragment_program_options fo;
+		const auto prepared = cache.prepare_fragment(bytes, fo);
+		const color alternate{0, 0, 1, 1};
+		const auto initial_constants = cache.prepare_constants(ctx, prepared, bytes);
+		const auto alternate_constants = cache.prepare_constants(ctx, prepared, program(alternate, 1));
+		bool foreign_constants = false, invalid_constants = false;
+		try { (void)foreign.prepare_constants(ctx, prepared, bytes); } catch (const std::invalid_argument&) { foreign_constants = true; }
+		try { (void)cache.prepare_constants(ctx, prepared, std::span(bytes).first(20)); } catch (const std::invalid_argument&) { invalid_constants = true; }
+		require(foreign_constants && invalid_constants && warm.tasks().statistics().admitted == 0 && !cache.fragment_statistics().compiled,
+			"Fragment literal preparation compiled a shader or accepted foreign/truncated input");
+		vertex_fetch_request request;
+		request.vertex_count = 3;
+		request.attribute_mask = 1;
+		request.attributes[0] = {16u | (1u << 8) | (2u << 24) | (4u << 27), 1u << 29};
+		ctx.begin();
+		vertex_inputs input;
+		input.attributes = fetch.decode(ctx, request, vertices, nil);
+		ctx.submit().wait();
+		auto requirements = vertex_shader::plan_uploads(input, vo.flat_result_inputs, nullptr);
+		const auto fragment_uploads = fragment_shader::plan_uploads(prepared.texture_mask());
+		requirements.insert(requirements.end(), fragment_uploads.begin(), fragment_uploads.end());
+		const auto cold_uploads = ctx.prepare_uploads(requirements);
+		require(warm.tasks().statistics().admitted == 0 && !cache.vertex_statistics().compiled && !cache.fragment_statistics().compiled,
+			"Draw uniform reservation required a compiled shader");
 		const auto vp = cache.prewarm_vertex(cache.prepare_vertex(code, vo), vo);
-		const auto fp = cache.prewarm_fragment(cache.prepare_fragment(bytes, fo), fo);
+		const auto fp = cache.prewarm_fragment(prepared, fo);
 		require(warm.tasks().statistics().admitted == 2 && !cache.vertex_statistics().compiled && !cache.fragment_statistics().compiled,
 			"Native shader prewarm waited/materialized or failed to start both stages");
 		std::fill(code.begin(), code.end(), std::array<unsigned, 4>{});
@@ -308,7 +331,8 @@ struct fixture
 		auto flat = fo; flat.flat_colors = true;
 		const auto changed = cache.prewarm_fragment(fp, flat);
 		const auto lookups = cache.fragment_statistics().lookups;
-		require(cache.fragment(changed, flat) != fragment && cache.fragment_statistics().lookups == lookups,
+		const auto changed_shader = cache.fragment(changed, flat);
+		require(changed_shader != fragment && cache.fragment_statistics().lookups == lookups,
 			"Final prewarm options repeated program lookup or reused another variant");
 		bool refused = false;
 		try { (void)foreign.prewarm_fragment(fp, fo); } catch (const std::invalid_argument&) { refused = true; }
@@ -348,19 +372,23 @@ struct fixture
 		require(pipelines.statistics().fast_hits == hot.fast_hits + 100 && pipelines.statistics().descriptor_lookups == hot.descriptor_lookups,
 			"Warm preflight rebuilt native descriptors");
 		config.state.front.reference = 0;
-		const auto render_pixels = [&](color value)
+		const auto render_pixels = [&](color value, const fragment_shader::constant_binding& constants, const upload_plan& uploads)
 		{
 			auto description = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float width:4 height:4 mipmapped:NO];
 			description.storageMode = MTLStorageModePrivate; description.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
 			const auto target = make_texture(ctx, description);
 			const auto output = make_buffer(ctx, 1024, buffer_storage::shared);
 			ctx.begin();
-			vertex_fetch_request request; request.vertex_count = 3; request.attribute_mask = 1;
-			request.attributes[0] = {16u | (1u << 8) | (2u << 24) | (4u << 27), 1u << 29};
-			vertex_inputs input; input.attributes = fetch.decode(ctx, request, vertices, nil);
 			vertex_context vc; vc.vertex_count = 3;
-			const auto vb = vertex->prepare(ctx, vc, geometry, input);
-			const auto fb = fragment->prepare(ctx, {}, program(value, 1), {});
+			bool foreign_variant = false;
+			try { (void)changed_shader->prepare(ctx, {}, constants, {}); } catch (const std::invalid_argument&) { foreign_variant = true; }
+			require(foreign_variant, "Fragment literal binding escaped to a different shader variant");
+			bindings vb, fb;
+			ctx.with_uploads(uploads, [&]
+			{
+				vb = vertex->prepare(ctx, vc, geometry, input);
+				fb = fragment->prepare(ctx, {}, constants, {});
+			});
 			auto pass = [MTL4RenderPassDescriptor new];
 			pass.colorAttachments[0].texture = target; pass.colorAttachments[0].loadAction = MTLLoadActionClear; pass.colorAttachments[0].storeAction = MTLStoreActionStore;
 			render_commands draw(ctx, pass);
@@ -372,7 +400,10 @@ struct fixture
 			for (unsigned y = 0; y < 4; ++y) for (unsigned x = 0; x < 4; ++x) for (unsigned c = 0; c < 4; ++c)
 				require(std::bit_cast<unsigned>(words[y * 64 + 4 * x + c]) == std::bit_cast<unsigned>(value[c]), "Prewarmed native pipeline used stale literal bits");
 		};
-		render_pixels(source); render_pixels({0, 0, 1, 1});
+		render_pixels(source, initial_constants, cold_uploads);
+		render_pixels(alternate, alternate_constants, ctx.prepare_uploads(requirements));
+		std::cout << "Fragment literal preparation: no compiler job, invalid/foreign inputs refused, exact 32 pixels after shader materialization\n";
+		std::cout << "Draw uniform reservation: admitted before either library job, consumed exactly by both native stages, 32 bit-exact pixels\n";
 		auto altered = config; altered.state.colors[0].write_mask = 1;
 		const auto mask = pipelines.prewarm(altered, vertex->function(), *fragment);
 		require(mask && pipelines.get(*mask).pipeline != a.pipeline, "Pending pipeline key ignored color mask");

@@ -4,6 +4,8 @@
 #error "The native Metal 4 backend requires ARC."
 #endif
 
+#include <algorithm>
+#include <atomic>
 #include <list>
 #include <stdexcept>
 #include <string>
@@ -31,6 +33,7 @@ struct compiler::library_cache
 			if (it->second == entry) { index.erase(it); return; }
 	}
 	library_cache_statistics stats;
+	std::atomic<std::size_t> prepared_source_bytes{0};
 	std::uint64_t generation = 0;
 	std::vector<std::weak_ptr<library_preparation>> pending;
 	id<MTLLibrary> find(std::string_view source)
@@ -72,26 +75,43 @@ struct compiler::library_preparation
 	std::optional<compiler_job> job;
 	id<MTLLibrary> resolved = nil;
 	bool failed = false;
+	std::size_t source_charge = 0;
+
+	~library_preparation()
+	{
+		if (source_charge)
+		{
+			std::string{}.swap(source);
+			owner->prepared_source_bytes.fetch_sub(source_charge, std::memory_order_relaxed);
+		}
+	}
 };
 
 bool compiler::prepared_library::ready() const { return m_state->resolved || m_state->job->ready(); }
 bool compiler::prepared_library::failed() const noexcept { return m_state->failed; }
+compiler_function compiler::prepared_library::function(NSString* name) const
+{
+	return m_state->resolved ? compiler_function::from_library(m_state->resolved, name) : m_state->job->function(name);
+}
 std::size_t compiler::prepared_library::retained_bytes() const noexcept
 {
 	return sizeof(library_preparation) + m_state->source.capacity() + 1;
 }
 
-compiler::compiler(context& ctx, std::size_t library_capacity, std::size_t source_budget)
+compiler::compiler(context& ctx, std::size_t library_capacity, std::size_t source_budget, id<MTL4Compiler> native)
 {
 	if (library_capacity > 4096 || (library_capacity && !source_budget))
 		throw std::invalid_argument("Metal4 library cache capacity/source budget is invalid");
 	m_libraries = std::make_shared<library_cache>();
 	m_libraries->stats.capacity = library_capacity;
 	m_libraries->stats.source_budget = source_budget;
+	const auto queue_budget = compiler_queue_limits{}.source_bytes;
+	m_libraries->stats.prepared_source_budget = source_budget ? std::min(source_budget, queue_budget) : queue_budget;
 	MTL4CompilerDescriptor* descriptor = [MTL4CompilerDescriptor new];
 	descriptor.label = @"RPCS3 Metal 4 compiler";
 	NSError* error = nil;
-	m_compiler = [ctx.device() newCompilerWithDescriptor:descriptor error:&error];
+	if (native && native.device != ctx.device()) throw std::invalid_argument("Native compiler belongs to another Metal4 context device");
+	m_compiler = native ? native : [ctx.device() newCompilerWithDescriptor:descriptor error:&error];
 	if (!m_compiler)
 	{
 		throw std::runtime_error(error ? error.localizedDescription.UTF8String : "Metal 4 compiler creation failed");
@@ -127,6 +147,8 @@ id<MTLLibrary> compiler::library(std::string_view msl, NSString* label) const
 std::optional<compiler::prepared_library> compiler::prewarm_library(std::string_view msl, NSString* label) const
 {
 	if (msl.empty()) throw std::invalid_argument("Metal4 prewarm source is empty");
+	if (msl.size() > compiler_queue_limits{}.source_bytes)
+		throw std::invalid_argument("Metal4 prewarm source exceeds the native compiler quota");
 	if (const auto cached = m_libraries->find(msl))
 	{
 		auto state = std::make_shared<library_preparation>(); state->owner = m_libraries; state->generation = m_libraries->generation; state->resolved = cached;
@@ -136,10 +158,16 @@ std::optional<compiler::prepared_library> compiler::prewarm_library(std::string_
 		{ const auto entry = weak.lock(); return !entry || entry->resolved || entry->failed || entry->generation != m_libraries->generation; });
 	for (const auto& weak : m_libraries->pending)
 		if (const auto pending = weak.lock(); pending && pending->source == msl) return prepared_library(pending);
-	if (m_libraries->pending.size() == 64) return {};
+	// The queue can release its own charge as soon as a job completes. A
+	// retained ticket still owns an exact source key, even across clear().
+	const auto prepared_bytes = m_libraries->prepared_source_bytes.load(std::memory_order_relaxed);
+	if (m_libraries->pending.size() == 64 || msl.size() > m_libraries->stats.prepared_source_budget - prepared_bytes)
+		return {};
 	auto state = std::make_shared<library_preparation>();
 	state->owner = m_libraries; state->generation = m_libraries->generation;
 	state->source.assign(msl);
+	state->source_charge = state->source.size();
+	m_libraries->prepared_source_bytes.fetch_add(state->source_charge, std::memory_order_relaxed);
 	state->job = m_jobs->library(state->source, label);
 	if (!state->job) return {};
 	m_libraries->pending.push_back(state);
@@ -172,7 +200,9 @@ id<MTLLibrary> compiler::library(const prepared_library& prepared, std::chrono::
 
 library_cache_statistics compiler::library_statistics() const noexcept
 {
-	return m_libraries->stats;
+	auto result = m_libraries->stats;
+	result.prepared_source_bytes = m_libraries->prepared_source_bytes.load(std::memory_order_relaxed);
+	return result;
 }
 
 void compiler::clear_libraries()

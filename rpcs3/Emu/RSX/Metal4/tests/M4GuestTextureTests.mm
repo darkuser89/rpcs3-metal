@@ -1,4 +1,5 @@
 #include "M4GuestTexture.h"
+#include "Emu/RSX/Common/tiled_dma_copy.hpp"
 #include "M4ProgramSamplerPlan.h"
 #include "M4RenderPipeline.h"
 #include "M4SurfaceCache.h"
@@ -109,11 +110,13 @@ void append(std::vector<std::byte>& bytes, unsigned word)
 	for (unsigned shift : {8u, 0u, 24u, 16u})
 		bytes.push_back(std::byte(word >> shift));
 }
-std::vector<std::byte> code(color coordinate, unsigned opcode = 23, float lod = 0)
+std::vector<std::byte> code(color coordinate, unsigned opcode = 23, float lod = 0, bool varying = false, unsigned lod_axis = 0)
 {
 	std::vector<std::byte> result;
 	unsigned reg = 1;
-	for (const auto literal : {coordinate, color{lod, 0, 0, 0}})
+	color lod_word{};
+	lod_word.at(lod_axis) = lod;
+	for (const auto literal : {coordinate, lod_word})
 	{
 		for (unsigned word : {(1u << 24) | (reg << 1) | (15u << 9), (0xe4u << 9) | (7u << 18) | (0xe4u << 21) | 2u, 0xe4u << 9, 0xe4u << 9})
 			append(result, word);
@@ -121,6 +124,9 @@ std::vector<std::byte> code(color coordinate, unsigned opcode = 23, float lod = 
 			append(result, std::bit_cast<unsigned>(v));
 		++reg;
 	}
+	if (varying)
+		for (unsigned word : {(1u << 24) | (1u << 1) | (3u << 9), (0xe4u << 9) | (7u << 18) | (0xe4u << 21) | 1u, 0xe4u << 9, 0xe4u << 9})
+			append(result, word);
 	for (unsigned word : {(opcode << 24) | (15u << 9) | 1u, (0xe4u << 9) | (7u << 18) | (0xe4u << 21) | 4u, (0xe4u << 9) | 8u, 0xe4u << 9})
 		append(result, word);
 	return result;
@@ -153,27 +159,38 @@ vertex float4 v(uint i [[vertex_id]]) { const float2 p[3]={float2(-1,-1),float2(
 		target = make_texture(ctx, td);
 		output = make_buffer(ctx, 512, buffer_storage::shared);
 	}
-	void sample(resolved_fragment_texture resource, const fragment_texture_registers& words, color coordinate, color expected, unsigned opcode = 23, float lod = 0)
+	void sample(resolved_fragment_texture resource, const fragment_texture_registers& words, color coordinate, color expected,
+		unsigned opcode = 23, float lod = 0, const fragment_context* varying = nullptr, unsigned lod_axis = 0,
+		const texture_state_overrides& overrides = {}, const std::array<color, 4>* pixels = nullptr)
 	{
 		const auto program_metadata = program_sampler_plan::capture(words, resource.metadata);
 		const auto storage_plan = plan_guest_texture(words);
-		const unsigned source_depth = storage_plan.codec.depth ? static_cast<unsigned>(*storage_plan.codec.depth) : 0;
+		const unsigned source_depth = storage_plan.codec.depth ? static_cast<unsigned>(*storage_plan.codec.depth) :
+			resource.metadata.depth ? resource.metadata.source_depth_format : 0;
 		constexpr unsigned expected_class[]{1, 2, 8, 4, 16};
 		require(program_metadata.format_class == expected_class[source_depth] &&
-			program_metadata.samples == 1 && program_metadata.coordinates.scale == resource.metadata.coordinates.scale,
+			program_metadata.samples == resource.texture.sampleCount && program_metadata.coordinates.scale == resource.metadata.coordinates.scale,
 			"Native VM/alias snapshot lost source depth class or base coordinate transform");
-		const auto decoded = decode_fragment_texture_state(words, resource.metadata);
+		std::array<std::uint32_t, fragment_texture_method_base + 8> methods{};
+		const std::array registers{words.offset, words.format, words.address, words.control0,
+			words.control1, words.filter, words.image_rect, words.border_color};
+		std::ranges::copy(registers, methods.begin() + fragment_texture_method_base);
+		methods[fragment_texture_control3_base] = words.control3;
+		const auto snapshot = fragment_texture_snapshot::capture(methods, 1);
 		fragment_program_options options;
-		configure_fragment_texture_state(options, 0, decoded);
-		const auto program = code(coordinate, opcode, lod);
+		fragment_inputs inputs;
+		apply_fragment_texture_snapshot(snapshot, [&](unsigned, const auto& frozen)
+		{
+			require(frozen == words, "Fragment binding changed the frozen RSX words");
+			return resource;
+		}, ctx, samplers, options, inputs, overrides);
+		const auto program = code(coordinate, opcode, lod, varying != nullptr, lod_axis);
 		fragment_shader shader(compile, program, options);
 		render_pipeline_configuration config;
 		config.colors[0] = MTLPixelFormatRGBA32Float;
 		const auto pipeline = make_render_pipeline(compile, config, library_function(vertex, @"v"), shader);
-		fragment_inputs inputs;
-		inputs.set_texture_state(0, resource.texture, samplers, decoded);
 		ctx.begin();
-		const auto bindings = shader.prepare(ctx, {}, program, inputs);
+		const auto bindings = shader.prepare(ctx, varying ? *varying : fragment_context{}, program, inputs);
 		auto pass = [MTL4RenderPassDescriptor new];
 		pass.colorAttachments[0].texture = target;
 		pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
@@ -193,8 +210,9 @@ vertex float4 v(uint i [[vertex_id]]) { const float2 p[3]={float2(-1,-1),float2(
 				for (unsigned c = 0; c < 4; ++c)
 				{
 					const float actual = static_cast<const float*>(output.contents)[y * 64 + x * 4 + c];
-					if (!std::isfinite(actual) || std::abs(actual - expected[c]) > 2e-6f)
-						throw std::runtime_error("Guest texture format=" + std::to_string((words.format >> 8) & 255) + " lane=" + std::to_string(c) + " actual=" + std::to_string(actual) + " expected=" + std::to_string(expected[c]));
+					const auto want = pixels ? (*pixels)[y * 2 + x][c] : expected[c];
+					if (!std::isfinite(actual) || std::abs(actual - want) > 2e-6f)
+						throw std::runtime_error("Guest texture format=" + std::to_string((words.format >> 8) & 255) + " lane=" + std::to_string(c) + " actual=" + std::to_string(actual) + " expected=" + std::to_string(want));
 				}
 		++cases;
 	}
@@ -226,13 +244,13 @@ vertex float4 v(uint i [[vertex_id]]) { const float2 p[3]={float2(-1,-1),float2(
 					for (std::size_t x = 0; x < s.columns; ++x)
 					{
 						std::size_t offset = s.offset + (z * s.rows + y) * s.row_pitch + x * plan.codec.block.bytes;
-						if (plan.swizzled && plan.codec.block.width == 1)
+						if (plan.swizzled && plan.codec.block.height == 1)
 							offset = s.offset + morton_index({x, y, z}, {unsigned(std::bit_width(s.columns) - 1), unsigned(std::bit_width(s.rows) - 1), unsigned(std::bit_width(s.depth) - 1)}) * plan.codec.block.bytes;
 						for (unsigned b = 0; b < block.size(); ++b)
 							ram->bytes[offset + b] = std::byte(block[b]);
 					}
 	}
-	captured_guest_texture capture_without_gpu(const fragment_texture_registers& words)
+	captured_guest_texture capture_without_gpu(const fragment_texture_registers& words, std::size_t expected_reads = 1)
 	{
 		const auto bytes = upload_budget->statistics().reserved_bytes;
 		const auto reads = ram->reads;
@@ -241,7 +259,7 @@ vertex float4 v(uint i [[vertex_id]]) { const float2 p[3]={float2(-1,-1),float2(
 		ctx.begin();
 		auto captured = resolver.capture(words);
 		ctx.cancel();
-		require(upload_budget->statistics().reserved_bytes == bytes && ram->reads == reads + 1,
+		require(upload_budget->statistics().reserved_bytes == bytes && ram->reads == reads + expected_reads,
 			"CPU texture capture encoded/allocated GPU storage or reread VM");
 		require(captured.storage_bytes() == plan_guest_texture(words).storage_bytes, "Owned capture lost storage bytes");
 		return captured;
@@ -691,7 +709,7 @@ kernel void vtc_reference(texture2d<float> image [[texture(0)]],device uint4* ou
 					f->gpu->wait_idle();const auto frozen=job.finish();verify(frozen[0].image,0,pieces);const auto plan=plan_guest_texture(f->registers);const auto face=std::find_if(plan.subresources.begin(),plan.subresources.end(),[](const auto& sub){return sub.face==1&&sub.level==0;});require(face!=plan.subresources.end(),"Deferred RTT test lacks second cubeface");const unsigned address=0x1000+face->offset;const auto destination=f->surfaces->acquire({address,{2,2,1,surface_color::argb8,false},face->row_pitch,{}});f->surfaces->defer_copy(f->source,{0,0,2,2},destination,0,0);require(f->surfaces->status(destination).deferred_copies==1,"New deferred RTT owner didnotretain its copy");
 					if(mode==8)f->surfaces->cancel_deferred_copies(destination);
 					else{guest_surface_byte_cursor cursor(plan_guest_surface(address,2,2,4,face->row_pitch));while(const auto run=cursor.next())f->ram->forbidden.push_back(*run);}
-					const auto fresh=f->textures->resolve_versioned(f->registers,*f->surfaces);verify(fresh.image,0,pieces,mode==7);require(fresh.image.texture!=frozen[0].image.texture&&f->surfaces->status(destination).deferred_copies==0,"Deferred RTT owner reused stale ready assembly orfailed materialization");verify(job.finish()[0].image,0,pieces);require(f->textures->resolve_versioned(f->registers,*f->surfaces).image.texture==fresh.image.texture,"Old RTT job displaced deferred/cancelled-owner ready result");continue;
+					const auto fresh=f->textures->resolve_versioned(f->registers,*f->surfaces);verify(fresh.image,0,pieces,mode==7);require(fresh.image.texture!=frozen[0].image.texture&&f->surfaces->status(destination).deferred_copies==unsigned(mode==7),"Deferred RTT owner reused stale ready assembly or changed its queued authority");verify(job.finish()[0].image,0,pieces);require(f->textures->resolve_versioned(f->registers,*f->surfaces).image.texture==fresh.image.texture,"Old RTT job displaced deferred/cancelled-owner ready result");continue;
 				}
 				if(mode==6)
 				{
@@ -894,6 +912,2155 @@ fragment float4 deep_atlas_color(float4 p [[position]]) {const float f=as_type<f
 		}
 		std::cout<<"RTT assembly channel normalization:"<<profiles<<" packedX0-X1/GB8 profiles,"<<packed_words<<" exactpackedwords,"<<cases-begin<<" independent mip/cubeface RSX draws;2/4channel native andVM maps,targetconstant-alpha andduplicatedchannels preserved withoutVMnativecapture/writeback passed\n";
 	}
+	void adjusted_pitch_cases()
+	{
+		const auto first=cases;
+		unsigned profiles=0, refusals=0;
+		const std::array<color,6> directions{{{1,0,0,1},{-1,0,0,1},{0,1,0,1},{0,-1,0,1},{0,0,1,1},{0,0,-1,1}}};
+		for(auto dimension:{vertex_texture_dimension::one,vertex_texture_dimension::two,vertex_texture_dimension::three,vertex_texture_dimension::cube})
+			for(unsigned mode:{0u,1u,2u})
+				for(bool pixel_coordinates:{false,true})
+				{
+					const bool cube=dimension==vertex_texture_dimension::cube;
+					if(cube&&pixel_coordinates)continue;
+					const unsigned declared_width=cube&&mode==0?1:17;
+					const unsigned declared_height=dimension==vertex_texture_dimension::one?1:mode==2?5:3;
+					const unsigned declared_depth=dimension==vertex_texture_dimension::three?5:1;
+					const unsigned width=mode==0?declared_width:declared_height==1?3:declared_height;
+					const unsigned height=mode==0?1:declared_height, depth=mode==0?1:declared_depth;
+					const unsigned pitch=4*width+(mode==2);
+					auto r=words(0x85,dimension,true,declared_width,declared_height,declared_depth,6);
+					r.control3=(declared_depth<<20)|(mode?pitch:0);
+					if(pixel_coordinates)r.format|=0x40u<<8;
+					const auto levels=std::bit_width(std::max({width,height,depth}));
+					const unsigned faces=cube?6:1;
+					const auto plan=plan_guest_texture(r);
+					require(plan.adjusted_pitch&&plan.width==width&&plan.height==height&&plan.depth==depth&&
+						plan.mips==levels&&plan.layers==faces,"Adjusted pitch did not produce legal native geometry");
+					const auto red=[cube](unsigned l,unsigned f,unsigned x,unsigned y,unsigned z)
+					{return 17+l*21+f*7+(cube?0:x*3+y*5+z*11);};
+					ram->bytes.assign(65536,std::byte{0xcd});
+					std::size_t cursor=0;
+					for(unsigned f=0;f<faces;++f)for(unsigned l=0;l<levels;++l)
+					{
+						const auto w=std::max(1u,width>>l),h=std::max(1u,height>>l),d=std::max(1u,depth>>l);
+						const auto& s=plan.subresources[f*levels+l];
+						require(s.offset==cursor&&s.row_pitch==pitch&&s.storage_bytes==pitch*h*d,"Adjusted mip stride or face offset changed");
+						for(unsigned z=0;z<d;++z)for(unsigned y=0;y<h;++y)for(unsigned x=0;x<w;++x)
+						{
+							const auto at=cursor+(z*h+y)*pitch+x*4;
+							ram->bytes[at]=std::byte{255};ram->bytes[at+1]=std::byte(red(l,f,x,y,z));
+							ram->bytes[at+2]=std::byte{53};ram->bytes[at+3]=std::byte{97};
+						}
+						cursor+=pitch*h*d;
+					}
+					require(plan.storage_bytes==cursor,"Adjusted snapshot extends past the last planned mip");
+					const auto before=ram->bytes;
+					const auto captured=capture_without_gpu(r);
+					require(ram->bytes==before,"Adjusted capture changed VM padding or pixels");
+					const auto image=realize_without_vm(captured);
+					require(image.texture.width==width&&image.texture.height==height&&image.texture.depth==depth&&
+						image.texture.mipmapLevelCount==levels&&image.metadata.actual_mips==levels,"Adjusted upload lost native dimensions");
+					for(unsigned f=0;f<faces;++f)for(unsigned l=0;l<levels;++l)
+					{
+						const auto w=std::max(1u,width>>l),h=std::max(1u,height>>l),d=std::max(1u,depth>>l);
+						color coordinate{(w-.5f)/w,(h-.5f)/h,(d-.5f)/d,1};
+						if(pixel_coordinates){coordinate[0]*=width;coordinate[1]*=height;coordinate[2]*=depth;}
+						sample(image,r,cube?directions[f]:coordinate,{red(l,f,w-1,h-1,d-1)/255.f,53.f/255,97.f/255,1},47,float(l));
+					}
+					require(ram->bytes.empty(),"Adjusted realization recreated detached VM storage");
+					++profiles;
+				}
+		for(auto r:{words(0x85,vertex_texture_dimension::two,true,9,4),words(0x86,vertex_texture_dimension::two,true,16,8),
+			words(0x85,vertex_texture_dimension::cube,true,8,8)})
+		{
+			r.control3=1u<<20 | (((r.format>>8)&0x9f)==0x86?7:3);
+			if(r.format&4)r.control3=(1u<<20)|16u;
+			const auto reads=ram->reads,translations=translated;
+			bool rejected=false;
+			try{(void)resolver.resolve(r);}catch(const std::invalid_argument&){rejected=true;}
+			require(rejected&&ram->reads==reads&&translated==translations,"Invalid adjusted pitch reached VM");
+			++refusals;
+		}
+		std::cout<<"Adjusted pitch native geometry:"<<profiles<<" profiles,"<<cases-first<<" exact sampled mip/face results,"<<refusals<<" pre-VM block/cube refusals passed\n";
+	}
+	void adjusted_pitch_aliases()
+	{
+		unsigned profiles=0;
+		const auto first=cases;
+		for(unsigned mode:{0u,1u,2u})
+		{
+			const auto r=[&]
+			{
+				auto words=fixture::words(0x85,vertex_texture_dimension::two,true,9,4,1,mode==2?3:1);
+				words.control3=(1u<<20)|(mode?13:0);
+				return words;
+			}();
+			const auto plan=plan_guest_texture(r);
+			const cpu_capture_dispatch capture=[](const auto& work){work();};
+			auto io=std::make_shared<io_mapping_epoch>();
+			context gpu{1};
+			auto ledger=std::make_shared<heap_budget>(gpu,8u<<20);
+			gpu.set_buffer_budget(ledger);
+			surface_cache surfaces(gpu,ram,8u<<20,ledger,capture);
+			guest_texture_cache textures(gpu,ram,[](unsigned offset,unsigned,std::size_t){return 0x1000+offset-0x200;},1u<<20,ledger,64,{capture,io});
+			fill(plan,{255,17,33,65});
+			const auto old=textures.resolve(r);
+			const auto reads=ram->reads;
+			require(textures.resolve(r).texture==old.texture&&ram->reads==reads,"Adjusted VM texture lost its cache hit");
+			ram->bytes[1]=std::byte{73};
+			++ram->version;
+			const auto updated=textures.resolve(r);
+			require(updated.texture!=old.texture,"Adjusted texture missed a CPU revision change");
+			sample(updated,r,{.5f/plan.width,.5f/plan.height,0,1},{73.f/255,33.f/255,65.f/255,1},47,0);
+			const auto original=ram->bytes;
+			for(const auto& s:plan.subresources)
+			{
+				const auto ea=static_cast<std::uint32_t>(0x1000+s.offset);
+				const auto image=surfaces.acquire({ea,{s.width,s.height,1,surface_color::argb8,false},s.row_pitch,{}});
+				surfaces.clear(image,0xf0,0xff104080u+(s.level<<16),0,255,{0,0,s.width,s.height});
+				guest_surface_byte_cursor active(plan_guest_surface(ea,s.width,s.height,4,s.row_pitch));
+				while(const auto range=active.next())ram->forbidden.push_back(*range);
+			}
+			const auto before=ram->reads;
+			const auto native=textures.resolve_versioned(r,surfaces);
+			require(native.image.texture!=updated.texture&&native.image.metadata.actual_mips==plan.mips,
+				"Adjusted native aliases missed their corrected texture");
+			for(const auto& s:plan.subresources)
+				sample(native.image,r,{.75f,.75f,0,1},{(16.f+s.level)/255,64.f/255,128.f/255,1},47,s.level);
+			require(ram->reads==before&&ram->bytes==original,"Adjusted native alias accessed or changed guest pixels");
+			require(textures.resolve_versioned(r,surfaces).image.texture==native.image.texture,
+				"Adjusted native alias lost its warm cache entry");
+			ram->forbidden.clear();
+			++profiles;
+		}
+		std::cout<<"Adjusted pitch cache and RTT:"<<profiles<<" profiles,"<<cases-first<<" exact samples with CPU invalidation, native single/mip alias reuse and no native VM capture passed\n";
+	}
+	void stored_border_cases()
+	{
+		const auto first = cases;
+		constexpr unsigned width = 4, height = 3, pitch = 27;
+		auto r = words(0x85, vertex_texture_dimension::two, true, width, height);
+		r.format &= ~8u;
+		r.address = (7u << 28) | 0x040404;
+		r.control3 = (1u << 20) | pitch;
+		r.border_color = 0xffeeddcc;
+		const auto texel = [](float x, float y) -> color
+		{
+			return {(16 + 12 * x + 4 * y) / 255, (24 + 4 * x + 20 * y) / 255,
+				(40 + 8 * x + 8 * y) / 255, 1};
+		};
+		ram->bytes.assign(pitch * (height + 2), std::byte{0xcd});
+		for (unsigned y = 0; y < height + 2; ++y)
+			for (unsigned x = 0; x < width + 2; ++x)
+			{
+				const auto value = texel(x, y);
+				const std::size_t at = y * pitch + x * 4;
+				ram->bytes[at] = std::byte{255};
+				for (unsigned c = 0; c < 3; ++c)
+					ram->bytes[at + c + 1] = std::byte(std::lround(value[c] * 255));
+			}
+		++ram->version;
+		const auto original = ram->bytes;
+		const auto image = resolver.resolve(r);
+		require(image.metadata.stored_border_extent == std::array{width, height} && image.texture.width == width + 2 && image.texture.height == height + 2,
+			"Linear guest texel ring was not allocated");
+		for (unsigned y = 0; y < height + 2; ++y)
+			for (unsigned x = 0; x < width + 2; ++x)
+				sample(image, r, {(float(x) - .5f) / width, (float(y) - .5f) / height, 0, 1}, texel(x, y));
+		sample(image, r, {-16, -32, 0, 1}, texel(0, 0));
+		sample(image, r, {16, 32, 0, 1}, texel(width + 1, height + 1));
+		auto edge = r;
+		edge.address = (edge.address & ~15u) | 3u;
+		sample(image, edge, {-16, -32, 0, 1}, texel(1, 0));
+		sample(image, edge, {16, 32, 0, 1}, texel(width, height + 1));
+		auto linear = r;
+		linear.filter = 0x02020000;
+		sample(image, linear, {0, 0, 0, 1}, texel(.5f, .5f));
+		sample(image, linear, {1, 1, 0, 1}, texel(width + .5f, height + .5f));
+		sample(image, linear, {0, .5f, 0, 1}, texel(.5f, 2));
+		linear.address = edge.address;
+		sample(image, linear, {0, 0, 0, 1}, texel(1, .5f));
+		auto pixels = r;
+		pixels.format |= 0x40u << 8;
+		const auto pixel_image = resolver.resolve(pixels);
+		sample(pixel_image, pixels, {-1, 1, 0, 1}, texel(0, 2));
+		sample(pixel_image, pixels, {3, 1, 0, 2}, texel(2, 1), 24);
+		require(ram->bytes == original, "Stored-border upload changed guest bytes or padding");
+		const auto captured = capture_without_gpu(r);
+		sample(realize_without_vm(captured), r, {2, 2, 0, 1}, texel(width + 1, height + 1), 47);
+		ram->bytes = original;
+		++ram->version;
+
+		const cpu_capture_dispatch capture = [](const auto& work) { work(); };
+		context gpu{1};
+		auto ledger = std::make_shared<heap_budget>(gpu, 8u << 20);
+		gpu.set_buffer_budget(ledger);
+		surface_cache surfaces(gpu, ram, 8u << 20, ledger, capture);
+		guest_texture_cache textures(gpu, ram, [](unsigned offset, unsigned, std::size_t) { return 0x1000 + offset - 0x200; },
+			1u << 20, ledger, 64, {capture, std::make_shared<io_mapping_epoch>()});
+		const std::array requests{r, pixels};
+		const auto batch = textures.resolve_versioned_batch(requests, surfaces);
+		require(batch.size() == 2 && batch[0].image.texture == batch[1].image.texture,
+			"Normalized and pixel-coordinate requests did not coalesce their stored ring");
+		sample(batch[1].image, pixels, {-2, -2, 0, 1}, texel(0, 0));
+		const auto reads = ram->reads;
+		require(textures.resolve_versioned(r, surfaces).image.texture == batch[0].image.texture && ram->reads == reads,
+			"Stored ring lost its versioned cache hit");
+		ram->bytes[1] = std::byte{144};
+		++ram->version;
+		require(!batch[0].revision.current(), "Border-only write left a stale texture receipt current");
+		const auto updated = textures.resolve_versioned(r, surfaces);
+		require(updated.image.texture != batch[0].image.texture, "Border-only write reused the old native texture");
+		sample(updated.image, r, {-2, -2, 0, 1}, {144.f / 255, 24.f / 255, 40.f / 255, 1});
+		sample(batch[0].image, r, {-2, -2, 0, 1}, texel(0, 0));
+
+		const auto native = surfaces.acquire({0x1000 + (height + 1) * pitch + (width + 1) * 4,
+			{1, 1, 1, surface_color::argb8, false}, 4, {}});
+		surfaces.clear(native, 0xf0, 0xff104080, 0, 255, {0, 0, 1, 1});
+		ram->forbidden.push_back({0x1000 + (height + 1) * pitch + (width + 1) * 4, 4});
+		const auto vm_before_assembly = ram->bytes;
+		const auto composed = textures.resolve_versioned(r, surfaces);
+		require(composed.image.texture != updated.image.texture && composed.image.metadata.stored_border_extent == std::array{width, height} &&
+			textures.statistics().assembly_vm_bytes == ((width + 2) * (height + 2) - 1) * 4,
+			"Border-only render target did not supply exactly its owned texel");
+		sample(composed.image, r, {8, 8, 0, 1}, {16.f / 255, 64.f / 255, 128.f / 255, 1});
+		sample(composed.image, r, {-8, -8, 0, 1}, {144.f / 255, 24.f / 255, 40.f / 255, 1});
+		sample(updated.image, r, {8, 8, 0, 1}, texel(width + 1, height + 1));
+		require(ram->bytes == vm_before_assembly, "Stored border assembly wrote guest bytes");
+		ram->forbidden.clear();
+		const auto before = ram->reads;
+
+		const auto addresses = translated;
+		auto invalids = std::array{r, r, r, r};
+		invalids[0].address = r.address & ~15u;
+		invalids[1].control3 = (1u << 20) | 11u; // Two border texels and an incomplete interior texel.
+		invalids[2].format |= 4u;
+		invalids[3].address = r.address & ~(15u << 8);
+		for (const auto& invalid : invalids)
+		{
+			bool refused = false;
+			try { (void)resolver.resolve(invalid); }
+			catch (const std::invalid_argument&) { refused = true; }
+			require(refused && translated == addresses && ram->reads == before,
+				"Unsupported stored-border layout reached guest translation or capture");
+		}
+		std::cout << "Linear stored texel ring: " << cases - first
+			<< " exact native samples, four pre-VM refusals and one border-only RTT composition passed\n";
+	}
+	static unsigned morton_border_cell(unsigned x, unsigned y, unsigned x_bits, unsigned y_bits)
+	{
+		// Independent reference: spread each axis into even/odd bit lanes,
+		// then append the unmatched bits of the longer axis.
+		const unsigned shared = std::min(x_bits, y_bits);
+		unsigned result = 0;
+		for (unsigned bit = 0; bit < shared; ++bit)
+			result |= ((x >> bit) & 1) << (2 * bit) | ((y >> bit) & 1) << (2 * bit + 1);
+		return result | ((x_bits > y_bits ? x : y) >> shared) << (2 * shared);
+	}
+	void stored_border_mip_atlas_cases()
+	{
+		using namespace std::chrono_literals;
+		context gpu(1);
+		auto budget = std::make_shared<heap_budget>(gpu, 16u << 20);
+		gpu.set_buffer_budget(budget);
+		guest_texture_resolver upload(gpu, ram, [&](unsigned offset, unsigned location, std::size_t size)
+		{
+			require(!ram->forbid_vm_access && offset == 0x200 && location == 1 && size <= ram->bytes.size(), "Mip atlas changed VM translation");
+			return 0x1000;
+		}, 1u << 20, budget);
+		std::size_t profiles = 0, levels = 0, words_checked = 0, stencil_checked = 0, gated = 0;
+		const auto first_sample = cases;
+		for (const auto [width, height, mips] : {std::array{9u, 5u, 4u}, {4u, 11u, 3u}, {2u, 1u, 2u}})
+			for (const auto format : {0x85u, 0x90u, 0x91u, 0x92u, 0x93u})
+				for (const bool linear : {false, true})
+				{
+					auto r = words(format, vertex_texture_dimension::two, linear, width, height, 1, mips);
+					r.format &= ~8u;
+					const auto bpp = describe_guest_texture_format(format).block.bytes;
+					const auto pitch = (width + 2) * bpp + 1;
+					if (linear) r.control3 = (1u << 20) | pitch;
+					const auto plan = plan_guest_texture(r);
+					const auto raw = [&](unsigned mip, unsigned x, unsigned y)
+					{
+						const unsigned n = mip * 23 + x * 3 + y * 11;
+						if (format == 0x85) return 0xff000000u | (n << 16) | ((n ^ 71u) << 8) | (n ^ 23u);
+						if (format == 0x92) return 0x2000u + n * 67;
+						if (format == 0x93) return 0x5000u + n;
+						const unsigned depth = format == 0x90 ? 0x400000u + n * 139 : std::bit_cast<unsigned>(.25f + n / 1024.f) >> 7;
+						return (depth << 8) | (n ^ 17u);
+					};
+					ram->bytes.assign(plan.storage_bytes, std::byte{0xda});
+					std::size_t source_offset = 0;
+					for (unsigned mip = 0; mip < mips; ++mip)
+					{
+						const auto w = std::max(1u, width >> mip), h = std::max(1u, height >> mip);
+						const auto sw = std::bit_ceil(w + 8), sh = std::bit_ceil(h + 8);
+						for (unsigned y = 0; y < h + 2; ++y)
+							for (unsigned x = 0; x < w + 2; ++x)
+							{
+								const auto position = linear ? y * pitch + x * bpp :
+									morton_border_cell(x + 3, y + 3, std::bit_width(sw) - 1, std::bit_width(sh) - 1) * bpp;
+								for (unsigned byte = 0; byte < bpp; ++byte)
+									ram->bytes.at(source_offset + position + byte) = std::byte(raw(mip, x, y) >> ((bpp - byte - 1) * 8));
+							}
+						source_offset += linear ? pitch * (h + 2) : sw * sh * bpp;
+					}
+					require(source_offset == ram->bytes.size(), "Independent atlas source size differs");
+					++ram->version;
+					auto capture = upload.capture(r);
+					const auto reads = ram->reads;
+					ram->forbid_vm_access = true;
+					const auto image = [&]() -> resolved_fragment_texture
+					{
+						if (linear) return upload.realize(capture);
+						const auto gate = [gpu.device() newSharedEvent];
+						struct release_gate { id<MTLSharedEvent> event; ~release_gate() { event.signaledValue = 1; } } release{gate};
+						const auto job = [&]
+						{
+							const std::array captures{std::move(capture)};
+							return upload.enqueue_uploads(captures, std::array{guest_texture_upload_dependency{gate, 1}});
+						}();
+						bool timed_out = false;
+						try { (void)job.finish(1ms); } catch (const submission_wait_timeout&) { timed_out = true; }
+						require(timed_out && !job.ready(), "Mip atlas escaped its GPU gate");
+						gate.signaledValue = 1;
+						++gated;
+						return job.finish().front();
+					}();
+					ram->forbid_vm_access = false;
+					require(image.texture.mipmapLevelCount == 1 && image.metadata.actual_mips == mips && ram->reads == reads,
+						"Atlas lost logical mip metadata or recaptured VM");
+					const bool wide = width >= height, depth = format != 0x85, stencil = format == 0x90 || format == 0x91;
+					const unsigned native_bytes = format == 0x92 ? 2u : 4u;
+					unsigned cursor = 0;
+					for (unsigned mip = 0; mip < mips; ++mip)
+					{
+						const auto columns = std::max(1u, width >> mip) + 2, rows = std::max(1u, height >> mip) + 2;
+						texture_region region;
+						region.size = MTLSizeMake(columns, rows, 1);
+						if (mip)
+						{
+							region.origin = wide ? MTLOriginMake(cursor, height + 2, 0) : MTLOriginMake(width + 2, cursor, 0);
+							cursor += wide ? columns : rows;
+						}
+						const auto result = make_buffer(gpu, 512 * rows, buffer_storage::shared);
+						gpu.begin();
+						texture_to_buffer(gpu, image.texture, region, result, 0, 256, 0, depth ? texture_plane::depth : texture_plane::all);
+						if (stencil) texture_to_buffer(gpu, image.texture, region, result, 256 * rows, 256, 0, texture_plane::stencil);
+						gpu.submit().wait();
+						const auto bytes = map_buffer(result, 0, result.length);
+						for (unsigned y = 0; y < rows; ++y)
+							for (unsigned x = 0; x < columns; ++x)
+							{
+								const auto word = raw(mip, x, y);
+								unsigned actual = 0;
+								std::memcpy(&actual, bytes.data() + y * 256 + x * native_bytes, native_bytes);
+								const auto expected = format == 0x90 ? std::bit_cast<unsigned>(float(word >> 8) / 16777215.f) :
+									format == 0x91 ? (word >> 8) << 7 : format == 0x93 ? (word << 11) + (120u << 23) : word;
+								require(actual == expected, "Native atlas changed a color or depth texel");
+								if (stencil)
+								{
+									require(bytes[(rows + y) * 256 + x] == std::byte(word & 255), "Native atlas changed a stencil texel");
+									++stencil_checked;
+								}
+								++words_checked;
+							}
+						++levels;
+					}
+					const unsigned mip = mips - 1;
+					r.address = (7u << 28) | 0x040404;
+					const auto word = raw(mip, 0, 0);
+					if (format == 0x85)
+						sample(image, r, {-8, -8, 0, 1}, {float((word >> 16) & 255) / 255, float((word >> 8) & 255) / 255,
+							float(word & 255) / 255, 1}, 47, float(mip));
+					else
+					{
+						const float depth = format == 0x90 ? float(word >> 8) / 16777215.f : format == 0x91 ?
+							std::bit_cast<float>((word >> 8) << 7) : format == 0x92 ? float(word) / 65535 :
+							std::bit_cast<float>((word << 11) + (120u << 23));
+						sample(image, r, {-8, -8, 0, 1}, {depth, depth, depth, depth}, 47, float(mip));
+						r.address = (1u << 28) | 0x040404;
+						r.control0 = (1u << 31) | (mip * 256u << 19) | (mip * 256u << 7);
+						sample(image, r, {-8, -8, depth + 1.f / 1024, 1}, {1, 1, 1, 1});
+						sample(image, r, {-8, -8, depth - 1.f / 1024, 1}, {0, 0, 0, 0});
+					}
+					++profiles;
+				}
+		std::cout << "Stored-border mip atlas: " << profiles << " linear/Morton profiles, " << levels << " rings, "
+			<< words_checked << " exact color/depth words, " << stencil_checked << " exact stencil bytes, "
+			<< gated << " gated immutable uploads passed\n";
+		std::cout << "Stored-border atlas formats: " << cases - first_sample
+			<< " point color, depth and shadow RSX samples passed\n";
+	}
+	void stored_border_1d_cases()
+	{
+		const auto first = cases;
+		const cpu_capture_dispatch capture = [](const auto& work) { work(); };
+		context gpu{1};
+		auto ledger = std::make_shared<heap_budget>(gpu, 16u << 20);
+		gpu.set_buffer_budget(ledger);
+		std::size_t profiles = 0, rings = 0, active_bytes = 0, stencil_bytes = 0, assembled = 0;
+		for (const auto [width, mips] : {std::array{1u, 1u}, {5u, 3u}, {9u, 4u}})
+			for (const unsigned format : {0x85u, 0x90u, 0x91u, 0x92u, 0x93u})
+				for (const bool linear : {false, true})
+				{
+					auto r = words(format, vertex_texture_dimension::one, linear, width, 1, 1, mips);
+					r.format &= ~8u;
+					r.address = (7u << 28) | 0x040404;
+					const auto bpp = static_cast<unsigned>(describe_guest_texture_format(format).block.bytes);
+					const auto pitch = (width + 2) * bpp + 1;
+					if (linear) r.control3 = (1u << 20) | pitch;
+					const auto plan = plan_guest_texture(r);
+					ram->bytes.assign(plan.storage_bytes, std::byte{0xcd});
+					std::vector<bool> active(plan.storage_bytes);
+					std::vector<unsigned> starts;
+					const auto raw = [format](unsigned mip, unsigned x)
+					{
+						const unsigned n = mip * 24 + x * 8;
+						if (format == 0x85) return 0xff000000u | ((16 + n) << 16);
+						if (format == 0x92) return 0x2000u + n * 128;
+						if (format == 0x93) return 0x5000u + n * 8;
+						const unsigned depth = format == 0x90 ? 0x400000u + n * 4096 :
+							std::bit_cast<unsigned>(.25f + n / 512.f) >> 7;
+						return (depth << 8) | n;
+					};
+					const auto expected = [&](unsigned mip, unsigned x) -> color
+					{
+						const auto value = raw(mip, x);
+						if (format == 0x85) return {float((value >> 16) & 255) / 255, 0, 0, 1};
+						const float depth = format == 0x90 ? float(value >> 8) / 16777215.f : format == 0x91 ?
+							std::bit_cast<float>((value >> 8) << 7) : format == 0x92 ? float(value) / 65535.f :
+							std::bit_cast<float>((value << 11) + (120u << 23));
+						return {depth, depth, depth, depth};
+					};
+					unsigned offset = 0, touched = 0;
+					for (unsigned mip = 0; mip < mips; ++mip)
+					{
+						const auto w = std::max(1u, width >> mip);
+						const auto sw = std::bit_ceil(w + 8);
+						const auto byte_at = [&](unsigned x)
+						{
+							return offset + (linear ? pitch + x * bpp : morton_border_cell(x + 3, 4, std::bit_width(sw) - 1, 4) * bpp);
+						};
+						starts.push_back(byte_at(0));
+						for (unsigned x = 0; x < w + 2; ++x)
+							for (unsigned byte = 0; byte < bpp; ++byte)
+							{
+								const auto at = byte_at(x) + byte;
+								active.at(at) = true;
+								ram->bytes.at(at) = std::byte(raw(mip, x) >> ((bpp - 1 - byte) * 8));
+								++touched;
+							}
+						offset += linear ? pitch * 3 : sw * 16 * bpp;
+					}
+					require(offset == ram->bytes.size(), "1D guest storage disagrees with independent strides");
+					for (unsigned at = 0; at < offset;)
+					{
+						const auto start = at++;
+						while (at < offset && active[at] == active[start]) ++at;
+						if (!active[start]) ram->forbidden.push_back({0x1000 + start, at - start});
+					}
+					++ram->version;
+					const auto original = ram->bytes;
+					surface_cache surfaces(gpu, ram, 16u << 20, ledger, capture);
+					guest_texture_cache textures(gpu, ram, [](unsigned ea, unsigned, std::size_t) { return 0x1000 + ea - 0x200; },
+						1u << 20, ledger, 16, {capture, std::make_shared<io_mapping_epoch>()});
+					auto pixels = r;
+					pixels.format |= 0x40u << 8;
+					const auto batch = textures.resolve_versioned_batch(std::array{r, pixels}, surfaces);
+					const auto image = batch[0].image;
+					require(image.texture == batch[1].image.texture && image.texture.width == width + 2 &&
+						image.texture.height == mips && image.texture.mipmapLevelCount == 1 && image.metadata.actual_mips == mips,
+						"Versioned 1D storage lost or duplicated a mip row");
+					for (unsigned mip = 0; mip < mips; ++mip)
+					{
+						const auto w = std::max(1u, width >> mip);
+						sample(image, r, {-4, 8, 0, 1}, expected(mip, 0), 47, float(mip));
+						sample(image, r, {4, -8, 0, 1}, expected(mip, w + 1), 47, float(mip));
+						sample(image, pixels, {width * .375f, -8, 0, 1}, expected(mip, 1 + unsigned(w * .375f)), 47, float(mip));
+						if (format != 0x85)
+						{
+							auto shadow = r;
+							shadow.address = (1u << 28) | 0x040404;
+							shadow.control0 = (1u << 31) | (mip * 256u << 19) | (mip * 256u << 7);
+							const auto depth = expected(mip, 0)[0];
+							sample(image, shadow, {-4, -8, depth - 1.f / 1024, 1}, {0, 0, 0, 0});
+							sample(image, shadow, {-4, 8, depth + 1.f / 1024, 1}, {1, 1, 1, 1});
+						}
+						if (format == 0x90 || format == 0x91)
+						{
+							const auto stencil = make_buffer(gpu, 256, buffer_storage::shared);
+							texture_region area;
+							area.origin = MTLOriginMake(0, mip, 0);
+							area.size = MTLSizeMake(w + 2, 1, 1);
+							gpu.begin();
+							texture_to_buffer(gpu, image.texture, area, stencil, 0, 256, 0, texture_plane::stencil);
+							gpu.submit().wait();
+							const auto values = map_buffer(stencil, 0, w + 2);
+							for (unsigned x = 0; x < w + 2; ++x)
+								require(values[x] == std::byte(raw(mip, x) & 255), "1D mip row lost its stencil byte");
+							stencil_bytes += w + 2;
+						}
+						++rings;
+					}
+					if (format == 0x85)
+					{
+						auto filter = r;
+						filter.filter = (2u << 24) | (4u << 16);
+						const auto left = expected(mips - 1, 0), inner = expected(mips - 1, 1);
+						sample(image, filter, {0, 8, 0, 1}, {.5f * (left[0] + inner[0]), 0, 0, 1}, 47, float(mips - 1));
+						auto repeat = r;
+						repeat.address = (r.address & ~15u) | 1u;
+						sample(image, repeat, {-0.0625f, -8, 0, 1}, expected(0, width));
+						const auto address = 0x1000 + starts.back();
+						const auto native = surfaces.acquire({address, {1, 1, 1, surface_color::argb8, false}, 4, {}});
+						surfaces.clear(native, 0xf0, 0xffcc0000, 0, 255, {0, 0, 1, 1});
+						ram->forbidden.push_back({address, 4});
+						const auto mixed = textures.resolve_versioned(r, surfaces);
+						require(mixed.image.texture != image.texture && textures.statistics().assemblies_created == 1 &&
+							textures.statistics().assembly_vm_bytes == touched - 4, "1D RTT did not capture exactly its active holes");
+						sample(mixed.image, r, {-4, 8, 0, 1}, {.8f, 0, 0, 1}, 47, float(mips - 1));
+						sample(image, r, {-4, 8, 0, 1}, expected(mips - 1, 0), 47, float(mips - 1));
+						const auto reads = ram->reads;
+						require(textures.resolve_versioned(r, surfaces).image.texture == mixed.image.texture &&
+							ram->reads == reads, "Warm 1D RTT recaptured the mip rows");
+						++assembled;
+					}
+					require(ram->bytes == original, "1D border processing changed VM bytes");
+					ram->forbidden.clear();
+					active_bytes += touched;
+					++profiles;
+				}
+		std::cout << "Stored 1D borders: " << profiles << " linear/Morton profiles, " << rings
+			<< " mip rows, " << active_bytes << " active source bytes, " << cases - first
+			<< " RSX samples, " << stencil_bytes << " stencil bytes and " << assembled << " mixed native/VM assemblies passed\n";
+	}
+	void stored_border_anisotropic_cases()
+	{
+		const auto first = cases;
+		using D = vertex_texture_dimension;
+		const auto rgba = [](float value) -> color { return {value, value, value, value}; };
+		const auto fill = [&](const guest_texture_layout& plan, auto value)
+		{
+			ram->bytes.assign(plan.storage_bytes, std::byte{0xcd});
+			for (const auto& mip : plan.subresources)
+			{
+				const auto image = guest_texture_image_subresource(plan, mip);
+				for (unsigned z = 0; z < image.depth; ++z)
+					for (unsigned y = 0; y < image.height; ++y)
+						for (unsigned x = 0; x < image.width; ++x)
+						{
+							const auto word = value(mip.level, x, y, z);
+							const auto at = guest_texture_block_offset(plan, image, x, y, z);
+							for (unsigned byte = 0; byte < 4; ++byte)
+								ram->bytes.at(at + byte) = std::byte(word >> ((3 - byte) * 8));
+						}
+			}
+			++ram->version;
+		};
+		unsigned profiles = 0, shadow_samples = 0;
+		for (const auto dimension : {D::one, D::two, D::three, D::cube})
+			for (const bool linear : {false, true})
+				for (const unsigned mips : {1u, 3u})
+					for (const unsigned format : {0x9cu, 0x91u})
+					{
+						const auto height = dimension == D::cube ? 8u : dimension == D::one ? 1u : 4u;
+						const auto depth = dimension == D::three ? 4u : 1u;
+						auto r = words(format, dimension, linear, 8, height, depth, mips);
+						r.format &= ~8u;
+						r.address = (7u << 28) | 0x030404;
+						const auto plan = plan_guest_texture(r);
+						fill(plan, [&](unsigned mip, unsigned x, unsigned, unsigned z)
+						{
+							const float value = mip == 2 ? .875f : mip == 1 ? .625f :
+								x == 3 || (dimension == D::three && z == 1) ? .75f : .25f;
+							const auto bits = std::bit_cast<unsigned>(value);
+							return format == 0x91 ? (bits >> 7) << 8 : bits;
+						});
+						const auto image = resolver.resolve(r);
+						const color coord = dimension == D::cube ? color{0, 0, 1, 1} : color{.5f, .5f, .625f, 1};
+						const float gradient = dimension == D::cube ? 1.f : .5f;
+						for (const auto [setting, expected] : {std::pair{0u, mips > 1 ? .875f : .25f},
+							{1u, mips > 1 ? .625f : .25f}, {2u, .375f}, {7u, .375f}})
+						{
+							auto state = r;
+							state.control0 |= setting << 4;
+							sample(image, state, coord, rgba(expected), 25, gradient);
+							sample(image, state, coord, rgba(.25f), 47, 0);
+						}
+						auto anisotropic = r;
+						anisotropic.control0 |= 2u << 4;
+						if (dimension != D::cube)
+						{
+							anisotropic.format |= 0x40u << 8;
+							sample(image, anisotropic, {4, height * .5f, depth * .625f, 1}, rgba(.375f), 25, 4);
+						}
+						if (dimension == D::three)
+							sample(image, anisotropic, {4, height * .5f, depth * .5f, 1}, rgba(.375f), 25, 4, nullptr, 2);
+						++profiles;
+					}
+
+		for (const bool linear : {false, true})
+		{
+			auto r = words(0x91, D::two, linear, 8, 1);
+			r.format &= ~8u;
+			r.address = (1u << 28) | 0x030301; // Depth less than reference, repeat X.
+			r.filter = (1u << 24) | (1u << 16);
+			r.control0 |= 2u << 4;
+			const auto plan = plan_guest_texture(r);
+			fill(plan, [](unsigned, unsigned x, unsigned, unsigned)
+			{
+				return (std::bit_cast<unsigned>((x == 1 || x == 5) ? .75f : .25f) >> 7) << 8;
+			});
+			const auto image = resolver.resolve(r);
+			fragment_context varying;
+			varying.wpos_scale = .5f;
+			sample(image, r, {0, 0, .5f, 1}, rgba(.75f), 23, 0, &varying);
+			++shadow_samples;
+		}
+		// A one-level texture with a 16-texel footprint makes each hardware
+		// anisotropy setting produce an independently predictable sample.
+		auto caps = words(0x9c, D::two, true, 32, 1);
+		caps.format &= ~8u;
+		caps.address = (7u << 28) | 0x030303;
+		caps.filter = (1u << 24) | (1u << 16);
+		const auto cap_plan = plan_guest_texture(caps);
+		fill(cap_plan, [](unsigned, unsigned x, unsigned, unsigned)
+		{
+			return std::bit_cast<unsigned>(float(x * x) / 1024.f);
+		});
+		const auto cap_image = resolver.resolve(caps);
+		constexpr std::array factors{1u, 2u, 4u, 6u, 8u, 10u, 12u, 16u};
+		const auto oracle = [&](unsigned count)
+		{
+			float total = 0;
+			for (unsigned i = 1; i <= count; ++i)
+			{
+				const auto x = 1u + static_cast<unsigned>(std::floor(16.125 + 16.0 * (double(i) / (count + 1) - .5)));
+				total += float(x * x) / 1024.f;
+			}
+			return rgba(total / count);
+		};
+		const color coord{16.125f / 32, .5f, 0, 1};
+		for (unsigned i = 0; i < factors.size(); ++i)
+		{
+			caps.control0 = (caps.control0 & ~112u) | (i << 4);
+			sample(cap_image, caps, coord, oracle(factors[i]), 25, .5f);
+		}
+		sample(cap_image, caps, coord, oracle(2), 25, .5f, nullptr, 0, {0, 2});
+		std::cout << "Stored-border anisotropy: " << profiles << " linear/Morton dimension/mip/format profiles, "
+			<< cases - first << " exact shader samples including " << shadow_samples
+			<< " anisotropic shadow samples, all eight factors and a configuration override passed\n";
+	}
+	void stored_border_cube_cases()
+	{
+		const auto first = cases;
+		const cpu_capture_dispatch capture = [](const auto& work) { work(); };
+		context gpu{1};
+		auto ledger = std::make_shared<heap_budget>(gpu, 32u << 20);
+		gpu.set_buffer_budget(ledger);
+		const auto translate = [](unsigned ea, unsigned, std::size_t) { return 0x1000 + ea - 0x200; };
+		guest_texture_resolver upload(gpu, ram, translate, 1u << 20, ledger, capture);
+		unsigned profiles = 0, planes = 0, words_checked = 0, stencil_checked = 0;
+		for (const auto [side, mips] : {std::array{1u, 1u}, {5u, 3u}})
+			for (const unsigned format : {0x85u, 0x90u, 0x91u, 0x92u, 0x93u})
+				for (const bool linear : {false, true})
+				{
+					auto r = words(format, vertex_texture_dimension::cube, linear, side, side, 1, mips);
+					r.format &= ~8u;
+					r.address = (7u << 28) | 0x040404;
+					const auto codec = describe_guest_texture_format(format);
+					const unsigned bpp = codec.block.bytes, pitch = (side + 2) * bpp + 1;
+					if (linear) r.control3 = (1u << 20) | pitch;
+					const auto plan = plan_guest_texture(r);
+					ram->bytes.assign(plan.storage_bytes, std::byte{0xdc});
+					std::vector<bool> active(plan.storage_bytes);
+					std::vector<unsigned> bases;
+					const auto raw = [format](unsigned face, unsigned mip, unsigned x, unsigned y)
+					{
+						const unsigned n = face * 19 + mip * 23 + x * 3 + y * 7;
+						if (format == 0x85) return 0xff000000u | (n << 16) | ((n ^ 17u) << 8) | (n ^ 31u);
+						if (format == 0x92) return 0x4000u + n * 64;
+						if (format == 0x93) return 0x5000u + n * 8;
+						const unsigned depth = format == 0x90 ? 0x400000u + n * 4096 :
+							std::bit_cast<unsigned>(.25f + n / 512.f) >> 7;
+						return (depth << 8) | (n ^ 7u);
+					};
+					const auto address = [&](unsigned face, unsigned mip, unsigned x, unsigned y)
+					{
+						const auto w = std::max(1u, side >> mip);
+						const auto log = std::bit_width(std::bit_ceil(w + 8)) - 1;
+						const auto texel = linear ? y * pitch + x * bpp : morton_border_cell(x + 3, y + 3, log, log) * bpp;
+						return bases.at(face * mips + mip) + texel;
+					};
+					unsigned offset = 0, active_bytes = 0;
+					for (unsigned face = 0; face < 6; ++face)
+					{
+						for (unsigned mip = 0; mip < mips; ++mip)
+						{
+							bases.push_back(offset);
+							const auto w = std::max(1u, side >> mip), padded = std::bit_ceil(w + 8);
+							for (unsigned y = 0; y < w + 2; ++y)
+								for (unsigned x = 0; x < w + 2; ++x)
+									for (unsigned byte = 0; byte < bpp; ++byte)
+									{
+										const auto at = address(face, mip, x, y) + byte;
+										require(!active.at(at), "Cube border oracle overlaps active bytes");
+										active[at] = true;
+										ram->bytes[at] = std::byte(raw(face, mip, x, y) >> ((bpp - 1 - byte) * 8));
+										++active_bytes;
+									}
+							offset += linear ? pitch * (w + 2) : padded * padded * bpp;
+						}
+						if (!linear && face < 5) offset = (offset + 127u) & ~127u;
+					}
+					require(offset == ram->bytes.size(), "Stored cube allocation disagrees with independent strides");
+					for (unsigned at = 0; at < offset;)
+					{
+						const auto start = at++;
+						while (at < offset && active[at] == active[start]) ++at;
+						if (!active[start]) ram->forbidden.push_back({0x1000 + start, at - start});
+					}
+					++ram->version;
+					const auto original = ram->bytes;
+					const auto captured = upload.capture(r);
+					const auto reads_before = ram->reads;
+					ram->forbid_vm_access = true;
+					const auto uploaded = upload.realize(captured);
+					ram->forbid_vm_access = false;
+					require(ram->reads == reads_before && uploaded.texture.textureType == MTLTextureType2DArray &&
+						uploaded.texture.arrayLength == 6 && uploaded.texture.mipmapLevelCount == 1 &&
+						uploaded.metadata.actual_mips == mips, "Detached cube storage recaptured VM or lost a face");
+					const unsigned native_face = 4, native_mip = mips - 1;
+					const auto atlas = plan_stored_border_atlas(side, side, mips, false);
+					const auto verify = [&](id<MTLTexture> image, bool with_owner)
+					{
+						for (unsigned face = 0; face < 6; ++face)
+							for (unsigned mip = 0; mip < mips; ++mip)
+							{
+								const auto w = std::max(1u, side >> mip) + 2;
+								const auto out = make_buffer(gpu, w * 512, buffer_storage::shared);
+								texture_region area;
+								area.origin = MTLOriginMake(atlas.origins[mip][0], atlas.origins[mip][1], 0);
+								area.size = MTLSizeMake(w, w, 1);
+								area.slice = face;
+								gpu.begin();
+								texture_to_buffer(gpu, image, area, out, 0, 256, 0, codec.depth ? texture_plane::depth : texture_plane::all);
+								const bool stencil = format == 0x90 || format == 0x91;
+								if (stencil) texture_to_buffer(gpu, image, area, out, w * 256, 256, 0, texture_plane::stencil);
+								gpu.submit().wait();
+								const auto data = map_buffer(out, 0, w * 512);
+								const unsigned stride = format == 0x92 ? 2 : 4;
+								for (unsigned y = 0; y < w; ++y)
+									for (unsigned x = 0; x < w; ++x)
+									{
+										const bool native = with_owner && face == native_face && mip == native_mip && x == 1 && y == 1;
+										const auto word = raw(face, mip, x, y);
+										unsigned value = 0;
+										std::memcpy(&value, data.data() + y * 256 + x * stride, stride);
+										const auto expected = format == 0x90 ? std::bit_cast<unsigned>(float(word >> 8) / 16777215.f) :
+											format == 0x91 ? (word >> 8) << 7 : format == 0x93 ? (word << 11) + (120u << 23) : word;
+										const auto written = format == 0x85 ? 0xff204060u : format == 0x92 ? 65535u : std::bit_cast<unsigned>(1.f);
+										require(value == (native ? written : expected), "Native cube lost a color/depth ring word");
+										if (stencil)
+										{
+											require(data[(w + y) * 256 + x] == std::byte(native ? 53u : word & 255u), "Native cube lost a stencil byte");
+											++stencil_checked;
+										}
+										++words_checked;
+									}
+								++planes;
+							}
+					};
+					verify(uploaded.texture, false);
+					const auto expected = [&](unsigned face, unsigned mip, unsigned x, unsigned y) -> color
+					{
+						const auto word = raw(face, mip, x, y);
+						if (!codec.depth) return {float((word >> 16) & 255) / 255, float((word >> 8) & 255) / 255, float(word & 255) / 255, 1};
+						const float value = format == 0x90 ? float(word >> 8) / 16777215.f : format == 0x91 ?
+							std::bit_cast<float>((word >> 8) << 7) : format == 0x92 ? float(word) / 65535.f :
+							std::bit_cast<float>((word << 11) + (120u << 23));
+						return {value, value, value, value};
+					};
+					const auto direction = [](unsigned face, float s, float t)
+					{
+						const float u = 2 * s - 1, v = 2 * t - 1;
+						const std::array<color, 6> mapped{{{1,-v,-u,1}, {-1,-v,u,1}, {u,1,v,1},
+							{u,-1,-v,1}, {u,-v,1,1}, {-u,-v,-1,1}}};
+						return mapped.at(face);
+					};
+					for (unsigned face = 0; face < 6; ++face)
+						for (unsigned mip = 0; mip < mips; ++mip)
+						{
+							const auto w = std::max(1u, side >> mip);
+							const auto xy = direction(face, .225f, .775f);
+							const auto pixel = expected(face, mip, 1 + unsigned(w * .225f), 1 + unsigned(w * .775f));
+							sample(uploaded, r, xy, pixel, 47, float(mip));
+							if (codec.depth)
+							{
+								auto shadow = r;
+								shadow.address = (1u << 28) | 0x040404;
+								shadow.control0 = (1u << 31) | (mip * 256u << 19) | (mip * 256u << 7);
+								auto ref = xy;
+								ref[3] = pixel[0] - 1.f / 1024;
+								sample(uploaded, shadow, ref, {0, 0, 0, 0});
+								ref[3] = pixel[0] + 1.f / 1024;
+								sample(uploaded, shadow, ref, {1, 1, 1, 1});
+							}
+						}
+					const auto center = (side / 2 + .5f) / side;
+					const auto corner = direction(0, 1, center);
+					sample(uploaded, r, corner, expected(0, 0, side + 1, side / 2 + 1));
+					if (!codec.depth)
+					{
+						// Either side of the shared +X/-Z edge must select its
+						// own oriented face before addressing the atlas.
+						sample(uploaded, r, {1, 0, -.9375f, 1}, expected(0, 0, side, side / 2 + 1));
+						sample(uploaded, r, {.9375f, 0, -1, 1}, expected(5, 0, 1, side / 2 + 1));
+						auto clamped = r;
+						clamped.address = (r.address & ~15u) | 3u;
+						sample(uploaded, clamped, corner, expected(0, 0, side, side / 2 + 1));
+						auto repeated = r;
+						repeated.address = (r.address & ~15u) | 1u;
+						sample(uploaded, repeated, corner, expected(0, 0, 1, side / 2 + 1));
+						auto projected = direction(3, .225f, .775f);
+						for (auto& component : projected) component *= 2;
+						sample(uploaded, r, projected, expected(3, 0, 1 + unsigned(side * .225f), 1 + unsigned(side * .775f)), 24);
+						if (mips > 1)
+						{
+							sample(uploaded, r, {1, 0, 0, 1}, expected(0, 0, 1 + side / 2, 1 + side / 2), 25, .8f, nullptr, 0);
+							sample(uploaded, r, {1, 0, 0, 1}, expected(0, 1, 2, 2), 25, .8f, nullptr, 2);
+						}
+					}
+					if (format == 0x91 || format == 0x93)
+					{
+						auto filter = r;
+						filter.filter = (2u << 24) | (4u << 16);
+						const auto edge = expected(0, 0, side, side / 2 + 1);
+						const auto border = expected(0, 0, side + 1, side / 2 + 1);
+						const float value = (edge[0] + border[0]) * .5f;
+						sample(uploaded, filter, corner, {value, value, value, value});
+						filter.address = (1u << 28) | 0x040404;
+						auto ref = corner;
+						ref[3] = value;
+						sample(uploaded, filter, ref, {.5f, .5f, .5f, .5f});
+						if (mips > 1)
+						{
+							filter = r;
+							filter.filter = (1u << 24) | (5u << 16);
+							const auto coarse = expected(0, 1, 3, 2);
+							const float lod_value = .5f * (border[0] + coarse[0]);
+							sample(uploaded, filter, corner, {lod_value, lod_value, lod_value, lod_value}, 47, .5f);
+						}
+					}
+					surface_cache surfaces(gpu, ram, 32u << 20, ledger, capture);
+					guest_texture_cache textures(gpu, ram, translate, 1u << 20, ledger, 16, {capture, std::make_shared<io_mapping_epoch>()});
+					const auto ea = 0x1000 + address(native_face, native_mip, 1, 1);
+					const surface_format fmt = codec.depth ? surface_format{*codec.depth} : surface_format{surface_color::argb8};
+					const auto owner = surfaces.acquire({ea, {1, 1, 1, fmt, false}, bpp, {}});
+					if (!codec.depth)
+						surfaces.clear(owner, 0xf0, 0xff204060, 0, 255, {0, 0, 1, 1});
+					else
+						surfaces.draw(std::array{cached_surface_use{owner, true}}, [&](context& commands, auto images)
+						{
+							auto pass = [MTL4RenderPassDescriptor new];
+							pass.depthAttachment.texture = images[0];
+							pass.depthAttachment.loadAction = MTLLoadActionClear;
+							pass.depthAttachment.storeAction = MTLStoreActionStore;
+							pass.depthAttachment.clearDepth = 1;
+							if (format <= 0x91)
+							{
+								pass.stencilAttachment.texture = images[0];
+								pass.stencilAttachment.loadAction = MTLLoadActionClear;
+								pass.stencilAttachment.storeAction = MTLStoreActionStore;
+								pass.stencilAttachment.clearStencil = 53;
+							}
+							(void)commands.render(pass);
+						});
+					ram->forbidden.push_back({ea, bpp});
+					const auto mixed = textures.resolve_versioned_batch(std::array{r}, surfaces).front();
+					require(textures.statistics().assembly_vm_bytes == active_bytes - bpp && mixed.image.texture != uploaded.texture,
+						"Cube ring assembly did not read exactly the VM holes");
+					verify(mixed.image.texture, true);
+					sample(mixed.image, r, direction(native_face, .5f, .5f),
+						codec.depth ? color{1, 1, 1, 1} : color{32.f / 255, 64.f / 255, 96.f / 255, 1}, 47, float(native_mip));
+					const auto reads = ram->reads;
+					require(textures.resolve_versioned(r, surfaces).image.texture == mixed.image.texture &&
+						ram->reads == reads && ram->bytes == original, "Warm cube assembly recaptured or changed guest bytes");
+					ram->forbidden.clear();
+					++profiles;
+				}
+		std::cout << "Stored cube borders: " << profiles << " linear/Morton profiles, " << planes << " face-mip planes, "
+			<< words_checked << " exact color/depth words, " << stencil_checked << " stencil bytes and "
+			<< profiles << " mixed native/VM assemblies passed\n";
+		std::cout << "Stored cube sampling: " << cases - first
+			<< " RSX color/depth/shadow samples through the regular Metal 4 binding passed\n";
+	}
+	void stored_border_volume_cases()
+	{
+		const auto first = cases;
+		const cpu_capture_dispatch capture = [](const auto& work) { work(); };
+		context gpu{1};
+		auto ledger = std::make_shared<heap_budget>(gpu, 32u << 20);
+		gpu.set_buffer_budget(ledger);
+		const auto translate = [](unsigned ea, unsigned, std::size_t) { return 0x1000 + ea - 0x200; };
+		guest_texture_resolver upload(gpu, ram, translate, 1u << 20, ledger, capture);
+		unsigned profiles = 0, planes = 0, words_checked = 0, composed = 0;
+		for (const auto [width, height, depth, mips] : {std::array{1u, 1u, 2u, 1u}, {5u, 4u, 4u, 3u}})
+			for (const unsigned format : {0x85u, 0x90u, 0x91u, 0x92u, 0x93u})
+				for (const bool linear : {false, true})
+				{
+					auto r = words(format, vertex_texture_dimension::three, linear, width, height, depth, mips);
+					r.format &= ~8u;
+					r.border_color = 0xff6080a0;
+					const auto codec = describe_guest_texture_format(format);
+					const unsigned bpp = codec.block.bytes;
+					const auto pitch = (width + 2) * bpp + 1;
+					if (linear) r.control3 = (depth << 20) | pitch;
+					const auto plan = plan_guest_texture(r);
+					ram->bytes.assign(plan.storage_bytes, std::byte{0xdc});
+					std::vector<bool> active(plan.storage_bytes);
+					std::vector<unsigned> bases;
+					const auto raw = [format](unsigned mip, unsigned x, unsigned y, unsigned z)
+					{
+						const auto n = 20 * mip + 2 * x + 3 * y + 11 * z;
+						if (format == 0x85) return 0xff000000u | (n << 16) | ((n ^ 17u) << 8) | (n ^ 31u);
+						if (format == 0x92) return 0x4000u + n * 64;
+						if (format == 0x93) return 0x5000u + n * 8;
+						const unsigned depth_bits = format == 0x90 ? 0x400000u + n * 4096 :
+							std::bit_cast<unsigned>(.25f + n / 512.f) >> 7;
+						return (depth_bits << 8) | (n ^ 7u);
+					};
+					const auto address = [&](unsigned mip, unsigned x, unsigned y, unsigned z)
+					{
+						const auto w = std::max(1u, width >> mip), h = std::max(1u, height >> mip);
+						if (linear) return bases.at(mip) + (z * (h + 2) + y) * pitch + x * bpp;
+						const std::array size{std::bit_ceil(w + 8), std::bit_ceil(h + 8), std::max(1u, depth >> mip)};
+						const std::array coord{x + 3, y + 3, z};
+						unsigned ordinal = 0, weight = 1;
+						for (unsigned bit = 1; bit < std::max({size[0], size[1], size[2]}); bit <<= 1)
+							for (unsigned axis = 0; axis < 3; ++axis)
+								if (bit < size[axis])
+								{
+									if (coord[axis] & bit) ordinal += weight;
+									weight <<= 1;
+								}
+						return bases.at(mip) + ordinal * bpp;
+					};
+					unsigned offset = 0, active_bytes = 0;
+					for (unsigned mip = 0; mip < mips; ++mip)
+					{
+						bases.push_back(offset);
+						const auto w = std::max(1u, width >> mip), h = std::max(1u, height >> mip), d = std::max(1u, depth >> mip);
+						for (unsigned z = 0; z < d; ++z)
+							for (unsigned y = 0; y < h + 2; ++y)
+								for (unsigned x = 0; x < w + 2; ++x)
+									for (unsigned byte = 0; byte < bpp; ++byte)
+									{
+										const auto at = address(mip, x, y, z) + byte;
+										require(!active.at(at), "Volume border oracle maps two active bytes together");
+										active[at] = true;
+										ram->bytes[at] = std::byte(raw(mip, x, y, z) >> ((bpp - 1 - byte) * 8));
+										++active_bytes;
+									}
+						offset += d * (linear ? pitch * (h + 2) : std::bit_ceil(w + 8) * std::bit_ceil(h + 8) * bpp);
+					}
+					require(offset == ram->bytes.size(), "Stored volume allocation disagrees with independent strides");
+					for (unsigned at = 0; at < offset;)
+					{
+						const auto start = at++;
+						while (at < offset && active[at] == active[start]) ++at;
+						if (!active[start]) ram->forbidden.push_back({0x1000 + start, at - start});
+					}
+					++ram->version;
+					const auto original = ram->bytes;
+					const auto owned = upload.capture(r);
+					const auto reads_before = ram->reads;
+					ram->forbid_vm_access = true;
+					const auto uploaded = upload.realize(owned);
+					ram->forbid_vm_access = false;
+					require(ram->reads == reads_before && uploaded.texture.textureType == MTLTextureType3D &&
+						uploaded.texture.depth == depth && uploaded.texture.mipmapLevelCount == 1 && uploaded.metadata.actual_mips == mips,
+						"Detached volume storage recaptured VM or has the wrong shape");
+
+					const auto atlas = mips > 1 ? plan_stored_border_atlas(width, height, mips, false) : stored_border_mip_atlas{};
+					const unsigned source_mip = mips > 1 ? 1 : 0, source_z = 1;
+					const auto verify = [&](id<MTLTexture> image, bool with_owner)
+					{
+						for (unsigned mip = 0; mip < mips; ++mip)
+						{
+							const auto cols = std::max(1u, width >> mip) + 2, rows = std::max(1u, height >> mip) + 2;
+							for (unsigned z = 0; z < std::max(1u, depth >> mip); ++z)
+							{
+								const auto out = make_buffer(gpu, rows * 256, buffer_storage::shared);
+								texture_region area;
+								area.origin = MTLOriginMake(atlas.origins[mip][0], atlas.origins[mip][1], z);
+								area.size = MTLSizeMake(cols, rows, 1);
+								gpu.begin();
+								texture_to_buffer(gpu, image, area, out, 0, 256);
+								gpu.submit().wait();
+								const auto data = map_buffer(out, 0, rows * 256);
+								for (unsigned y = 0; y < rows; ++y)
+									for (unsigned x = 0; x < cols; ++x)
+									{
+										const bool native = with_owner && mip == source_mip && z == source_z && !x && !y;
+										const auto word = raw(mip, x, y, z);
+										const auto at = y * 256 + x * (codec.depth ? 8 : 4);
+										unsigned value;
+										std::memcpy(&value, data.data() + at, 4);
+										if (!codec.depth)
+											require(value == (native ? 0xff204060u : word), "Native volume lost an XY color ring texel");
+										else
+										{
+											const auto expected = format == 0x90 ? std::bit_cast<unsigned>(float(word >> 8) / 16777215.f) :
+												format == 0x91 ? (word >> 8) << 7 : format == 0x92 ? std::bit_cast<unsigned>(float(word) / 65535.f) :
+												(word << 11) + (120u << 23);
+											require(value == (native ? std::bit_cast<unsigned>(1.f) : expected), "Native volume lost an XY depth ring word");
+											std::memcpy(&value, data.data() + at + 4, 4);
+											const float stencil = format <= 0x91 ? (native ? 53.f : float(word & 255)) : 0.f;
+											require(value == std::bit_cast<unsigned>(stencil), "Native volume lost an XY stencil word");
+											++words_checked;
+										}
+										++words_checked;
+									}
+								++planes;
+							}
+						}
+					};
+					verify(uploaded.texture, false);
+					const auto expected = [&](unsigned mip, unsigned x, unsigned y, unsigned z) -> color
+					{
+						const auto word = raw(mip, x, y, z);
+						if (!codec.depth) return {float((word >> 16) & 255) / 255, float((word >> 8) & 255) / 255, float(word & 255) / 255, 1};
+						const float value = format == 0x90 ? float(word >> 8) / 16777215.f : format == 0x91 ?
+							std::bit_cast<float>((word >> 8) << 7) : format == 0x92 ? float(word) / 65535.f :
+							std::bit_cast<float>((word << 11) + (120u << 23));
+						return {value, value, value, value};
+					};
+					const auto average = [](color left, color right)
+					{
+						for (unsigned c = 0; c < left.size(); ++c) left[c] = (left[c] + right[c]) * .5f;
+						return left;
+					};
+					auto border = r;
+					border.address = (7u << 28) | 0x030404;
+					auto pixels = border;
+					pixels.format |= 0x40u << 8;
+					for (unsigned mip = 0; mip < mips; ++mip)
+					{
+						const auto w = std::max(1u, width >> mip), h = std::max(1u, height >> mip), d = std::max(1u, depth >> mip);
+						sample(uploaded, border, {-2, -2, .75f, 1}, expected(mip, 0, 0, d * 3 / 4), 47, float(mip));
+						sample(uploaded, border, {2, 2, .125f, 1}, expected(mip, w + 1, h + 1, 0), 47, float(mip));
+						sample(uploaded, pixels, {-2, -2, depth * .75f, 1}, expected(mip, 0, 0, d * 3 / 4), 47, float(mip));
+					}
+					sample(uploaded, border, {-4, -4, .25f, 2}, expected(0, 0, 0, 0), 24);
+					auto z_border = border;
+					z_border.address = (7u << 28) | 0x040404;
+					const color z_color = codec.depth ? color{96.f / 255, 96.f / 255, 96.f / 255, 96.f / 255} :
+						color{96.f / 255, 128.f / 255, 160.f / 255, 1};
+					sample(uploaded, z_border, {-2, -2, 2, 1}, z_color);
+					z_border.filter = (2u << 24) | (4u << 16);
+					sample(uploaded, z_border, {-2, -2, 0, 1}, average(z_color, expected(0, 0, 0, 0)));
+					auto repeat = z_border;
+					repeat.address = (7u << 28) | 0x010404;
+					sample(uploaded, repeat, {-2, -2, 0, 1}, average(expected(0, 0, 0, 0), expected(0, 0, 0, depth - 1)));
+					if (mips > 1)
+					{
+						sample(uploaded, border, {-2, -2, .75f, 1}, expected(1, 0, 0, 1), 25, .5f, nullptr, 2);
+						auto trilinear = border;
+						trilinear.filter = (1u << 24) | (5u << 16);
+						sample(uploaded, trilinear, {-2, -2, .75f, 1}, average(expected(1, 0, 0, 1), expected(2, 0, 0, 0)), 47, 1.5f);
+						auto z_linear = border;
+						z_linear.filter = (2u << 24) | (4u << 16);
+						sample(uploaded, z_linear, {-2, -2, .5f, 1}, average(expected(1, 0, 0, 0), expected(1, 0, 0, 1)), 47, 1);
+					}
+					if (!codec.depth)
+						for (unsigned wrap = 1; wrap <= 8; ++wrap)
+						{
+							auto wrapped = border;
+							wrapped.address = (7u << 28) | (wrap << 16) | 0x0404;
+							const auto z = wrap == 1 ? depth - 1 : 0;
+							sample(uploaded, wrapped, {-2, -2, -.125f, 1}, wrap == 4 ? z_color : expected(0, 0, 0, z));
+						}
+					surface_cache surfaces(gpu, ram, 32u << 20, ledger, capture);
+					guest_texture_cache textures(gpu, ram, translate, 1u << 20, ledger, 16, {capture, std::make_shared<io_mapping_epoch>()});
+					const auto ea = 0x1000 + address(source_mip, 0, 0, source_z);
+					const surface_format fmt = codec.depth ? surface_format{*codec.depth} : surface_format{surface_color::argb8};
+					const auto owner = surfaces.acquire({ea, {1, 1, 1, fmt, false}, bpp, {}});
+					if (!codec.depth)
+						surfaces.clear(owner, 0xf0, 0xff204060, 0, 255, {0, 0, 1, 1});
+					else
+						surfaces.draw(std::array{cached_surface_use{owner, true}}, [&](context& commands, auto images)
+						{
+							auto pass = [MTL4RenderPassDescriptor new];
+							pass.depthAttachment.texture = images[0];
+							pass.depthAttachment.loadAction = MTLLoadActionClear;
+							pass.depthAttachment.storeAction = MTLStoreActionStore;
+							pass.depthAttachment.clearDepth = 1;
+							if (format <= 0x91)
+							{
+								pass.stencilAttachment.texture = images[0];
+								pass.stencilAttachment.loadAction = MTLLoadActionClear;
+								pass.stencilAttachment.storeAction = MTLStoreActionStore;
+								pass.stencilAttachment.clearStencil = 53;
+							}
+							(void)commands.render(pass);
+						});
+					ram->forbidden.push_back({ea, bpp});
+					const auto mixed = textures.resolve_versioned(r, surfaces);
+					require(textures.statistics().assembly_vm_bytes == active_bytes - bpp && mixed.image.texture != uploaded.texture,
+						"Volume ring assembly did not read exactly the VM holes");
+					verify(mixed.image.texture, true);
+					const auto position = 1.5f / std::max(1u, depth >> source_mip);
+					sample(mixed.image, border, {-2, -2, position, 1}, codec.depth ? color{1, 1, 1, 1} :
+						color{32.f / 255, 64.f / 255, 96.f / 255, 1}, 47, float(source_mip));
+					const auto reads = ram->reads;
+					require(textures.resolve_versioned(r, surfaces).image.texture == mixed.image.texture &&
+						ram->reads == reads && ram->bytes == original, "Warm volume assembly recaptured or changed guest bytes");
+					ram->forbidden.clear();
+					++profiles;
+					++composed;
+				}
+		std::cout << "Stored volume borders: " << profiles << " linear/Morton profiles, " << planes << " XY mip planes, "
+			<< words_checked << " exact native color/depth/stencil words and " << composed << " mixed native/VM assemblies passed\n";
+		std::cout << "Stored volume sampling: " << cases - first << " RSX color/depth samples through the regular Metal 4 binding passed\n";
+	}
+	void morton_paired_cases()
+	{
+		const auto before = cases;
+		context gpu{1}; auto ledger = std::make_shared<heap_budget>(gpu, 16u << 20); gpu.set_buffer_budget(ledger);
+		const cpu_capture_dispatch capture = [](const auto& work) { work(); };
+		unsigned profiles = 0, planes = 0, texels = 0, mixed = 0, full = 0;
+		std::size_t holes = 0;
+		const auto address = [](unsigned x, unsigned y, unsigned z, const std::array<std::size_t, 3>& storage)
+		{
+			std::size_t result = 0, weight = 1;
+			for (unsigned bit = 1; bit < std::max({storage[0], storage[1], storage[2]}); bit *= 2)
+				for (unsigned axis = 0; axis < 3; ++axis) if (bit < storage[axis]) { if (std::array{x,y,z}[axis] & bit) result += weight; weight *= 2; }
+			return result;
+		};
+		for (const unsigned format : {0x8du, 0x8eu})
+			for (const auto dimension : {vertex_texture_dimension::one, vertex_texture_dimension::two, vertex_texture_dimension::three, vertex_texture_dimension::cube})
+				for (const bool border : {false, true})
+					for (unsigned shape = 0; shape < 4; ++shape)
+						@autoreleasepool
+						{
+							if (!border && dimension == vertex_texture_dimension::cube && shape == 3) continue;
+							const unsigned width = border ? std::array{1u,4u,5u,15u}[shape] : std::array{1u,4u,8u,3u}[shape];
+							const unsigned height = dimension == vertex_texture_dimension::one ? 1 : dimension == vertex_texture_dimension::cube ? width : 4;
+							const unsigned depth = dimension == vertex_texture_dimension::three ? 4 : 1;
+							auto r = words(format, dimension, false, width, height, depth, shape ? 3 : 1);
+							if (border) r.format &= ~8u;
+							r.address = (7u << 28) | 0x040404;
+							const auto plan = plan_guest_texture(r);
+							ram->bytes.assign(plan.storage_bytes, std::byte{0xee}); ram->forbidden.clear(); ++ram->version;
+							const auto channels = [](unsigned face, unsigned mip, unsigned z, unsigned x, unsigned y)
+							{ const unsigned n = (face * 31 + mip * 17 + z * 13 + x * 7 + y * 3) & 127; return std::array{11u+n,41u+n,71u+n,101u+n}; };
+							const auto unpack = [format](const auto& b, unsigned lane) -> color
+							{ return format == 0x8d ? color{b[1+lane*2]/255.f,b[2]/255.f,b[0]/255.f,1} : color{b[lane*2]/255.f,b[3]/255.f,b[1]/255.f,1}; };
+							std::vector<bool> active(plan.storage_bytes);
+							std::vector<std::size_t> cells;
+							for (const auto& s : plan.subresources)
+							{
+								const auto image = guest_texture_image_subresource(plan, s);
+								const std::array<std::size_t,3> storage{s.row_pitch/4,s.storage_rows,s.depth};
+								for (unsigned z = 0; z < s.depth; ++z) for (unsigned y = 0; y < image.rows; ++y) for (unsigned x = 0; x < image.columns; ++x)
+								{
+									const auto at = s.offset + 4 * address(x+(border?3:0),y+(border?dimension==vertex_texture_dimension::one?4:3:0),z,storage);
+									const auto b = channels(s.face,s.level,z,x,y); cells.push_back(at);
+									for (unsigned c = 0; c < 4; ++c) { ram->bytes.at(at+c)=std::byte(b[c]); active.at(at+c)=true; }
+								}
+							}
+							const auto original = ram->bytes;
+							if (border) for (std::size_t at = 0; at < active.size();)
+							{ if (active[at]) { ++at; continue; } const auto start=at; while (at<active.size()&&!active[at]) ++at; ram->forbidden.push_back({static_cast<unsigned>(0x1000+start),at-start}); }
+							surface_cache surfaces(gpu,ram,16u<<20,ledger,capture);
+							const auto translate = [](unsigned ea,unsigned,std::size_t) { return 0x1000u+ea-0x200; };
+							guest_texture_cache textures(gpu,ram,translate,1u<<20,ledger,64,{capture,std::make_shared<io_mapping_epoch>()});
+							resolved_fragment_texture uploaded;
+							if (profiles == 0)
+							{
+								const auto gate=[gpu.device() newSharedEvent]; struct release { id<MTLSharedEvent> e; ~release(){e.signaledValue=1;} } unblock{gate};
+								auto job=textures.prepare_versioned_batch(std::array{r},surfaces,std::array{guest_texture_upload_dependency{gate,1}});
+								bool timeout=false; try{(void)job.finish(std::chrono::milliseconds(1));}catch(const submission_wait_timeout&){timeout=true;}
+								require(timeout&&!job.ready(),"Packed Morton upload lost its pending event"); gate.signaledValue=1; uploaded=job.finish().front().image;
+							}
+							else uploaded=textures.resolve_versioned(r,surfaces).image;
+							const auto atlas=uses_stored_border_mip_atlas(plan)?std::optional{plan_stored_border_mip_atlas(plan)}:std::nullopt;
+							const auto oracle = [&](const guest_texture_subresource& s,unsigned z,unsigned x,unsigned y,bool native) -> color
+							{
+								const unsigned block=border?(x==0?0:x==s.width+1?(s.width+1)/2+1:(x-1)/2+1):x/2;
+								const unsigned lane=border?(x==0?1:x==s.width+1?0:(x-1)%2):x%2;
+								const auto b=native&&!s.face&&!s.level&&!z&&!block&&!y?std::array{255u,35u,69u,103u}:channels(s.face,s.level,z,block,y);
+								return unpack(b,lane);
+							};
+							const auto check = [&](const resolved_fragment_texture& image,bool native,bool sampling)
+							{
+								for (const auto& s : plan.subresources) for (unsigned z=0;z<s.depth;++z)
+								{
+									const unsigned w=s.width+(border?2:0),h=dimension==vertex_texture_dimension::one?1:s.height+(border?2:0);
+									const auto out=make_buffer(gpu,h*256,buffer_storage::shared); texture_region area;
+									area.level=atlas?0:s.level; area.slice=s.face; area.origin=MTLOriginMake(atlas?atlas->origins[s.level][0]:0,atlas?atlas->origins[s.level][1]:0,z); area.size=MTLSizeMake(w,h,1);
+									gpu.begin();texture_to_buffer(gpu,image.texture,area,out,0,256);gpu.submit().wait();
+									for(unsigned y=0;y<h;++y)for(unsigned x=0;x<w;++x)
+									{
+										const auto wanted=oracle(s,z,x,y,native);const auto* actual=static_cast<const unsigned char*>(out.contents)+y*256+x*4;
+										for(unsigned c=0;c<4;++c)require(actual[c]==std::lround(wanted[c==0||c==2?c^2:c]*255),"Packed Morton native pixel differs from its independent block/lane oracle"); ++texels;
+									}
+									++planes;
+									if (!sampling) continue;
+									const unsigned x=s.width/2+(border?1:0),y=dimension==vertex_texture_dimension::one?0:s.height/2+(border?1:0);
+									const std::array<color,6> directions{color{1,0,0,1},color{-1,0,0,1},color{0,1,0,1},color{0,-1,0,1},color{0,0,1,1},color{0,0,-1,1}};
+									const color coordinate=dimension==vertex_texture_dimension::cube?directions[s.face]:color{.5f,.5f,(z+.5f)/s.depth,1};
+									sample(image,r,coordinate,oracle(s,z,x,y,native),47,s.level);
+									if(!s.level){auto projected=coordinate;for(auto& c:projected)c*=2;sample(image,r,projected,oracle(s,z,x,y,native),24);}
+									auto linear=r;linear.filter=(4u<<16)|(2u<<24);color filtered{};
+									const float px=s.width*.5f+(border?.5f:-.5f),py=dimension==vertex_texture_dimension::one?0:s.height*.5f+(border?.5f:-.5f);
+									const int ix=std::floor(px),iy=std::floor(py);const float fx=px-ix,fy=py-iy;
+									for(unsigned yy=0;yy<2;++yy)for(unsigned xx=0;xx<2;++xx){const auto value=oracle(s,z,std::clamp(ix+int(xx),0,int(w)-1),std::clamp(iy+int(yy),0,int(h)-1),native);const auto weight=(xx?fx:1-fx)*(yy?fy:1-fy);for(unsigned c=0;c<4;++c)filtered[c]+=value[c]*weight;}
+									sample(image,linear,coordinate,filtered,47,s.level);
+								}
+							};
+							check(uploaded,false,true);
+							const auto reads=ram->reads;const auto created=ledger->statistics().created;const auto encoders=gpu.encoding_statistics();
+							require(textures.resolve_versioned(r,surfaces).image.texture==uploaded.texture&&ram->reads==reads&&ledger->statistics().created==created&&gpu.encoding_statistics().compute_encoders==encoders.compute_encoders,"Packed Morton ready image was recaptured or re-encoded");
+							const auto anchor=cells.front();const auto donor=surfaces.acquire({static_cast<unsigned>(0x1000+anchor),{1,1,1,surface_color::argb8,false},4,{}});
+							surfaces.clear(donor,0xf0,0xff234567,0,255,{0,0,1,1});ram->forbidden.push_back({static_cast<unsigned>(0x1000+anchor),4});
+							const auto vm_before=textures.statistics().assembly_vm_bytes;const auto assembled=textures.resolve_versioned(r,surfaces).image;
+							require(assembled.texture!=uploaded.texture&&textures.statistics().assembly_vm_bytes-vm_before==cells.size()*4-4&&ram->bytes==original,"Packed Morton mixed RTT captured native pixels/padding or changed VM");
+							holes+=cells.size()*4-4;check(assembled,true,true);check(uploaded,false,false);++mixed;
+							if (border&&dimension==vertex_texture_dimension::two&&shape==1)
+							{
+								auto memory=std::make_shared<class memory>();memory->bytes=original;
+								surface_cache complete(gpu,memory,16u<<20,ledger,capture);guest_texture_cache all(gpu,memory,translate,1u<<20,ledger,64,{capture,std::make_shared<io_mapping_epoch>()});
+								surface_color_transfer colors(gpu);
+								for(const auto& s:plan.subresources){const auto image=guest_texture_image_subresource(plan,s);const std::array<std::size_t,3> storage{s.row_pitch/4,s.storage_rows,s.depth};const auto source=complete.acquire({static_cast<unsigned>(0x1000+s.offset),{image.columns,image.rows,1,surface_color::argb8,false},0,swizzle_region{storage,{3,3,0},{image.columns,image.rows,1}}});complete.prepare(source,surface_initialization::background);std::vector<std::byte> pixels(image.columns*image.rows*4);for(unsigned y=0;y<image.rows;++y)for(unsigned x=0;x<image.columns;++x){const auto b=channels(0,s.level,0,x,y);for(unsigned c=0;c<4;++c)pixels[(y*image.columns+x)*4+c]=std::byte(b[c]);}complete.draw(std::array{cached_surface_use{source,true}},[&](context& commands,auto images){texture_region area;area.size=MTLSizeMake(image.columns,image.rows,1);colors.upload(commands,surface_color::argb8,make_upload(commands,pixels),{},images[0],area);});}
+								memory->forbidden.push_back({0x1000,original.size()});const auto image=all.resolve_versioned(r,complete).image;require(all.statistics().assembly_vm_bytes==0&&memory->reads==0,"Complete packed Morton RTT captured guest bytes");check(image,false,true);++full;
+							}
+							ram->forbidden.clear();++profiles;
+						}
+		unsigned refused = 0;
+		for (unsigned format : {0x8du, 0x8eu})
+		{
+			const auto invalid = words(format, vertex_texture_dimension::two, false, 5, 4);
+			const auto reads = ram->reads, translations = translated;
+			bool rejected = false; try { (void)resolver.resolve(invalid); } catch (const std::invalid_argument&) { rejected = true; }
+			require(rejected && ram->reads == reads && translated == translations, "Invalid packed Morton storage reached VM"); ++refused;
+		}
+		std::cout<<"Paired Morton textures: "<<profiles<<" ordinary/stored-border 1D/2D/3D/cube profiles, "<<planes<<" mip/face/Z checks, "<<texels<<" exact BGRA texels, "<<cases-before<<" RSX point/projected/linear samples, "<<mixed<<" mixed and "<<full<<" complete native RTT assemblies, "<<holes<<" exact VM-hole bytes, "<<refused<<" pre-VM storage refusals, pending timeout and warm reuse passed\n";
+	}
+	void paired_border_cases()
+	{
+		const auto first = cases;
+		const cpu_capture_dispatch capture = [](const auto& work) { work(); };
+		context gpu{1};
+		auto ledger = std::make_shared<heap_budget>(gpu, 16u << 20);
+		gpu.set_buffer_budget(ledger);
+		unsigned profiles = 0, rows_checked = 0, native_texels = 0, mixed = 0, full = 0;
+		for (const unsigned format : {0x8du, 0x8eu})
+			for (const bool one : {false, true})
+				for (const auto [width, mips] : {std::array{1u, 1u}, {4u, 3u}, {5u, 3u}})
+				{
+					const auto height = one ? 1u : 3u;
+					auto r = words(format, one ? vertex_texture_dimension::one : vertex_texture_dimension::two, true, width, height, 1, mips);
+					r.format &= ~8u;
+					r.address = (7u << 28) | 0x040404;
+					const unsigned pitch = ((width + 1) / 2 + 2) * 4 + (width != 1 ? 1 : 0);
+					r.control3 = (1u << 20) | pitch;
+					const auto plan = plan_guest_texture(r);
+					ram->bytes.assign(plan.storage_bytes, std::byte{0xee});
+					const auto channels = [](unsigned mip, unsigned block, unsigned row)
+					{
+						const unsigned n = mip * 24 + block * 8 + row * 4;
+						return std::array{12u + n, 52u + n, 92u + n, 132u + n};
+					};
+					const auto unpack = [format](const std::array<unsigned, 4>& b, unsigned lane) -> color
+					{
+						return format == 0x8d ? color{b[1 + lane * 2] / 255.f, b[2] / 255.f, b[0] / 255.f, 1} :
+							color{b[lane * 2] / 255.f, b[3] / 255.f, b[1] / 255.f, 1};
+					};
+					std::vector<unsigned> offsets;
+					unsigned offset = 0, active_bytes = 0;
+					for (unsigned mip = 0; mip < mips; ++mip)
+					{
+						const auto w = std::max(1u, width >> mip), h = std::max(1u, height >> mip);
+						const auto blocks = (w + 1) / 2 + 2;
+						offsets.push_back(offset);
+						for (unsigned y = 0; y < h + 2; ++y)
+							for (unsigned block = 0; block < blocks; ++block)
+							{
+								const auto bytes = channels(mip, block, y);
+								for (unsigned b = 0; b < bytes.size(); ++b)
+									ram->bytes.at(offset + y * pitch + block * 4 + b) = std::byte(bytes[b]);
+							}
+						active_bytes += blocks * 4 * (one ? 1 : h + 2);
+						offset += (h + 2) * pitch;
+					}
+					require(offset == ram->bytes.size(), "Paired guest ring has wrong block strides");
+					++ram->version;
+					const auto original = ram->bytes;
+					surface_cache surfaces(gpu, ram, 16u << 20, ledger, capture);
+					guest_texture_cache textures(gpu, ram, [](unsigned ea, unsigned, std::size_t) { return 0x1000 + ea - 0x200; },
+						1u << 20, ledger, 16, {capture, std::make_shared<io_mapping_epoch>()});
+					const auto uploaded = textures.resolve_versioned(r, surfaces).image;
+					const auto atlas = one || mips > 1 ? plan_stored_border_atlas(width, height, mips, one) : stored_border_mip_atlas{};
+					for (unsigned mip = 0; mip < mips; ++mip)
+					{
+						const auto w = std::max(1u, width >> mip), h = std::max(1u, height >> mip);
+						const auto cols = w + 2, rows = one ? 1u : h + 2;
+						const auto oracle = [&](unsigned x, unsigned y)
+						{
+							const auto block = x == 0 ? 0 : x == w + 1 ? (w + 1) / 2 + 1 : (x - 1) / 2 + 1;
+							return unpack(channels(mip, block, y + unsigned(one)), x == 0 ? 1 : x == w + 1 ? 0 : (x - 1) % 2);
+						};
+						const auto out = make_buffer(gpu, rows * 256, buffer_storage::shared);
+						texture_region area;
+						if (one || mips > 1)
+							area.origin = MTLOriginMake(atlas.origins[mip][0], atlas.origins[mip][1], 0);
+						area.size = MTLSizeMake(cols, rows, 1);
+						gpu.begin();
+						texture_to_buffer(gpu, uploaded.texture, area, out, 0, 256);
+						gpu.submit().wait();
+						const auto bytes = map_buffer(out, 0, rows * 256);
+						for (unsigned y = 0; y < rows; ++y)
+							for (unsigned x = 0; x < cols; ++x)
+							{
+								const auto value = oracle(x, y);
+								for (unsigned c = 0; c < 4; ++c)
+								{
+									const unsigned rgba = c == 0 || c == 2 ? c ^ 2 : c;
+									require(bytes[y * 256 + x * 4 + c] == std::byte(std::lround(value[rgba] * 255)),
+										"Paired border decoded the wrong lane or shared channel");
+								}
+								++native_texels;
+							}
+						sample(uploaded, r, {-8, -8, 0, 1}, oracle(0, 0), 47, float(mip));
+						sample(uploaded, r, {8, 8, 0, 1}, oracle(cols - 1, rows - 1), 47, float(mip));
+						auto filter = r;
+						filter.filter = (2u << 24) | (4u << 16);
+						const auto left = oracle(0, 0), interior = oracle(1, 0);
+						color average{};
+						for (unsigned c = 0; c < average.size(); ++c)
+							average[c] = (left[c] + interior[c]) * .5f;
+						sample(uploaded, filter, {0, -8, 0, 1}, average, 47, float(mip));
+						rows_checked += rows;
+					}
+					const auto mip = mips - 1;
+					const auto address = 0x1000 + offsets.back() + (one ? pitch : 0);
+					const auto native = surfaces.acquire({address, {1, 1, 1, surface_color::argb8, false}, 4, {}});
+					surfaces.clear(native, 0xf0, 0xaabbccdd, 0, 255, {0, 0, 1, 1});
+					ram->forbidden.push_back({address, 4});
+					const auto composed = textures.resolve_versioned(r, surfaces);
+					require(composed.image.texture != uploaded.texture && textures.statistics().assembly_vm_bytes == active_bytes - 4,
+						"Paired border RTT did not use exactly its VM holes");
+					sample(composed.image, r, {-8, -8, 0, 1}, unpack({0xaa, 0xbb, 0xcc, 0xdd}, 1), 47, float(mip));
+					sample(uploaded, r, {-8, -8, 0, 1}, unpack(channels(mip, 0, unsigned(one)), 1), 47, float(mip));
+					require(ram->bytes == original, "Paired border path changed guest bytes");
+					ram->forbidden.clear();
+					++mixed;
+					++profiles;
+
+					if (width == 1 && !one)
+					{
+						surface_cache full_surfaces(gpu, ram, 16u << 20, ledger, capture);
+						guest_texture_cache full_textures(gpu, ram, [](unsigned ea, unsigned, std::size_t) { return 0x1000 + ea - 0x200; },
+							1u << 20, ledger, 16, {capture, std::make_shared<io_mapping_epoch>()});
+						const auto owner = full_surfaces.acquire({0x1000, {3, height + 2, 1, surface_color::argb8, false}, pitch, {}});
+						full_surfaces.clear(owner, 0xf0, 0xff234567, 0, 255, {0, 0, 3, height + 2});
+						ram->forbidden.push_back({0x1000, ram->bytes.size()});
+						const auto cast = full_textures.resolve_versioned(r, full_surfaces);
+						require(full_textures.statistics().assembly_vm_bytes == 0, "Complete paired RTT cast captured VM");
+						sample(cast.image, r, {-8, -8, 0, 1}, unpack({0xff, 0x23, 0x45, 0x67}, 1));
+						sample(cast.image, r, {8, 8, 0, 1}, unpack({0xff, 0x23, 0x45, 0x67}, 0));
+						ram->forbidden.clear();
+						++full;
+					}
+				}
+		std::cout << "Linear paired borders: " << profiles << " profiles, " << rows_checked << " mip rows, "
+			<< native_texels << " exact native texels, " << cases - first << " RSX samples, "
+			<< mixed << " mixed and " << full << " complete native RTT assemblies passed\n";
+	}
+	void sampled_border_atlas_cases()
+	{
+		const auto first = cases;
+		constexpr unsigned width = 8, height = 4, mips = 4, pitch = (width + 2) * 4 + 1;
+		auto r = words(0x85, vertex_texture_dimension::two, true, width, height, 1, mips);
+		r.format &= ~8u;
+		r.control3 = (1u << 20) | pitch;
+		r.address = (7u << 28) | 0x040404;
+		const auto plan = plan_guest_texture(r);
+		ram->bytes.assign(plan.storage_bytes, std::byte{0xcd});
+		const auto red = [](unsigned mip, unsigned x, unsigned y) { return 8 + mip * 40 + x * 8 + y * 4; };
+		const auto shade = [](float value) -> color { return {value / 255.f, 0, 0, 1}; };
+		for (unsigned mip = 0; mip < mips; ++mip)
+		{
+			const auto w = std::max(1u, width >> mip), h = std::max(1u, height >> mip);
+			for (unsigned y = 0; y < h + 2; ++y)
+				for (unsigned x = 0; x < w + 2; ++x)
+				{
+					const auto at = plan.subresources[mip].offset + y * pitch + x * 4;
+					ram->bytes[at] = std::byte{255};
+					ram->bytes[at + 1] = std::byte(red(mip, x, y));
+					ram->bytes[at + 2] = ram->bytes[at + 3] = std::byte{};
+				}
+		}
+		++ram->version;
+		const cpu_capture_dispatch capture = [](const auto& work) { work(); };
+		context gpu{1};
+		auto ledger = std::make_shared<heap_budget>(gpu, 16u << 20);
+		gpu.set_buffer_budget(ledger);
+		surface_cache surfaces(gpu, ram, 16u << 20, ledger, capture);
+		guest_texture_cache textures(gpu, ram, [](unsigned offset, unsigned, std::size_t) { return 0x1000 + offset - 0x200; },
+			1u << 20, ledger, 64, {capture, std::make_shared<io_mapping_epoch>()});
+		const auto pixels = [&]
+		{
+			auto value = r;
+			value.format |= 0x40u << 8;
+			return value;
+		}();
+		const auto uploaded = textures.resolve_versioned_batch(std::array{r, pixels}, surfaces);
+		const auto image = uploaded[0].image;
+		require(image.texture == uploaded[1].image.texture && image.texture.mipmapLevelCount == 1 &&
+			image.metadata.actual_mips == mips, "Versioned draw cache did not coalesce the atlas upload");
+		for (unsigned mip = 0; mip < mips; ++mip)
+		{
+			const auto w = std::max(1u, width >> mip), h = std::max(1u, height >> mip);
+			sample(image, r, {-2, -2, 0, 1}, shade(red(mip, 0, 0)), 47, float(mip));
+			sample(image, r, {2, 2, 0, 1}, shade(red(mip, w + 1, h + 1)), 47, float(mip));
+			sample(image, r, {.375f, .625f, 0, 1}, shade(red(mip, 1 + unsigned(.375f * w), 1 + unsigned(.625f * h))), 47, float(mip));
+			sample(image, pixels, {3, 2.5f, 0, 1}, shade(red(mip, 1 + unsigned(.375f * w), 1 + unsigned(.625f * h))), 47, float(mip));
+		}
+		for (unsigned wrap = 1; wrap <= 8; ++wrap)
+		{
+			auto state = r;
+			state.address = (7u << 28) | 0x040400 | wrap;
+			const unsigned point[]{4, 1, 1, 0, 1, 1, 1, 1};
+			sample(image, state, {-.1875f, -.25f, 0, 1}, shade(red(1, point[wrap - 1], 0)), 47, 1);
+		}
+		auto mip_blend = r;
+		mip_blend.filter = (1u << 24) | (5u << 16);
+		sample(image, mip_blend, {-2, -2, 0, 1}, shade(.75f * red(1, 0, 0) + .25f * red(2, 0, 0)), 47, 1.25f);
+		auto level_blend = r;
+		level_blend.filter = (1u << 24) | (4u << 16);
+		sample(image, level_blend, {.25f, -.25f, 0, 1}, shade(.5f * (red(1, 1, 0) + red(1, 2, 0))), 47, 1);
+		level_blend.address = (7u << 28) | 0x040401;
+		sample(image, level_blend, {0, -.25f, 0, 1}, shade(.5f * (red(1, 1, 0) + red(1, 4, 0))), 47, 1);
+		sample(image, r, {-.25f, -.25f, 0, 1}, shade(red(1, 0, 0)), 25, .25f);
+		sample(image, r, {-.25f, -.25f, 0, 1}, shade(red(0, 0, 0)), 49, 2.f);
+		sample(image, r, {-1, -1, 0, 2}, shade(red(0, 0, 0)), 24);
+		auto clamped = r;
+		clamped.control0 = (1u << 31) | (256u << 19) | (512u << 7);
+		sample(image, clamped, {-2, -2, 0, 1}, shade(red(1, 0, 0)), 23);
+		sample(image, clamped, {-2, -2, 0, 1}, shade(red(2, 0, 0)), 47, 9);
+		clamped.filter |= 128;
+		sample(image, clamped, {-2, -2, 0, 1}, shade(red(2, 0, 0)), 47, 1.2f);
+
+		// Only a border texel in mip one is native. Remaining active bytes
+		// come from VM, and the old cached atlas must stay immutable.
+		const auto at = static_cast<unsigned>(0x1000 + plan.subresources[1].offset);
+		const auto native = surfaces.acquire({at, {1, 1, 1, surface_color::argb8, false}, 4, {}});
+		surfaces.clear(native, 0xf0, 0xffcc0000, 0, 255, {0, 0, 1, 1});
+		ram->forbidden.push_back({at, 4});
+		const auto before = ram->bytes;
+		const auto assembled = textures.resolve_versioned(r, surfaces);
+		require(assembled.image.texture != image.texture && assembled.image.texture.mipmapLevelCount == 1 &&
+			textures.statistics().assemblies_created == 1, "Native owner did not rebuild the stored-border atlas");
+		sample(assembled.image, r, {-2, -2, 0, 1}, shade(204), 47, 1);
+		sample(assembled.image, r, {-2, -2, 0, 1}, shade(red(2, 0, 0)), 47, 2);
+		sample(image, r, {-2, -2, 0, 1}, shade(red(1, 0, 0)), 47, 1);
+		const auto reads = ram->reads;
+		require(textures.resolve_versioned(r, surfaces).image.texture == assembled.image.texture &&
+			ram->reads == reads && ram->bytes == before, "Warm RTT atlas recaptured or changed guest bytes");
+		ram->forbidden.clear();
+
+		// Float texels give an exact independent oracle for simultaneous
+		// within-level and between-level filtering without UNORM rounding.
+		auto floats = words(0x9b, vertex_texture_dimension::two, true, width, height, 1, mips);
+		floats.format &= ~8u;
+		floats.address = r.address;
+		floats.filter = (2u << 24) | (6u << 16);
+		const auto float_plan = plan_guest_texture(floats);
+		ram->bytes.assign(float_plan.storage_bytes, std::byte{0xcd});
+		for (const auto& level : float_plan.subresources)
+			for (unsigned y = 0; y < level.height + 2; ++y)
+				for (unsigned x = 0; x < level.width + 2; ++x)
+				{
+					const color value{float(level.level) * .25f + float(x) / 64, 0, 0, 1};
+					auto at = level.offset + y * level.row_pitch + x * 16;
+					for (const auto channel : value)
+					{
+						const auto bits = std::bit_cast<unsigned>(channel);
+						for (unsigned byte = 0; byte < 4; ++byte)
+							ram->bytes[at++] = std::byte(bits >> ((3 - byte) * 8));
+					}
+				}
+		++ram->version;
+		const auto float_image = resolver.resolve(floats);
+		sample(float_image, floats, {0, -.25f, 0, 1}, {.375f + 1.f / 128, 0, 0, 1}, 47, 1.5f);
+		std::cout << "Stored-border atlas shader: " << cases - first
+			<< " exact RSX samples, versioned cache reuse and one mixed native/VM mip assembly passed\n";
+	}
+	static std::size_t count_active_runs(std::span<const bool> active)
+	{
+		std::size_t runs = 0;
+		bool previous = false;
+		for (bool present : active)
+		{
+			if (present && !previous) ++runs;
+			previous = present;
+		}
+		return runs;
+	}
+	void stored_border_clamp_cases()
+	{
+		const auto first = cases;
+		unsigned periodic_samples = 0;
+		unsigned mixed_samples = 0;
+		constexpr unsigned width = 4, height = 3, pitch = 27;
+		const auto texel = [](float x, float y) -> color
+		{
+			return {(24 + 16 * x + 8 * y) / 255, (16 + 8 * x + 24 * y) / 255, (32 + 12 * x + 12 * y) / 255, 1};
+		};
+		for (bool morton : {false, true})
+		{
+			auto r = words(0x85, vertex_texture_dimension::two, !morton, width, height);
+			r.format &= ~8u;
+			r.control3 = (1u << 20) | pitch;
+			ram->bytes.assign(morton ? 16 * 16 * 4 : pitch * (height + 2), std::byte{0xcd});
+			for (unsigned y = 0; y < height + 2; ++y)
+				for (unsigned x = 0; x < width + 2; ++x)
+				{
+					const auto at = morton ? morton_border_cell(x + 3, y + 3, 4, 4) * 4 : y * pitch + x * 4;
+					const auto value = texel(x, y);
+					ram->bytes[at] = std::byte{255};
+					for (unsigned c = 0; c < 3; ++c)
+						ram->bytes[at + c + 1] = std::byte(std::lround(value[c] * 255));
+				}
+			++ram->version;
+			const auto before = ram->bytes;
+			for (unsigned mode : {5u, 6u, 7u, 8u})
+				for (unsigned axis : {0u, 1u})
+				{
+					r.address = (7u << 28) | (0x040404u & ~(15u << (8 * axis))) | (mode << (8 * axis));
+					r.filter = 0x01010000;
+					const auto image = resolver.resolve(r);
+					const auto size = axis ? height : width;
+					const auto coordinate = [&](float p, bool pixels, float w)
+					{
+						color value{.375f, .5f, 0, w};
+						if (pixels) { value[0] *= width; value[1] *= height; }
+						value[axis] = pixels ? p : p / size;
+						value[0] *= w;
+						value[1] *= w;
+						return value;
+					};
+					const auto expected = [&](float p)
+					{
+						return axis ? texel(2, p) : texel(p, 2);
+					};
+					sample(image, r, coordinate(-1.75f, false, 1), expected(mode == 5 ? 1 : 2));
+					sample(image, r, coordinate(-8.f, false, -2), expected(mode == 5 ? 1 : mode == 7 ? size + 1 : size), 24);
+					sample(image, r, coordinate(8.f, false, 1), expected(mode == 7 ? size + 1 : size), 47);
+					auto linear = r;
+					linear.filter = 0x02020000;
+					sample(image, linear, coordinate(-.125f, false, 1), expected(mode == 5 ? .5f : 1.f));
+					sample(image, linear, coordinate(-8.f, false, 1), expected(mode == 5 ? .5f : mode == 6 ? float(size) : mode == 7 ? size + 1.f : size + .5f));
+					sample(image, linear, coordinate(8.f, false, 1), expected(mode == 6 ? float(size) : mode == 7 ? size + 1.f : size + .5f), 49);
+					auto pixels = linear;
+					pixels.format |= 0x40u << 8;
+					const auto pixel_image = resolver.resolve(pixels);
+					sample(pixel_image, pixels, coordinate(-1.25f, true, -2), expected(mode == 5 ? .5f : 1.75f), 24);
+				}
+			const auto index = [](float coordinate, int extent, unsigned wrap, bool linear)
+			{
+				const auto texel_index = [&](int pixel)
+				{
+					if (wrap == 1) return (pixel % extent + extent) % extent + 1;
+					if (wrap == 2)
+					{
+						const auto period = 2 * extent;
+						const auto cell = (pixel % period + period) % period;
+						return cell < extent ? cell + 1 : period - cell;
+					}
+					return std::clamp(pixel + 1, 0, extent + 1);
+				};
+				const auto cell = coordinate - (linear ? .5f : 0.f);
+				const auto low = int(std::floor(cell));
+				if (!linear) return float(texel_index(low));
+				return std::lerp(float(texel_index(low)), float(texel_index(low + 1)), cell - low);
+			};
+			for (const auto& [s, t] : {std::pair{1u, 1u}, {1u, 4u}, {4u, 1u}, {2u, 2u}, {1u, 2u}, {2u, 1u}})
+				for (bool pixels : {false, true})
+					for (bool linear : {false, true})
+					{
+						r.address = (7u << 28) | 0x040000u | (t << 8) | s;
+						r.filter = linear ? 0x02020000 : 0x01010000;
+						r.format = (r.format & ~(0x40u << 8)) | (pixels ? 0x40u << 8 : 0);
+						const auto image = resolver.resolve(r);
+						const float offset = pixels && !linear ? .01f : 0.f;
+						unsigned lookup = 0;
+						for (const auto& point : {std::array{0.f, 0.f}, {-.25f, .25f}, {4.25f, 2.75f},
+							{-9.75f, 8.25f}, {6.25f, -4.25f}})
+						{
+							const unsigned opcode = std::array{23u, 24u, 25u, 47u, 49u}[lookup++];
+							const float q = opcode == 24 ? -2.f : 1.f;
+							const color coordinate{q * point[0] / (pixels ? 1 : width), q * point[1] / (pixels ? 1 : height), 0, q};
+							sample(image, r, coordinate, texel(index(point[0] + offset, width, s, linear),
+								index(point[1] + offset, height, t, linear)), opcode, 1.75f);
+							++periodic_samples;
+						}
+					}
+			const auto mixed_begin = cases;
+			for (bool pixels : {false, true})
+				for (bool min_linear : {false, true})
+				{
+					r.address = 0x70040401; // Repeat S, stored border T.
+					r.filter = min_linear ? 0x01020000 : 0x02010000;
+					r.format = (r.format & ~(0x40u << 8)) | (pixels ? 0x40u << 8 : 0);
+					const auto image = resolver.resolve(r);
+					const auto expected = [&](bool minifies) { return texel(minifies == min_linear ? 2.5f : 1.f, 2.f); };
+					const color seam{0, pixels ? 1.5f : .5f, 0, 1};
+					const color projected{0, -2 * seam[1], 0, -2};
+					sample(image, r, seam, expected(false));
+					sample(image, r, projected, expected(false), 24);
+					sample(image, r, seam, expected(false), 25, .125f);
+					sample(image, r, seam, expected(true), 25, 2.f);
+					sample(image, r, seam, expected(false), 47, -1.f);
+					sample(image, r, seam, expected(true), 47, 1.f);
+
+					// Even though every sample clamps to the same guest corner,
+					// the original fragment-coordinate footprint crosses one texel.
+					r.address = 0x70040505;
+					fragment_context fragment;
+					fragment.wpos_bias_x = fragment.wpos_bias_y = -16;
+					const auto corner = [&](bool minifies) { return minifies == min_linear ? texel(.5f, .5f) : texel(1.f, 1.f); };
+					fragment.wpos_scale = 2.f;
+					sample(image, r, {}, corner(true), 23, 0, &fragment);
+					fragment.wpos_scale = .125f;
+					sample(image, r, {}, corner(false), 23, 0, &fragment);
+					sample(image, r, {}, corner(true), 49, 4.f, &fragment);
+				}
+			mixed_samples += cases - mixed_begin;
+			require(ram->bytes == before, "Stored border clamp sampling modified guest storage");
+		}
+		std::cout << "Stored border clamp modes: " << cases - first - periodic_samples - mixed_samples
+			<< " linear/Morton color samples across both axes, point/linear and projected/pixel coordinates\n";
+		std::cout << "Stored border periodic modes: " << periodic_samples
+			<< " linear/Morton color samples, mixed axes and simultaneous seams across five TEX opcodes\n";
+		std::cout << "Stored border mixed filters: " << mixed_samples
+			<< " linear/Morton color samples across implicit, projected, gradient, explicit-level and biased lookup\n";
+	}
+	void stored_morton_border_cases()
+	{
+		const auto first = cases;
+		constexpr unsigned width = 15, height = 3, columns = width + 2, rows = height + 2, bytes = 32 * 16 * 4;
+		auto r = words(0x85, vertex_texture_dimension::two, false, width, height);
+		r.format &= ~8u;
+		r.address = (7u << 28) | 0x040404;
+		const auto offset = [](unsigned x, unsigned y) { return morton_border_cell(x + 3, y + 3, 5, 4) * 4; };
+		const auto texel = [](float x, float y) -> color
+		{
+			return {(16 + 8 * x + 4 * y) / 255, (24 + 4 * x + 20 * y) / 255, (40 + 8 * x + 8 * y) / 255, 1};
+		};
+		ram->bytes.assign(bytes, std::byte{0xcd});
+		std::array<bool, bytes> active{};
+		for (unsigned y = 0; y < rows; ++y)
+			for (unsigned x = 0; x < columns; ++x)
+			{
+				const auto value = texel(x, y);
+				const auto at = offset(x, y);
+				ram->bytes[at] = std::byte{255};
+				for (unsigned channel = 0; channel < 3; ++channel)
+					ram->bytes[at + 1 + channel] = std::byte(std::lround(value[channel] * 255));
+				std::fill_n(active.begin() + at, 4, true);
+			}
+		for (unsigned i = 0; i < bytes;)
+		{
+			if (active[i]) { ++i; continue; }
+			const unsigned start = i;
+			while (i < bytes && !active[i]) ++i;
+			ram->forbidden.push_back({0x1000 + start, i - start});
+		}
+		++ram->version;
+		const auto original = ram->bytes;
+		const auto image = resolver.resolve(r);
+		require(image.texture.width == columns && image.texture.height == rows && image.metadata.stored_border_extent == std::array{width, height},
+			"Morton texture did not produce its inner ring");
+		for (unsigned y = 0; y < rows; ++y)
+			for (unsigned x = 0; x < columns; ++x)
+				sample(image, r, {(float(x) - .5f) / width, (float(y) - .5f) / height, 0, 1}, texel(x, y));
+		auto linear = r;
+		linear.filter = 0x02020000;
+		sample(image, linear, {0, 0, 0, 1}, texel(.5f, .5f));
+		auto pixels = r;
+		pixels.format |= 0x40u << 8;
+		const auto detached = realize_without_vm(capture_without_gpu(pixels, count_active_runs(active)));
+		sample(detached, pixels, {-2, 4, 0, 2}, texel(0, 3), 24);
+		ram->bytes = original;
+		++ram->version;
+
+		const cpu_capture_dispatch capture = [](const auto& work) { work(); };
+		context gpu{2};
+		auto ledger = std::make_shared<heap_budget>(gpu, 8u << 20);
+		gpu.set_buffer_budget(ledger);
+		surface_cache surfaces(gpu, ram, 8u << 20, ledger, capture);
+		guest_texture_cache textures(gpu, ram, [](unsigned offset, unsigned, std::size_t) { return 0x1000 + offset - 0x200; },
+			1u << 20, ledger, 64, {capture, std::make_shared<io_mapping_epoch>()});
+		const std::array requests{r, pixels};
+		const auto batch = textures.resolve_versioned_batch(requests, surfaces);
+		require(batch[0].image.texture == batch[1].image.texture, "Morton ring requests did not coalesce");
+		const auto reads = ram->reads;
+		require(textures.resolve_versioned(r, surfaces).image.texture == batch[0].image.texture && ram->reads == reads,
+			"Morton ring lost its warm VM cache hit");
+		const auto corner = 0x1000 + offset(width + 1, height + 1);
+		const auto native = surfaces.acquire({corner, {1, 1, 1, surface_color::argb8, false}, 4, {}});
+		surfaces.clear(native, 0xf0, 0xff104080, 0, 255, {0, 0, 1, 1});
+		ram->forbidden.push_back({corner, 4});
+		const auto composed = textures.resolve_versioned_batch(std::span{requests}.first(1), surfaces);
+		require(composed[0].image.texture != batch[0].image.texture &&
+			textures.statistics().assembly_vm_bytes == (columns * rows - 1) * 4,
+			"Morton border RTT did not restrict guest reads to active holes");
+		sample(composed[0].image, r, {8, 8, 0, 1}, {16.f / 255, 64.f / 255, 128.f / 255, 1});
+		sample(composed[0].image, r, {-8, -8, 0, 1}, texel(0, 0));
+		sample(batch[0].image, r, {8, 8, 0, 1}, texel(width + 1, height + 1));
+		require(ram->bytes == original, "Morton border upload or assembly changed guest bytes");
+		ram->forbidden.clear();
+		std::cout << "Morton stored color ring: " << cases - first << " native samples, coalesced VM upload and border-only RTT with exact active holes\n";
+	}
+	void stored_depth_border_cases()
+	{
+		const auto first = cases;
+		constexpr unsigned width = 4, height = 3, columns = width + 2, rows = height + 2;
+		std::size_t depth_words = 0, stencil_bytes = 0;
+		for (unsigned format : {0x90u, 0x91u, 0x92u, 0x93u})
+			for (unsigned layout = 0; layout < 3; ++layout)
+			{
+				const bool morton = layout == 2;
+				auto r = words(format, vertex_texture_dimension::two, !morton, width, height);
+				r.format &= ~8u;
+				r.address = (7u << 28) | 0x040404;
+				r.filter = 0x01010000;
+				r.border_color = 0xffffffff;
+				const unsigned bpp = describe_guest_texture_format(format).block.bytes;
+				const unsigned pitch = columns * bpp + (layout == 1 ? 1 : bpp);
+				r.control3 = (1u << 20) | pitch;
+				const auto raw = [&](unsigned x, unsigned y)
+				{
+					const bool high = (x + y) % 2;
+					const unsigned n = y * columns + x;
+					if (format == 0x92)
+						// Keep the bilinear oracle on a representable UNORM16 value.
+						return (high ? 0x9000u : 0x2000u) + n * 52;
+					if (format == 0x93)
+						return (high ? 0x6800u : 0x5000u) + n * 5;
+					const unsigned depth = format == 0x90 ? (high ? 0xa00000u : 0x400000u) + n * 139
+						: std::bit_cast<unsigned>((high ? .75f : .25f) + n / 1024.f) >> 7;
+					return (depth << 8) | (17 + n * 7);
+				};
+				const auto depth_bits = [&](unsigned value)
+				{
+					if (format == 0x92)
+						return value;
+					if (format == 0x90)
+						return std::bit_cast<unsigned>(float(value >> 8) / 16777215.f);
+					return format == 0x91 ? (value >> 8) << 7 : (value << 11) + (120u << 23);
+				};
+				const auto depth_at = [&](unsigned x, unsigned y)
+				{
+					const auto bits = depth_bits(raw(x, y));
+					return format == 0x92 ? bits / 65535.f : std::bit_cast<float>(bits);
+				};
+				ram->bytes.assign(morton ? 16 * 16 * bpp : pitch * rows, std::byte{0xe3});
+				std::array<bool, 16 * 16> active{};
+				for (unsigned y = 0; y < rows; ++y)
+					for (unsigned x = 0; x < columns; ++x)
+					{
+						auto at = y * pitch + x * bpp;
+						if (morton)
+						{
+							const auto cell = morton_border_cell(x + 3, y + 3, 4, 4);
+							active[cell] = true;
+							at = cell * bpp;
+						}
+						for (unsigned byte = 0; byte < bpp; ++byte)
+							ram->bytes[at + byte] = std::byte(raw(x, y) >> ((bpp - 1 - byte) * 8));
+					}
+				++ram->version;
+				const auto original = ram->bytes;
+				const auto image = resolver.resolve(r);
+				require(image.metadata.stored_border_extent == std::array{width, height} && image.metadata.depth &&
+					image.texture.width == columns && image.texture.height == rows, "Native depth ring lost its format or geometry");
+
+				const bool packed_stencil = bpp == 4;
+				const unsigned native_depth_bytes = format == 0x92 ? 2 : 4;
+				const auto output = make_buffer(ctx, 512 * rows, buffer_storage::shared);
+				texture_region region;
+				region.size = MTLSizeMake(columns, rows, 1);
+				ctx.begin();
+				texture_to_buffer(ctx, image.texture, region, output, 0, 256, 0, texture_plane::depth);
+				if (packed_stencil)
+					texture_to_buffer(ctx, image.texture, region, output, 256 * rows, 256, 0, texture_plane::stencil);
+				ctx.submit().wait();
+				const auto data = map_buffer(output, 0, output.length);
+				for (unsigned y = 0; y < rows; ++y)
+					for (unsigned x = 0; x < columns; ++x)
+					{
+						unsigned actual = 0;
+						std::memcpy(&actual, data.data() + y * 256 + x * native_depth_bytes, native_depth_bytes);
+						require(actual == depth_bits(raw(x, y)), "Stored depth ring differs from the guest depth word");
+						++depth_words;
+						if (packed_stencil)
+						{
+							require(data[256 * rows + y * 256 + x] == std::byte(raw(x, y)), "Stored depth ring lost its stencil byte");
+							++stencil_bytes;
+						}
+					}
+
+				const auto rgba = [](float depth) -> color { return {depth, depth, depth, depth}; };
+				sample(image, r, {-8, -8, 0, 1}, rgba(depth_at(0, 0)));
+				sample(image, r, {8, 8, 0, 1}, rgba(depth_at(width + 1, height + 1)));
+				sample(image, r, {.375f, .5f, 0, 1}, rgba(depth_at(2, 2)), 47);
+				auto mixed = r;
+				mixed.address = (mixed.address & ~15u) | 3u;
+				sample(image, mixed, {-8, -8, 0, 1}, rgba(depth_at(1, 0)));
+				auto pixels = r;
+				pixels.format |= 0x40u << 8;
+				sample(image, pixels, {-2, 3, 0, 2}, rgba(depth_at(0, 2)), 24);
+				auto linear = r;
+				linear.filter = 0x02020000;
+				sample(image, linear, {0, 0, 0, 1},
+					rgba((depth_at(0, 0) + depth_at(1, 0) + depth_at(0, 1) + depth_at(1, 1)) / 4));
+
+				auto shadow = r;
+				shadow.address = (shadow.address & 0x0fffffffu) | (1u << 28);
+				sample(image, shadow, {-8, -8, .5f, 1}, rgba(1));
+				sample(image, shadow, {8, 8, .5f, 1}, rgba(0));
+				sample(image, shadow, {-4, 1, 1, 2}, rgba(1), 24);
+				shadow.filter = linear.filter;
+				sample(image, shadow, {0, 0, .5f, 1}, rgba(.5f));
+				shadow.address = (shadow.address & ~15u) | 3u;
+				sample(image, shadow, {-8, -8, .5f, 1}, rgba(0));
+				sample(image, shadow, {0, 0, .5f, 1}, rgba(.5f));
+				for (const auto& [wrap, result] : {std::pair{6u, 1.f}, {7u, 0.f}, {8u, .5f}})
+				{
+					shadow.address = (shadow.address & ~15u) | wrap;
+					sample(image, shadow, {-8, -8, .5f, 1}, rgba(result));
+				}
+				shadow.address = (shadow.address & ~0x0f0fu) | 0x0101u;
+				sample(image, shadow, {0, 0, .5f, 1}, rgba(.5f));
+				linear.address = (linear.address & ~0x0f0fu) | 0x0101u;
+				sample(image, linear, {0, .5f, 0, 1}, rgba((depth_at(1, 2) + depth_at(4, 2)) / 2));
+				for (bool min_linear : {false, true})
+				{
+					linear.filter = shadow.filter = min_linear ? 0x01020000 : 0x02010000;
+					sample(image, linear, {0, .5f, 0, 1}, rgba(min_linear ? depth_at(1, 2) : (depth_at(1, 2) + depth_at(4, 2)) / 2));
+					sample(image, shadow, {0, 0, .5f, 1}, rgba(min_linear ? 1.f : .5f));
+					fragment_context minified;
+					minified.wpos_scale = 2.f;
+					minified.wpos_bias_x = minified.wpos_bias_y = -1.f;
+					sample(image, shadow, {0, 0, .5f, 1}, rgba(min_linear ? .5f : 1.f), 23, 0, &minified);
+				}
+				require(ram->bytes == original, "Stored depth upload changed guest bytes or row padding");
+				const auto captured = capture_without_gpu(r, morton ? count_active_runs(active) : 1);
+				sample(realize_without_vm(captured), r, {-8, -8, 0, 1}, rgba(depth_at(0, 0)));
+			}
+		std::cout << "Stored depth rings: eight linear and four Morton profiles, " << depth_words << " exact depth words, "
+			<< stencil_bytes << " exact stencil bytes, " << cases - first
+			<< " depth/shadow/PCF samples and unchanged VM passed\n";
+	}
+	void stored_border_assembly_cases(bool morton = false)
+	{
+		const auto first = cases;
+		constexpr unsigned extent = 4, side = extent + 2;
+		unsigned profiles = 0;
+		std::size_t depth_words = 0, stencil_bytes = 0, hole_bytes = 0;
+		for (unsigned format : {0x85u, 0x90u, 0x91u, 0x92u, 0x93u})
+			for (bool partial : {false, true})
+				for (unsigned samples : {1u, 2u, 4u})
+				{
+					@autoreleasepool
+					{
+						auto r = words(format, vertex_texture_dimension::two, !morton, extent, extent);
+						r.format &= ~8u;
+						r.address = (7u << 28) | 0x040404;
+						const auto codec = describe_guest_texture_format(format);
+						const bool depth = codec.depth.has_value(), stencil = format == 0x90 || format == 0x91;
+						const unsigned bpp = codec.block.bytes, pitch = side * bpp + 3;
+						r.control3 = (1u << 20) | pitch;
+						const unsigned vm_word = format == 0x85 ? 0xff204060u : format == 0x90 ? 0x8000002au :
+							format == 0x91 ? 0x7e00002au : format == 0x92 ? 0x8000u : 0x6000u;
+						ram->bytes.assign(morton ? 16 * 16 * bpp : pitch * side, std::byte{0xb7});
+						for (unsigned y = 0; y < side; ++y)
+							for (unsigned x = 0; x < side; ++x)
+							{
+								const auto offset = morton ? morton_border_cell(x + 3, y + 3, 4, 4) * bpp : y * pitch + x * bpp;
+								for (unsigned i = 0; i < bpp; ++i)
+									ram->bytes[offset + i] = std::byte(vm_word >> (8 * (bpp - 1 - i)));
+							}
+						++ram->version;
+						const auto original = ram->bytes;
+
+						const cpu_capture_dispatch capture = [](const auto& work) { work(); };
+						context gpu{1};
+						auto ledger = std::make_shared<heap_budget>(gpu, 8u << 20);
+						gpu.set_buffer_budget(ledger);
+						surface_cache surfaces(gpu, ram, 8u << 20, ledger, capture);
+						guest_texture_cache textures(gpu, ram, [](unsigned offset, unsigned, std::size_t) { return 0x1000 + offset - 0x200; },
+							1u << 20, ledger, 64, {capture, std::make_shared<io_mapping_epoch>()});
+						const surface_format sf = depth ? surface_format{*codec.depth} : surface_format{surface_color::argb8};
+						const auto factors = samples == 1 ? sample_layout{1, 1} : rsx_sample_layout(samples);
+						const auto native_depth = [&](unsigned part) -> float
+						{
+							return format == 0x90 || format == 0x92 ? float(part) : part ? .734567f : .267891f;
+						};
+						const unsigned region_size = partial ? 2 : side;
+						for (unsigned part = 0; part < (partial ? 2u : 1u); ++part)
+						{
+							const unsigned origin = part ? side - region_size : 0;
+							const unsigned address = morton ? 0x1000 : 0x1000 + origin * (pitch + bpp);
+							const auto swizzle = morton ? std::optional<swizzle_region>{{{16, 16, 1},
+								{origin + 3, origin + 3, 0}, {region_size, region_size, 1}}} : std::nullopt;
+							const auto row_pitch = morton ? 0 : pitch;
+							const auto source = surfaces.acquire({address,
+								{region_size / factors.x, region_size / factors.y, samples, sf, false}, row_pitch, swizzle});
+							surfaces.prepare(source, surface_initialization::background);
+							if (depth)
+							{
+								const std::array uses{cached_surface_use{source, true}};
+								surfaces.draw(uses, [&](context& commands, auto images)
+								{
+									auto pass = [MTL4RenderPassDescriptor new];
+									pass.depthAttachment.texture = images[0];
+									pass.depthAttachment.loadAction = MTLLoadActionClear;
+									pass.depthAttachment.storeAction = MTLStoreActionStore;
+									pass.depthAttachment.clearDepth = native_depth(part);
+									if (stencil)
+									{
+										pass.stencilAttachment.texture = images[0];
+										pass.stencilAttachment.loadAction = MTLLoadActionClear;
+										pass.stencilAttachment.storeAction = MTLStoreActionStore;
+										pass.stencilAttachment.clearStencil = 63 + part;
+									}
+									(void)commands.render(pass);
+								});
+							}
+							else
+								surfaces.clear(source, 0xf0, part ? 0xff8090a0 : 0xff103050, 0, 255,
+									{0, 0, region_size / factors.x, region_size / factors.y});
+							guest_surface_byte_cursor cursor(plan_guest_surface(address, region_size, region_size, bpp, row_pitch, swizzle));
+							while (const auto active = cursor.next())
+								ram->forbidden.push_back(*active);
+						}
+						auto pixels = r;
+						pixels.format |= 0x40u << 8;
+						const auto before = ram->reads;
+						const auto batch = textures.resolve_versioned_batch(std::array{r, pixels}, surfaces);
+						const auto& image = batch[0].image;
+						require(image.metadata.stored_border_extent == std::array{extent, extent} && image.texture.width == side && image.texture.height == side &&
+							image.texture == batch[1].image.texture && textures.statistics().assemblies_created == 1,
+							"Stored RTT ring did not preserve padded geometry or batch ownership");
+						const std::size_t holes = partial ? (side * side - 8) * bpp : 0;
+						require(textures.statistics().assembly_vm_bytes == holes && (holes || ram->reads == before),
+							"Stored RTT ring captured more than the active VM holes");
+						hole_bytes += holes;
+						const auto owner = [&](unsigned x, unsigned y)
+						{
+							if (!partial || (x < 2 && y < 2))
+								return 0u;
+							return x >= side - 2 && y >= side - 2 ? 1u : 2u;
+						};
+						if (depth)
+						{
+							texture_region area;
+							area.size = MTLSizeMake(side, side, 1);
+							const auto data = make_buffer(gpu, 512 * side, buffer_storage::shared);
+							gpu.begin();
+							texture_to_buffer(gpu, image.texture, area, data, 0, 256, 0, texture_plane::depth);
+							if (stencil)
+								texture_to_buffer(gpu, image.texture, area, data, 256 * side, 256, 0, texture_plane::stencil);
+							gpu.submit().wait();
+							const auto bytes = map_buffer(data, 0, data.length);
+							const unsigned unit = format == 0x92 ? 2 : 4;
+							for (unsigned y = 0; y < side; ++y)
+								for (unsigned x = 0; x < side; ++x)
+								{
+									const unsigned part = owner(x, y);
+									const unsigned expected = format == 0x92 ? (part == 2 ? vm_word : part * 65535) :
+										std::bit_cast<unsigned>(part < 2 ? native_depth(part) :
+											format == 0x90 ? float(vm_word >> 8) / 16777215.f : .5f);
+									unsigned actual = 0;
+									std::memcpy(&actual, bytes.data() + y * 256 + x * unit, unit);
+									require(actual == expected, "Stored RTT ring changed the winning depth word");
+									++depth_words;
+									if (stencil)
+									{
+										require(bytes[256 * side + y * 256 + x] == std::byte(part < 2 ? 63 + part : 42),
+											"Stored RTT ring changed the winning stencil byte");
+										++stencil_bytes;
+									}
+								}
+						}
+						for (const auto point : {std::array{0u, 0u}, std::array{side - 1, side - 1}, std::array{side / 2, 0u}})
+						{
+							const unsigned part = owner(point[0], point[1]);
+							const color coord{(float(point[0]) - .5f) / extent, (float(point[1]) - .5f) / extent, 0, 1};
+							if (depth)
+							{
+								const float value = part < 2 ? native_depth(part) : format == 0x92 ? 32768.f / 65535 :
+									format == 0x90 ? float(vm_word >> 8) / 16777215.f : .5f;
+								sample(image, r, coord, {value, value, value, value});
+							}
+							else
+							{
+								const std::array<color, 3> colors{{{16.f / 255, 48.f / 255, 80.f / 255, 1},
+									{128.f / 255, 144.f / 255, 160.f / 255, 1}, {32.f / 255, 64.f / 255, 96.f / 255, 1}}};
+								sample(image, r, coord, colors[part]);
+							}
+						}
+						const auto reads = ram->reads;
+						const auto allocations = ledger->statistics().created;
+						const auto warm = textures.resolve_versioned(pixels, surfaces);
+						require(warm.image.texture == image.texture && warm.revision.current() && ram->reads == reads &&
+							ledger->statistics().created == allocations && ram->bytes == original,
+							"Warm stored RTT ring recaptured pixels, allocated or changed VM");
+						ram->forbidden.clear();
+						++profiles;
+					}
+				}
+		std::cout << (morton ? "Morton" : "Linear") << " stored border RTT: " << profiles << " full/partial native profiles, "
+			<< cases - first << " samples, " << depth_words << " exact depth words, " << stencil_bytes
+			<< " exact stencil bytes, " << hole_bytes << " active VM hole bytes, immutable warm reuse passed\n";
+	}
+	void stored_border_adjusted_pitch_cases()
+	{
+		const auto first = cases;
+		unsigned profiles = 0, refusals = 0;
+		std::size_t vm_holes = 0;
+		for (unsigned format : {0x85u, 0x90u, 0x91u, 0x92u, 0x93u})
+			for (unsigned mode : {0u, 1u, 2u})
+			{
+				@autoreleasepool
+				{
+					const unsigned width = mode == 0 ? 3 : mode == 1 ? 5 : 1;
+					const unsigned height = mode == 0 ? 4 : 1;
+					const unsigned columns = width + 2, rows = height + 2;
+					const auto codec = describe_guest_texture_format(format);
+					const unsigned bpp = codec.block.bytes, pitch = columns * bpp + (mode != 1);
+					auto r = words(format, vertex_texture_dimension::two, true,
+						mode == 1 ? width : 9, mode == 1 ? 7 : height, 1, mode == 2 ? 4 : 1);
+					r.format &= ~8u;
+					r.address = (7u << 28) | 0x040404;
+					r.control3 = (1u << 20) | (mode == 1 ? 0 : pitch);
+					const auto plan = plan_guest_texture(r);
+					const auto& level = plan.subresources.front();
+					require(plan.adjusted_pitch && plan.width == width && plan.height == height &&
+						plan.mips == 1 && level.row_pitch == pitch && level.storage_rows == rows &&
+						plan.storage_bytes == pitch * rows, "Adjusted stored ring has inconsistent geometry or byte bounds");
+					const auto raw = [&](unsigned x, unsigned y)
+					{
+						const bool high = (x + y) % 2;
+						switch (format)
+						{
+						case 0x90: return high ? 0xc0000034u : 0x40000017u;
+						case 0x91: return high ? 0x7e800034u : 0x7d000017u;
+						case 0x92: return high ? 0xc000u : 0x4000u;
+						case 0x93: return high ? 0x6800u : 0x5000u;
+						default: return 0xff000000u | ((16 + 16 * x + 4 * y) << 16) | 0x4050u;
+						}
+					};
+					const auto expected = [&](unsigned x, unsigned y) -> color
+					{
+						const unsigned word = raw(x, y);
+						if (!codec.depth)
+							return {float((word >> 16) & 255) / 255, 64.f / 255, 80.f / 255, 1};
+						const float depth = format == 0x90 ? float(word >> 8) / 16777215.f :
+							format == 0x92 ? float(word) / 65535.f : (x + y) % 2 ? .75f : .25f;
+						return {depth, depth, depth, depth};
+					};
+					ram->bytes.assign(pitch * rows, std::byte{0xbd});
+					for (unsigned y = 0; y < rows; ++y)
+						for (unsigned x = 0; x < columns; ++x)
+							for (unsigned byte = 0; byte < bpp; ++byte)
+								ram->bytes[y * pitch + x * bpp + byte] = std::byte(raw(x, y) >> (8 * (bpp - 1 - byte)));
+					++ram->version;
+					const auto original = ram->bytes;
+					const auto image = resolver.resolve(r);
+					require(image.metadata.stored_border_extent == std::array{width, height} &&
+						image.texture.width == columns && image.texture.height == rows && image.texture.mipmapLevelCount == 1,
+						"Adjusted stored ring lost its effective extent");
+					const float right = (width - .5f) / width, bottom = (height - .5f) / height;
+					sample(image, r, {right, bottom, 0, 1}, expected(width, height), 47, 0);
+					sample(image, r, {8, 8, 0, 1}, expected(width + 1, height + 1));
+					auto pixels = r;
+					pixels.format |= 0x40u << 8;
+					sample(resolver.resolve(pixels), pixels, {2 * width - 1.f, 2 * height - 1.f, 0, 2}, expected(width, height), 24);
+					auto edge = r;
+					edge.address = (edge.address & ~0xffffu) | 0x0303;
+					sample(image, edge, {8, 8, 0, 1}, expected(width, height));
+					require(ram->bytes == original, "Adjusted stored ring upload changed guest storage");
+
+					const cpu_capture_dispatch capture = [](const auto& work) { work(); };
+					context gpu{1};
+					auto ledger = std::make_shared<heap_budget>(gpu, 8u << 20);
+					gpu.set_buffer_budget(ledger);
+					surface_cache surfaces(gpu, ram, 8u << 20, ledger, capture);
+					guest_texture_cache textures(gpu, ram, [](unsigned offset, unsigned, std::size_t) { return 0x1000 + offset - 0x200; },
+						1u << 20, ledger, 64, {capture, std::make_shared<io_mapping_epoch>()});
+					const auto old = textures.resolve_versioned(r, surfaces);
+					const unsigned corner = 0x1000 + (rows - 1) * pitch + (columns - 1) * bpp;
+					const surface_format sf = codec.depth ? surface_format{*codec.depth} : surface_format{surface_color::argb8};
+					const auto source = surfaces.acquire({corner, {1, 1, 1, sf, false}, bpp, {}});
+					if (codec.depth)
+					{
+						surfaces.prepare(source, surface_initialization::background);
+						const std::array uses{cached_surface_use{source, true}};
+						surfaces.draw(uses, [&](context& commands, auto images)
+						{
+							auto pass = [MTL4RenderPassDescriptor new];
+							pass.depthAttachment.texture = images[0];
+							pass.depthAttachment.loadAction = MTLLoadActionClear;
+							pass.depthAttachment.storeAction = MTLStoreActionStore;
+							pass.depthAttachment.clearDepth = 1;
+							(void)commands.render(pass);
+						});
+					}
+					else
+						surfaces.clear(source, 0xf0, 0xff1070b0, 0, 255, {0, 0, 1, 1});
+					ram->forbidden.push_back({corner, bpp});
+					const auto batch = textures.resolve_versioned_batch(std::array{r, pixels}, surfaces);
+					const auto& fresh = batch[0].image;
+					const auto holes = (columns * rows - 1) * bpp;
+					require(fresh.texture != old.image.texture && fresh.texture == batch[1].image.texture &&
+						fresh.metadata.stored_border_extent == std::array{width, height} && textures.statistics().assembly_vm_bytes == holes,
+						"Adjusted stored ring did not coalesce native corner and VM pixels");
+					const color new_corner = codec.depth ? color{1, 1, 1, 1} : color{16.f / 255, 112.f / 255, 176.f / 255, 1};
+					sample(fresh, r, {8, 8, 0, 1}, new_corner);
+					sample(batch[1].image, pixels, {width + 4.f, height + 4.f, 0, 1}, new_corner);
+					sample(fresh, r, {right, bottom, 0, 1}, expected(width, height));
+					sample(old.image, r, {8, 8, 0, 1}, expected(width + 1, height + 1));
+					const auto reads = ram->reads;
+					require(textures.resolve_versioned(r, surfaces).image.texture == fresh.texture &&
+						ram->reads == reads && ram->bytes == original, "Adjusted stored ring lost warm reuse or changed VM");
+					ram->forbidden.clear();
+					vm_holes += holes;
+					++profiles;
+
+					auto invalid = r;
+					invalid.control3 = (1u << 20) | (3 * bpp - 1);
+					const auto translations = translated;
+					bool refused = false;
+					try { (void)resolver.resolve(invalid); }
+					catch (const std::invalid_argument&) { refused = true; }
+					require(refused && translated == translations && ram->reads == reads,
+						"Incomplete adjusted ring accessed VM");
+					++refusals;
+				}
+			}
+		std::cout << "Adjusted stored border: " << profiles << " color/depth profiles, " << cases - first
+			<< " native samples, " << vm_holes << " active RTT hole bytes, " << refusals
+			<< " early refusals, warm and old versions preserved\n";
+	}
 	void all()
 	{
 		struct test
@@ -943,6 +3110,22 @@ fragment float4 deep_atlas_color(float4 p [[position]]) {const float f=as_type<f
 			sample(realize_without_vm(captured),r,{.0625f,.9375f,0,1},t.expected);
 		}
 		std::cout << "54 independent odd-byte-pitch guest texture draws:all27formats,8x8 lower corners,BC/packed/depth/endian,owned capture/realize and VM preservation passed\n";
+		const auto adjusted_begin=cases;
+		for(const auto& t:tests)for(bool zero:{false,true})
+		{
+			auto r=words(t.format,vertex_texture_dimension::two,true,12,4);
+			const auto codec=describe_guest_texture_format(t.format);
+			const unsigned columns=4/codec.block.width;
+			const unsigned pitch=columns*codec.block.bytes;
+			r.control3=1u<<20 | (zero?0u:pitch+(codec.block.bytes>1));
+			const auto plan=plan_guest_texture(r);
+			require(plan.adjusted_pitch&&plan.width==(zero?12u:4u)&&plan.height==(zero?1u:4u),"Adjusted codec geometry differs");
+			fill(plan,t.bytes);
+			const auto original=ram->bytes;
+			sample(resolver.resolve(r),r,{.5f/plan.width,.875f,0,1},t.expected);
+			require(ram->bytes==original,"Adjusted codec changed VM or padding");
+		}
+		std::cout<<"Adjusted pitch codec draws:"<<cases-adjusted_begin<<" across all 27 codecs with zero and short pitch passed\n";
 		for (auto dimension : {vertex_texture_dimension::one, vertex_texture_dimension::two, vertex_texture_dimension::three, vertex_texture_dimension::cube})
 			for (bool linear : {true, false})
 			{
@@ -992,9 +3175,12 @@ fragment float4 deep_atlas_color(float4 p [[position]]) {const float f=as_type<f
 		{
 			auto r = words(0x85);
 			if (invalid == 0)
+			{
 				r.format &= ~8u;
+				r.address = (r.address & ~15u) | 1u;
+			}
 			if (invalid == 1)
-				r.control3 &= ~0xfffffu;
+				r.control3 = (r.control3 & ~0xfffffu) | 3u; // Less than one ARGB8 block.
 			if (invalid == 2)
 			{
 				r = words(0x85, vertex_texture_dimension::two, false, 3, 4);
@@ -1035,6 +3221,60 @@ fragment float4 deep_atlas_color(float4 p [[position]]) {const float f=as_type<f
 		ram->conflict = false;
 		std::cout << cases << " native guest-address/layout/VM->texture->RSX draws:27formats,linear/Morton,1D/2D/3D/cube,mips,endian/depth/packed/BC,VM-preservation and revision conflict passed\n";
 	}
+	void conversion_dependencies()
+	{
+		const auto first = cases;
+		const color argb{23.f / 255, 61.f / 255, 97.f / 255, 1};
+		auto mipmapped = words(0x85, vertex_texture_dimension::two, true, 4, 4, 1, 3);
+		fill(plan_guest_texture(mipmapped), {255, 23, 61, 97});
+		const auto before = ctx.encoding_statistics();
+		const auto image = resolver.resolve(mipmapped);
+		const auto after = ctx.encoding_statistics();
+		require(after.checked_dispatches - before.checked_dispatches == 3 &&
+			after.dispatch_barriers - before.dispatch_barriers == 2 &&
+			after.dispatch_to_blit_barriers - before.dispatch_to_blit_barriers == 3 &&
+			after.blit_to_dispatch_barriers - before.blit_to_dispatch_barriers == 2 &&
+			after.checked_blit_raw_transitions == before.checked_blit_raw_transitions,
+			"Mip scratch reuse did not track both directions of the blit/dispatch dependency");
+		for (unsigned mip = 0; mip < 3; ++mip)
+			sample(image, mipmapped, {.5f, .5f, 0, 1}, argb, 47, mip);
+
+		auto vtc = words(0x86, vertex_texture_dimension::three, true, 8, 8, 4);
+		vtc.control3 = (4u << 20) | 16u;
+		fill(plan_guest_texture(vtc), {0, 0xf8, 0, 0, 0, 0, 0, 0});
+		const auto vtc_before = ctx.encoding_statistics();
+		const auto decoded = resolver.resolve(vtc);
+		const auto vtc_after = ctx.encoding_statistics();
+		require(vtc_after.checked_dispatches - vtc_before.checked_dispatches == 2 &&
+			vtc_after.blit_to_dispatch_barriers - vtc_before.blit_to_dispatch_barriers == 1 &&
+			vtc_after.dispatch_to_blit_barriers - vtc_before.dispatch_to_blit_barriers == 1 &&
+			vtc_after.checked_blit_raw_transitions == vtc_before.checked_blit_raw_transitions,
+			"VTC gather and hardware decode did not share checked stage dependencies");
+		sample(decoded, vtc, {.5f, .5f, .625f, 1}, {1, 0, 0, 1});
+
+		context gpu{1};
+		auto ledger = std::make_shared<heap_budget>(gpu, 8u << 20);
+		gpu.set_buffer_budget(ledger);
+		guest_texture_resolver uploads(gpu, ram, [](unsigned, unsigned, std::size_t) { return 0x1000; }, 1u << 20, ledger);
+		const auto single = words(0x85);
+		std::vector<captured_guest_texture> snapshots;
+		for (unsigned red : {37u, 123u})
+		{
+			fill(plan_guest_texture(single), {255, red, 61, 97});
+			snapshots.push_back(uploads.capture(single));
+		}
+		const auto images = uploads.enqueue_uploads(snapshots).finish();
+		const auto batch = gpu.encoding_statistics();
+		require(batch.compute_encoders == 1 && batch.checked_dispatches == 2 && batch.dispatch_barriers == 0 &&
+			batch.dispatch_barriers_elided == 2 && batch.dispatch_to_blit_barriers == 2 &&
+			batch.blit_to_dispatch_barriers == 0 && batch.dispatch_queue_barriers == 1 && batch.texture_blit_queue_barriers == 1,
+			"Independent conversions introduced an unnecessary dispatch dependency");
+		sample(images[0], single, {.5f, .5f, 0, 1}, {37.f / 255, 61.f / 255, 97.f / 255, 1});
+		sample(images[1], single, {.5f, .5f, 0, 1}, {123.f / 255, 61.f / 255, 97.f / 255, 1});
+		std::cout << "Checked native texture conversions: " << cases - first
+			<< " exact samples, three mip dispatches, VTC gather/decode, two independent batch dispatches without intra-pass waits passed\n";
+	}
+
 	void upload_work_cases()
 	{
 		struct profile { unsigned format; vertex_texture_dimension dimension; unsigned width, height, depth, mips; bool linear, odd, staged; unsigned direct; };
@@ -1083,7 +3323,7 @@ fragment float4 deep_atlas_color(float4 p [[position]]) {const float f=as_type<f
 				{
 					const auto bx = plan.codec.conversion >= 2 ? x / 2 : x;
 					std::size_t address = sub.offset + (z * sub.storage_rows + y) * sub.row_pitch + bx * plan.codec.block.bytes;
-					if (plan.swizzled && plan.codec.block.width == 1)
+					if (plan.swizzled && plan.codec.block.height == 1)
 						address = sub.offset + morton_index({bx,y,z},{unsigned(std::bit_width(sub.columns)-1),unsigned(std::bit_width(sub.rows)-1),unsigned(std::bit_width(sub.depth)-1)}) * plan.codec.block.bytes;
 					std::array<std::byte,16> expected{};
 					const auto byte = [&](unsigned lane) { return std::to_integer<unsigned>(original[address + lane]); };
@@ -1178,7 +3418,7 @@ fragment float4 deep_atlas_color(float4 p [[position]]) {const float f=as_type<f
 				for (std::size_t z = 0; z < sub.depth; ++z) for (std::size_t y = 0; y < sub.rows; ++y) for (std::size_t x = 0; x < sub.columns; ++x)
 				{
 					auto address = sub.offset + (z * sub.storage_rows + y) * sub.row_pitch + x * plan.codec.block.bytes;
-					if (plan.swizzled && plan.codec.block.width == 1)
+					if (plan.swizzled && plan.codec.block.height == 1)
 						address = sub.offset + morton_index({x,y,z},{unsigned(std::bit_width(sub.columns)-1),unsigned(std::bit_width(sub.rows)-1),unsigned(std::bit_width(sub.depth)-1)}) * plan.codec.block.bytes;
 					for (unsigned b = 0; b < plan.codec.block.bytes; ++b)
 					{
@@ -1835,6 +4075,147 @@ fragment float4 deep_atlas_color(float4 p [[position]]) {const float f=as_type<f
 		(void)batch_ctx.trim_upload_pages();
 		std::cout << profiles << " batched GPU-only typeless RTT profiles and " << comparisons << " bit-exact native plane comparisons and " << draws << " independent RSX sampler draws:18source/22target formats,linear different-BPP/Morton equal-BPP,crops,1/2/4samples,four requests share one cast/submit,UN metadata,target maps,VM poison,no pixel reads/writeback,revision mutation,spill and destroyed-cache ownership passed\n";
 	}
+	void packed_depth_color_filtering()
+	{
+		const auto translate = [](unsigned, unsigned, std::size_t) { return 0x1000u; };
+		constexpr std::array<std::uint32_t, 2> clears{0x23456738, 0x9abcde72};
+		const auto byte = [](std::uint32_t word, unsigned shift) { return float((word >> shift) & 255) / 255; };
+		for (const auto depth : {surface_depth::z24s8_uint, surface_depth::z24s8_float})
+		for (const unsigned samples : {1u, 2u, 4u})
+		{
+			context gpu{1};
+			auto budget = std::make_shared<heap_budget>(gpu, 4 << 20);
+			gpu.set_buffer_budget(budget);
+			surface_cache surfaces(gpu, ram, 4 << 20, budget);
+			guest_texture_cache textures(gpu, ram, translate, 1 << 20, budget);
+			guest_texture_cache batched(gpu, ram, translate, 1 << 20, budget);
+			auto r = words(0x85);
+			const auto plan = plan_guest_texture(r);
+			fill(plan, {0, 0, 0, 0});
+			for (const unsigned format : {0x85u, 0x9eu})
+				require(textures.resolve(words(format)).metadata.linear_filtering, "Ordinary VM color lost linear filtering");
+			const auto factors = samples == 1 ? sample_layout{1, 1} : rsx_sample_layout(samples);
+			const auto width = 4u / factors.x, height = 4u / factors.y;
+			const auto source = surfaces.acquire({0x1000, {width, height, samples, depth, false}, plan.subresources[0].row_pitch, {}});
+			surfaces.clear(source, 3, 0, clears[0], 255, {0, 0, width, height});
+			surfaces.clear(source, 3, 0, clears[1], 255, {width / 2, 0, width / 2, height});
+			const auto reads = ram->reads;
+			const auto revision = ram->version;
+			for (const unsigned format : {0x85u, 0x9eu})
+			{
+				r = words(format);
+				r.filter = (2u << 24) | (2u << 16);
+				const auto first = textures.resolve(r, surfaces);
+				const auto warm = textures.resolve(r, surfaces);
+				const auto deferred = batched.resolve_versioned_batch(std::array{r}, surfaces).front().image;
+				require(first.texture == warm.texture && textures.statistics().casts_reused != 0,
+					"Packed depth color cache did not reuse the native cast");
+				for (const auto& image : {first, warm, deferred})
+				{
+					const texture_state_overrides overrides{.anisotropy = 8};
+					for (unsigned i = 0; i < clears.size(); ++i)
+					{
+						auto packed = clears[i];
+						if (depth == surface_depth::z24s8_float)
+							packed = ((std::bit_cast<std::uint32_t>(float(packed >> 8) / 16777215.f) >> 7) << 8) | (packed & 255);
+						sample(image, r, {i ? .51f : .49f, .375f, 0, 1},
+							{byte(packed, 16), byte(packed, 8), byte(packed, 0), format == 0x85 ? byte(packed, 24) : 1.f},
+							23, 0, nullptr, 0, overrides);
+					}
+					const auto state = decode_fragment_texture_state(r, image.metadata, {.anisotropy = 8});
+					const auto sampler = resolve_sampler(state.sampler, state.policy);
+					require(sampler.min_filter == MTLSamplerMinMagFilterNearest &&
+						sampler.mag_filter == MTLSamplerMinMagFilterNearest && sampler.anisotropy == 1,
+						"Packed depth color retained interpolation");
+				}
+			}
+			require(ram->reads == reads && ram->version == revision && surfaces.status(source).dirty,
+				"Packed depth color read or wrote guest pixels");
+		}
+		std::cout << "Packed D24S8 color point filtering: 72 native draws, integer/float depth, 1/2/4 source samples, ARGB8/XRGB8, cold/warm/batched, no surface VM transfer\n";
+	}
+	void redirected_depth_shader()
+	{
+		const auto translate = [](unsigned offset, unsigned, std::size_t) { return 0x1000u + offset - 0x200u; };
+		constexpr std::array<std::uint32_t, 2> clears{0x23456738, 0x9abcde72};
+		const auto expected = [](std::uint32_t value, surface_depth depth, unsigned format)
+		{
+			if (depth == surface_depth::z24s8_float)
+				value = ((std::bit_cast<std::uint32_t>(float(value >> 8) / 16777215.f) >> 7) << 8) | (value & 255);
+			const auto byte = [&](unsigned shift) { return float((value >> shift) & 255) / 255; };
+			return color{byte(16), byte(8), byte(0), format == 0x85 ? byte(24) : 1.f};
+		};
+		const auto before = cases;
+		for (const auto depth : {surface_depth::z24s8_uint, surface_depth::z24s8_float})
+		for (const unsigned samples : {1u, 2u, 4u})
+		{
+			context gpu{1};
+			auto budget = std::make_shared<heap_budget>(gpu, 4 << 20);
+			gpu.set_buffer_budget(budget);
+			surface_cache surfaces(gpu, ram, 4 << 20, budget);
+			guest_texture_cache textures(gpu, ram, translate, 1 << 20, budget);
+			auto r = words(0x85);
+			const auto plan = plan_guest_texture(r);
+			const auto factors = samples == 1 ? sample_layout{1, 1} : rsx_sample_layout(samples);
+			const auto width = 4u / factors.x, height = 4u / factors.y;
+			const auto source = surfaces.acquire({0x1000, {width, height, samples, depth, false}, plan.subresources[0].row_pitch, {}});
+			surfaces.clear(source, 3, 0, clears[0], 255, {0, 0, width, height});
+			surfaces.clear(source, 3, 0, clears[1], 255, {width / 2, 0, width / 2, height});
+			const auto reads = ram->reads;
+			const auto revision = ram->version;
+			for (const unsigned format : {0x85u, 0x9eu})
+			{
+				r = words(format);
+				r.filter = (2u << 24) | (2u << 16);
+				const auto resolve = [&](auto regs)
+				{
+					return textures.prepare_versioned_batch(std::array{regs}, surfaces, {}, {}, texture_upload_path::separate, 1).finish().front().image;
+				};
+				const auto image = resolve(r);
+				const auto warm = resolve(r);
+				require(image.metadata.depth && image.metadata.depth_float == (depth == surface_depth::z24s8_float) &&
+					image.texture.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 && image.texture == warm.texture &&
+					textures.statistics().casts_created == 0,
+					"Draw-only redirected depth did not retain and reuse its original native snapshot");
+				for (unsigned opcode : {23u, 24u, 25u, 47u, 49u})
+					for (unsigned i = 0; i < clears.size(); ++i)
+					{
+						const auto x = i ? .51f : .49f;
+						const color coords = opcode == 24 ? color{2 * x, .75f, 0, 2} : color{x, .375f, 0, 1};
+						sample(image, r, coords, expected(clears[i], depth, format), opcode, 2, nullptr, 0, {.anisotropy = 8});
+					}
+				const auto first = expected(clears[0], depth, format);
+				const auto second = expected(clears[1], depth, format);
+				const color border{32.f / 255, 64.f / 255, 128.f / 255, 16.f / 255};
+				r.border_color = 0x10204080;
+				for (const auto& [wrap, x, value] : {std::tuple{1u, -0.25f, second}, std::tuple{2u, -0.25f, first},
+					std::tuple{3u, -0.75f, first}, std::tuple{4u, -0.25f, border}, std::tuple{5u, -0.75f, first},
+					std::tuple{6u, -0.75f, second}, std::tuple{7u, -1.25f, second}, std::tuple{8u, -1.25f, second}})
+				{
+					r.address = (r.address & ~15u) | wrap;
+					sample(image, r, {x, .375f, 0, 1}, value);
+				}
+				r = words(format);
+				r.control1 = 0x921b; // RGBA output selects zero, one, A, B.
+				sample(image, r, {.25f, .375f, 0, 1}, {0, 1, first[3], first[2]});
+				r = words(format);
+				r.format |= 0x40u << 8;
+				sample(resolve(r), r, {2, 1, 0, 1}, second);
+				r = words(format);
+				r.offset += 4;
+				r.image_rect = (2u << 16) | 4u;
+				const auto crop = resolve(r);
+				require(crop.metadata.depth && crop.texture.width == 2 && textures.statistics().casts_created == 0,
+					"Aligned redirected depth crop did not retain both source planes");
+				sample(crop, r, {.25f, .375f, 0, 1}, first);
+				sample(crop, r, {.75f, .375f, 0, 1}, second);
+			}
+			require(ram->reads == reads && ram->version == revision && surfaces.status(source).dirty,
+				"Redirected depth shader read or wrote guest pixels");
+		}
+		std::cout << "Redirected D24S8 shader: " << cases - before
+			<< " native draws, paired plane reads, TEX/TXP/TXD/TXL/TXB, remap, eight wrap modes, pixel coordinates and aligned crops, no cast or VM transfer\n";
+	}
 	void surface_alias_cases()
 	{
 		const auto translate = [](unsigned, unsigned, std::size_t)
@@ -1983,8 +4364,8 @@ fragment float4 deep_atlas_color(float4 p [[position]]) {const float f=as_type<f
 					guest_texture_cache deferred_textures(ctx, ram, [](unsigned, unsigned, std::size_t)
 														  { return 0x2000u; }, 1 << 20, budget);
 					deferred = deferred_textures.resolve(r, surfaces);
-					require(surfaces.status(destination).deferred_copies == 0 && surfaces.status(destination).dirty && ram->reads == reads,
-							"Deferred surface texture source read stale VM or failed to materialize its GPU epoch");
+					require(surfaces.status(destination).deferred_copies == 1 && !surfaces.status(destination).initialized && ram->reads == reads,
+							"Deferred surface texture source read stale VM or materialized its destination");
 					clear_native({1, 1, 1, 1}, .75f);
 					surfaces.spill(target_surface);
 					second = textures.resolve(r, surfaces);
@@ -2341,23 +4722,41 @@ fragment float4 deep_atlas_color(float4 p [[position]]) {const float f=as_type<f
 			}
 		std::cout << draws << " native clean surface CPU-revision/fallback/hit/refresh/immutable-old-epoch draws passed\n";
 	}
-	void region_alias_cases()
+	enum class region_source { resident, spilled, native_spilled, deferred };
+	void region_alias_cases(region_source input = region_source::resident)
 	{
-		unsigned draws = 0;
+		const bool native_spilled = input == region_source::native_spilled;
+		const bool spilled = input == region_source::spilled || native_spilled;
+		const bool deferred = input == region_source::deferred;
+		std::optional<context> upload_context;
+		std::shared_ptr<heap_budget> upload_budget;
+		if (spilled || deferred)
+		{
+			upload_context.emplace(1);
+			upload_budget = std::make_shared<heap_budget>(*upload_context, 8u << 20);
+			upload_context->set_buffer_budget(upload_budget);
+		}
+		auto& gpu = upload_context ? *upload_context : ctx;
+		unsigned draws = 0, async_regions = 0, lifetime_cases = 0, native_regions = 0;
 		for (const unsigned samples : {1u, 2u, 4u})
-		for (unsigned format : {0x81u, 0x84u, 0x85u, 0x8bu, 0x9au, 0x9bu, 0x9cu, 0x90u, 0x91u, 0x92u, 0x93u})
-			for (unsigned storage_case : {0u, 1u, 2u, 3u})
+		for (unsigned format : {0x81u, 0x82u, 0x84u, 0x85u, 0x8bu, 0x9au, 0x9bu, 0x9cu, 0x90u, 0x91u, 0x92u, 0x93u})
+			for (unsigned storage_case : {0u, 1u, 2u, 3u, 4u})
 			{
-				const bool linear = storage_case == 0;
+				if ((native_spilled && samples == 1) || (format == 0x82 && !native_spilled)) continue;
+				if (storage_case == 4 && (!native_spilled || format != 0x85)) continue;
+				const bool direct_spill = native_spilled &&
+					(format == 0x81 || format == 0x82 || format == 0x84 || format == 0x85 || format == 0x8b ||
+					 format == 0x9a || format == 0x9b || format == 0x9c || format == 0x92);
+				const bool linear = storage_case == 0 || storage_case == 4;
 				const unsigned source_width = storage_case == 2 ? 4 : 8;
 				const std::array<std::size_t, 3> storage{source_width, 8, storage_case == 3 ? 2u : 1u};
 				const auto source_words = words(format, vertex_texture_dimension::two, linear, source_width, 8);
 				const auto plan = plan_guest_texture(source_words);
 				fill(plan, std::vector<unsigned>(plan.codec.block.bytes, 0));
 				ram->bytes.resize((linear ? plan.storage_bytes : storage[0] * storage[1] * storage[2] * plan.codec.block.bytes), std::byte{0});
-				auto budget = std::make_shared<heap_budget>(ctx, 8 << 20);
-				surface_cache surfaces(ctx, ram, 8 << 20, budget);
-				guest_texture_cache textures(ctx, ram, [](unsigned offset, unsigned, std::size_t)
+				auto budget = upload_context ? upload_budget : std::make_shared<heap_budget>(gpu, 8 << 20);
+				surface_cache surfaces(gpu, ram, 8 << 20, budget);
+				guest_texture_cache textures(gpu, ram, [](unsigned offset, unsigned, std::size_t)
 											 { return 0x1000u + offset - 0x200; }, 1 << 20, budget);
 				const auto color_format = [&]() -> surface_color
 				{
@@ -2365,10 +4764,12 @@ fragment float4 deep_atlas_color(float4 p [[position]]) {const float f=as_type<f
 					{
 					case 0x81:
 						return surface_color::b8;
+					case 0x82:
+						return surface_color::x1rgb5_one;
 					case 0x84:
 						return surface_color::rgb565;
 					case 0x85:
-						return surface_color::argb8;
+						return storage_case == 4 ? surface_color::abgr8 : surface_color::argb8;
 					case 0x8b:
 						return surface_color::gb8;
 					case 0x9a:
@@ -2388,6 +4789,14 @@ fragment float4 deep_atlas_color(float4 p [[position]]) {const float f=as_type<f
 				description.allocation.height /= factors.y;
 				description.allocation.samples = samples;
 				const auto source = surfaces.acquire(description);
+				auto writer = source;
+				if (deferred)
+				{
+					ram->bytes.resize(0x1000 + ram->bytes.size());
+					auto donor = description;
+					donor.address = 0x2000;
+					writer = surfaces.acquire(donor);
+				}
 				const auto expected = [&](unsigned x, unsigned y) -> color
 				{
 					const float depth = .50123456f + x / 256.f + y / 16.f;
@@ -2395,6 +4804,8 @@ fragment float4 deep_atlas_color(float4 p [[position]]) {const float f=as_type<f
 					{
 					case 0x81:
 						return {(32 + x * 13 + y * 7) / 255.f, (32 + x * 13 + y * 7) / 255.f, (32 + x * 13 + y * 7) / 255.f, 1};
+					case 0x82:
+						return {std::floor((x + 1) / 31.f * 255) / 255, std::floor((y + 1) / 31.f * 255) / 255, std::floor((x + y + 1) / 31.f * 255) / 255, 1};
 					case 0x84:
 						return {std::floor((x + 1) / 31.f * 255) / 255, std::floor((y + 1) / 63.f * 255) / 255, std::floor((x + y + 1) / 31.f * 255) / 255, 1};
 					case 0x85:
@@ -2415,7 +4826,7 @@ fragment float4 deep_atlas_color(float4 p [[position]]) {const float f=as_type<f
 						return {depth, depth, depth, depth};
 					}
 				};
-				const auto raw = make_buffer(ctx, 2048, buffer_storage::shared), stencil = make_buffer(ctx, 2048, buffer_storage::shared);
+				const auto raw = make_buffer(gpu, 2048, buffer_storage::shared), stencil = make_buffer(gpu, 2048, buffer_storage::shared);
 				const auto put = [&](unsigned x, unsigned y, unsigned byte, unsigned value, unsigned count)
 				{
 					for (unsigned i = 0; i < count; ++i)
@@ -2431,6 +4842,9 @@ fragment float4 deep_atlas_color(float4 p [[position]]) {const float f=as_type<f
 						{
 						case 0x81:
 							put(x, y, 1, 32 + x * 13 + y * 7, 1);
+							break;
+						case 0x82:
+							put(x, y, 2, 0x8000u | ((x + 1) << 10) | ((y + 1) << 5) | (x + y + 1), 2);
 							break;
 						case 0x84:
 							put(x, y, 2, ((x + 1) << 11) | ((y + 1) << 5) | (x + y + 1), 2);
@@ -2460,7 +4874,7 @@ fragment float4 deep_atlas_color(float4 p [[position]]) {const float f=as_type<f
 						}
 						static_cast<unsigned char*>(stencil.contents)[y * 256 + x] = 42 + x + y;
 					}
-				const std::array uses{cached_surface_use{source, true}};
+				const std::array uses{cached_surface_use{writer, true}};
 				surfaces.draw(uses, [&](context& commands, auto native)
 							  {
 					texture_region whole;whole.size=MTLSizeMake(source_width,8,1);
@@ -2501,12 +4915,77 @@ fragment float4 deep_atlas_color(float4 p [[position]]) {const float f=as_type<f
 																																							   : storage_case == 3	 ? std::array<clear_rectangle, 4>{{{2, 2, 2, 2}, {6, 6, 2, 2}, {3, 5, 1, 1}, {7, 7, 1, 1}}}
 																																													 : std::array<clear_rectangle, 4>{{{2, 2, 2, 2}, {4, 6, 4, 2}, {3, 5, 1, 1}, {0, 0, 8, 8}}};
 				const auto reads = ram->reads;
+				const auto revision = ram->version;
+				if (spilled) surfaces.spill(source);
+				if (deferred)
+					surfaces.defer_copy(writer, {0, 0, description.allocation.width, description.allocation.height}, source, 0, 0);
+				const auto stays_pending = [&]
+				{
+					const auto state = surfaces.status(source);
+					return spilled ? state.spilled : state.deferred_copies == 1 && !state.initialized;
+				};
 				for (const auto rectangle : regions)
 				{
 					const auto r = input_words(rectangle);
-					const auto image = textures.resolve(r, surfaces);
-					require(image.texture.width == rectangle.width && image.texture.height == rectangle.height && ram->reads == reads,
+					resolved_fragment_texture image;
+					if (upload_context)
+					{
+						const auto before = surfaces.transaction_statistics().submitted;
+						const auto leases = surfaces.memory_statistics().leased_allocations;
+						const auto gate = [gpu.device() newSharedEvent];
+						struct unblock { id<MTLSharedEvent> event; ~unblock() { event.signaledValue = 1; } } release{gate};
+						auto pixels = r;
+						pixels.format |= 0x40u << 8;
+						const auto check_lifetime = format == 0x85 && linear && rectangle.x == 1;
+						if (check_lifetime)
+						{
+							auto canceled = textures.prepare_versioned_batch(std::array{r}, surfaces,
+								std::array{guest_texture_upload_dependency{gate, 1}}, {}, texture_upload_path::separate, native_spilled ? 1 : 0);
+							require(canceled.cancel_pending(), "Cold snapshot job could not cancel before its dependency");
+							bool rejected = false;
+							try { (void)canceled.finish(); }
+							catch (const std::runtime_error&) { rejected = true; }
+							require(rejected && stays_pending() &&
+								surfaces.transaction_statistics().submitted == before,
+								deferred ? "Cold native texture materialized its deferred source before the upload dependency" :
+									"Canceled spill job published or restored the source");
+							gpu.recover_completed_errors();
+						}
+						const bool cached = direct_spill && surfaces.snapshot_statistics().created == 1;
+						auto job = textures.prepare_versioned_batch(std::array{r, pixels}, surfaces,
+							std::array{guest_texture_upload_dependency{gate, 1}}, {}, texture_upload_path::separate, native_spilled ? 3 : 0);
+						require(job.ready() == cached && stays_pending() &&
+							surfaces.memory_statistics().leased_allocations == leases && surfaces.transaction_statistics().submitted == before,
+							deferred ? "Cold native texture materialized its deferred source before the upload dependency" :
+								"Cold native texture restored its spilled source before the upload dependency");
+						if (check_lifetime)
+						{
+							const auto reserved = budget->statistics().reserved_bytes;
+							bool timed_out = false;
+							try { (void)job.finish(std::chrono::milliseconds(1)); }
+							catch (const submission_wait_timeout&) { timed_out = true; }
+							require(timed_out && !job.ready() && budget->statistics().reserved_bytes == reserved &&
+								stays_pending(), "Timed-out snapshot job retired live storage");
+							++lifetime_cases;
+						}
+						gate.signaledValue = 1;
+						const auto ready = job.finish();
+						image = ready[0].image;
+						const auto warm = native_spilled ? textures.prepare_versioned_batch(std::array{r}, surfaces, {}, {},
+							texture_upload_path::separate, 1).finish().front() : textures.resolve_versioned(r, surfaces);
+						require(ready[0].revision.current() && ready[1].revision.current() &&
+							image.texture == ready[1].image.texture && warm.image.texture == image.texture &&
+							stays_pending() && surfaces.transaction_statistics().submitted == before && ram->version == revision,
+							"Pending native snapshot changed authority or missed immutable reuse");
+						++async_regions;
+					}
+					else
+						image = textures.resolve(r, surfaces);
+					require(image.metadata.samples == (direct_spill ? samples : 1) &&
+						image.texture.width == (direct_spill ? description.allocation.width : rectangle.width) &&
+						image.texture.height == (direct_spill ? description.allocation.height : rectangle.height) && ram->reads == reads,
 							"GPU surface subregion read VM or used incorrect native snapshot dimensions");
+					if (direct_spill) ++native_regions;
 					sample(image, r, {.5f / rectangle.width, .5f / rectangle.height, 0, 1}, expected(rectangle.x, rectangle.y));
 					sample(image, r, {1 - .5f / rectangle.width, 1 - .5f / rectangle.height, 0, 1}, expected(rectangle.x + rectangle.width - 1, rectangle.y + rectangle.height - 1));
 					draws += 2;
@@ -2514,7 +4993,8 @@ fragment float4 deep_atlas_color(float4 p [[position]]) {const float f=as_type<f
 					{
 						auto un = r;
 						un.format |= 0x40u << 8;
-						const auto pixels = textures.resolve(un, surfaces);
+						const auto pixels = native_spilled ? textures.prepare_versioned_batch(std::array{un}, surfaces, {}, {},
+							texture_upload_path::separate, 1).finish().front().image : textures.resolve(un, surfaces);
 						require(pixels.metadata.coordinates.scale == std::array<float, 3>{1.f / 3, 1.f / 2, 1}, "Cropped UN metadata used the containing surface dimensions");
 						sample(pixels, un, {.5f, .5f, 0, 1}, expected(rectangle.x, rectangle.y));
 						++draws;
@@ -2523,11 +5003,22 @@ fragment float4 deep_atlas_color(float4 p [[position]]) {const float f=as_type<f
 					// This detects guest float-codec quantization and any sample-coordinate mixup.
 					const auto plane = plan.codec.depth ? texture_plane::depth : texture_plane::all;
 					const auto native_bytes = storage_block(image.texture.pixelFormat, plane).bytes;
-					const auto copied = make_buffer(ctx, 256 * rectangle.height, buffer_storage::shared);
+					const auto copied = make_buffer(gpu, 256 * rectangle.height, buffer_storage::shared);
 					texture_region copied_region;copied_region.size = MTLSizeMake(rectangle.width, rectangle.height, 1);
-					ctx.begin();
-					texture_to_buffer(ctx, image.texture, copied_region, copied, 0, 256, 0, plane);
-					ctx.submit().wait();
+					gpu.begin();
+					auto copy_source = image.texture;
+					if (direct_spill)
+					{
+						auto descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:image.texture.pixelFormat
+							width:rectangle.width height:rectangle.height mipmapped:NO];
+						descriptor.storageMode = MTLStorageModePrivate;
+						descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView;
+						copy_source = make_texture(gpu, descriptor);
+						sample_transfer transfer(gpu);
+						transfer.expand_region(gpu, image.texture, copy_source, {rectangle.x, rectangle.y});
+					}
+					texture_to_buffer(gpu, copy_source, copied_region, copied, 0, 256, 0, plane);
+					gpu.submit().wait();
 					for (unsigned y = 0; y < rectangle.height; ++y)
 						for (unsigned x = 0; x < rectangle.width; ++x)
 							require(std::memcmp(static_cast<const std::byte*>(copied.contents) + y * 256 + x * native_bytes,
@@ -2535,17 +5026,18 @@ fragment float4 deep_atlas_color(float4 p [[position]]) {const float f=as_type<f
 								native_bytes) == 0, "Native MSAA/region snapshot changed a native sample word");
 					if (image.texture.pixelFormat == MTLPixelFormatDepth32Float_Stencil8)
 					{
-						const auto out = make_buffer(ctx, 256 * rectangle.height, buffer_storage::shared);
+						const auto out = make_buffer(gpu, 256 * rectangle.height, buffer_storage::shared);
 						texture_region whole;
 						whole.size = MTLSizeMake(rectangle.width, rectangle.height, 1);
-						ctx.begin();
-						texture_to_buffer(ctx, image.texture, whole, out, 0, 256, 0, texture_plane::stencil);
-						ctx.submit().wait();
+						gpu.begin();
+						texture_to_buffer(gpu, image.texture, whole, out, 0, 256, 0, texture_plane::stencil);
+						gpu.submit().wait();
 						for (unsigned y = 0; y < rectangle.height; ++y)
 							for (unsigned x = 0; x < rectangle.width; ++x)
 								require(static_cast<const unsigned char*>(out.contents)[y * 256 + x] == 42 + rectangle.x + x + rectangle.y + y, "Native partial depth copy lost or rebased source stencil incorrectly");
 					}
 				}
+				if (upload_context) continue;
 				bool refused = false;
 				auto invalid = input_words(linear ? clear_rectangle{0, 0, 2, 2} : clear_rectangle{0, 0, 2, 4});
 				if (linear)
@@ -2560,9 +5052,78 @@ fragment float4 deep_atlas_color(float4 p [[position]]) {const float f=as_type<f
 				}
 				require(refused && ram->reads == reads, "Incompatible pitch/Morton bit sequence fell back to stale VM data");
 			}
-		std::cout << draws << " patterned native partial surface RSX draws: eleven formats, 1/2/4 samples, linear address/pitch and Morton axis/carry/volume-slice mapping, cropped dimensions and depth stencil regions passed\n";
+		std::cout << draws << " patterned native partial surface RSX draws: "
+			<< (native_spilled ? "twelve formats, 2/4 samples" : "eleven formats, 1/2/4 samples")
+			<< ", linear address/pitch and Morton axis/carry/volume-slice mapping, cropped dimensions and depth stencil regions passed\n";
+		if (native_spilled)
+			std::cout << "Native MSAA spill snapshots: " << native_regions << " native windows and " << async_regions - native_regions
+				<< " raw float windows, exact sample words and warm reuse, " << lifetime_cases << " cancellation/timeout/retry groups\n";
+		else if (upload_context)
+			std::cout << (spilled ? "Cold raw spill snapshots: " : "Cold deferred snapshots: ") << async_regions
+				<< " event-gated crops, exact native planes, no surface preparation submission, VM pixel read or revision change, "
+				<< lifetime_cases << " cancellation/timeout/retry groups\n";
 	}
-	void multisample_snapshot_cases()
+	void deferred_snapshot_epochs()
+	{
+		context gpu{2};
+		auto budget = std::make_shared<heap_budget>(gpu, 8u << 20);
+		gpu.set_buffer_budget(budget);
+		surface_cache surfaces(gpu, ram, 8u << 20, budget);
+		guest_texture_cache textures(gpu, ram, [](unsigned offset, unsigned, std::size_t) { return 0x1000u + offset - 0x200; },
+			1u << 20, budget);
+		ram->bytes.assign(0x3000, std::byte{0});
+		++ram->version;
+		const surface_allocation_description format{4, 4, 1, surface_color::argb8, false};
+		const auto a = surfaces.acquire({0x2000, format, 16, {}});
+		const auto b = surfaces.acquire({0x3000, format, 16, {}});
+		const auto target = surfaces.acquire({0x1000, {6, 6, 1, surface_color::argb8, false}, 24, {}});
+		surfaces.clear(a, 0xf0, 0xff101010, 0, 255, {0, 0, 4, 4});
+		surfaces.clear(a, 0xf0, 0xff204080, 0, 255, {2, 1, 2, 2});
+		surfaces.clear(b, 0xf0, 0xff806020, 0, 255, {0, 0, 4, 4});
+		surfaces.defer_copy(a, {2, 1, 2, 2}, target, 1, 2);
+		auto crop = words(0x85, vertex_texture_dimension::two, true, 2, 2);
+		crop.offset += 2 * 24 + 4;
+		crop.control3 = (1u << 20) | 24;
+		const auto original = ram->bytes;
+		const auto reads = ram->reads;
+		const auto gate = [gpu.device() newSharedEvent];
+		struct unblock { id<MTLSharedEvent> event; ~unblock() { event.signaledValue = 1; } } release{gate};
+		auto old = textures.prepare_versioned_batch(std::array{crop}, surfaces, std::array{guest_texture_upload_dependency{gate, 1}});
+		require(!old.ready() && surfaces.status(target).deferred_copies == 1, "Shifted deferred crop materialized before completion");
+		gate.signaledValue = 1;
+		gpu.wait_idle();
+		surfaces.defer_copy(b, {0, 0, 2, 2}, target, 4, 4);
+		const auto disjoint = textures.resolve_versioned(crop, surfaces);
+		require(surfaces.status(target).deferred_copies == 2 && ram->reads == reads,
+			"A later disjoint copy forced materialization of the earlier covered crop");
+		sample(disjoint.image, crop, {.25f, .25f, 0, 1}, {32.f / 255, 64.f / 255, 128.f / 255, 1});
+		surfaces.defer_copy(b, {0, 0, 2, 2}, target, 1, 2);
+		const auto latest = textures.resolve_versioned(crop, surfaces);
+		const auto frozen = old.finish()[0];
+		require(latest.image.texture != frozen.image.texture &&
+			textures.resolve_versioned(crop, surfaces).image.texture == latest.image.texture &&
+			surfaces.status(target).deferred_copies == 3 && ram->reads == reads,
+			"Older completed deferred crop displaced the newer content epoch");
+		sample(frozen.image, crop, {.25f, .25f, 0, 1}, {32.f / 255, 64.f / 255, 128.f / 255, 1});
+		sample(latest.image, crop, {.75f, .75f, 0, 1}, {128.f / 255, 96.f / 255, 32.f / 255, 1});
+		surfaces.cancel_deferred_copies(target);
+		const auto canceled = textures.resolve_versioned(crop, surfaces);
+		require(canceled.image.texture != latest.image.texture && !surfaces.status(target).initialized,
+			"Cancelled deferred crop retained native authority");
+		sample(canceled.image, crop, {.25f, .25f, 0, 1}, {0, 0, 0, 0});
+
+		surfaces.defer_copy(a, {2, 1, 2, 2}, target, 1, 2);
+		auto whole = words(0x85, vertex_texture_dimension::two, true, 6, 6);
+		whole.control3 = (1u << 20) | 24;
+		const auto uncovered = textures.resolve_versioned(whole, surfaces);
+		require(surfaces.status(target).initialized && surfaces.status(target).dirty &&
+			surfaces.status(target).deferred_copies == 0 && ram->bytes == original,
+			"Uncovered deferred request lost normal materialization or wrote guest bytes");
+		sample(uncovered.image, whole, {.25f, 2.5f / 6, 0, 1}, {32.f / 255, 64.f / 255, 128.f / 255, 1});
+		sample(uncovered.image, whole, {.5f / 6, .5f / 6, 0, 1}, {0, 0, 0, 0});
+		std::cout << "Deferred snapshot epochs: shifted donor, disjoint and replacing copies, late old completion, cancellation and uncovered fallback passed\n";
+	}
+	void multisample_snapshot_cases(bool spilled_raster = false)
 	{
 		const auto writer = compile.library(R"msl(
 #include <metal_stdlib>
@@ -2586,22 +5147,57 @@ fragment depth_sample sample_depth(float4 p [[position]],uint s [[sample_id]]) {
 		ds.frontFaceStencil = ds.backFaceStencil = st;
 		const auto depth_state = [ctx.device() newDepthStencilStateWithDescriptor:ds];
 		unsigned checks = 0;
+		unsigned filtered_draws = 0;
+		unsigned wrap_draws = 0;
+		unsigned mixed_draws = 0;
+		unsigned anisotropic_draws = 0;
+		unsigned window_draws = 0;
+		const auto before = cases;
 		for (const unsigned samples : {2u, 4u})
-			for (const bool depth : {false, true})
+			for (const unsigned format_code : {0x9bu, 0x90u, 0x91u})
 				for (const bool linear : {true, false})
 				{
+					const bool depth = format_code != 0x9b;
 					const unsigned width = 8, height = samples == 2 ? 4 : 8;
-					const auto r = words(depth ? 0x91 : 0x9b, vertex_texture_dimension::two, linear, width, height);
+					const auto r = words(format_code, vertex_texture_dimension::two, linear, width, height);
 					const auto plan = plan_guest_texture(r);
 					fill(plan, std::vector<unsigned>(plan.codec.block.bytes, 0));
 					const auto original_ram = ram->bytes;
-					auto budget = std::make_shared<heap_budget>(ctx, 8 << 20);
+					context gpu{1};
+					auto budget = std::make_shared<heap_budget>(gpu, 8 << 20);
+					gpu.set_buffer_budget(budget);
 					resolved_fragment_texture retained;
 					id<MTLTexture> whole = nil;
+					std::vector point_words{r};
+					if (depth)
 					{
-						surface_cache surfaces(ctx, ram, 8 << 20, budget);
-						guest_texture_cache textures(ctx, ram, [](unsigned, unsigned, std::size_t) { return 0x1000u; }, 1 << 20, budget);
-						const surface_format format = depth ? surface_format{surface_depth::z24s8_float} : surface_format{surface_color::rgba32f};
+						auto shadow = r;
+						shadow.address = (shadow.address & 0x0fffffffu) | (1u << 28);
+						point_words.push_back(shadow);
+						auto packed = r;
+						packed.format = (packed.format & ~(0x9fu << 8)) | (0x85u << 8);
+						point_words.push_back(packed);
+					}
+					auto filter_words = point_words;
+					for (auto& regs : filter_words)
+					{
+						regs.filter = (2u << 16) | ((linear ? 2u : 4u) << 24);
+						if (!linear)
+							regs.address = (regs.address & ~0x0f0fu) | 0x0505u;
+					}
+					std::vector<versioned_guest_texture> point;
+					struct crop_profile { clear_rectangle rectangle; bool pixels; };
+					const std::array crops = linear ?
+						std::array{crop_profile{{1, 1, 3, 2}, false}, crop_profile{{2, 0, 4, 3}, true}} :
+						std::array{crop_profile{{2, 2, 2, 2}, false}, crop_profile{{4, 0, 2, 2}, true}};
+					std::vector<fragment_texture_registers> crop_words;
+					std::size_t crop_start = 0;
+					{
+						surface_cache surfaces(gpu, ram, 8 << 20, budget);
+						guest_texture_cache textures(gpu, ram, [](unsigned offset, unsigned, std::size_t) { return 0x1000u + offset - 0x200u; }, 1 << 20, budget);
+						const surface_format format = depth ?
+							surface_format{format_code == 0x90 ? surface_depth::z24s8_uint : surface_depth::z24s8_float} :
+							surface_format{surface_color::rgba32f};
 						cached_surface_description description{0x1000, {4, 4, samples, format, true}, linear ? plan.subresources[0].row_pitch : 0, {}};
 						if (!linear) description.morton = swizzle_region{{width, height, 1}, {}, {width, height, 1}};
 						const auto surface = surfaces.acquire(description);
@@ -2630,9 +5226,82 @@ fragment depth_sample sample_depth(float4 p [[position]],uint s [[sample_id]]) {
 							raster_state raster;raster.viewport = {0, 0, 4, 4, 0, 1};raster.scissor = {0, 0, 4, 4};
 							draw.configure(pipeline, depth ? depth_state : nil, raster, {}, {});draw.draw(MTLPrimitiveTypeTriangle, 0, 3);draw.end();
 						});
+						if (spilled_raster) surfaces.spill(surface);
 						const auto reads = ram->reads;
 						const auto revision = ram->version;
+						const auto spill_submissions = surfaces.transaction_statistics().submitted;
+						auto batch_words = point_words;
+						batch_words.insert(batch_words.end(), filter_words.begin(), filter_words.end());
+						auto wrapped = filter_words[0];
+						wrapped.address = (wrapped.address & ~0x0f0fu) | 0x0401u;
+						batch_words.push_back(wrapped);
+						auto mixed = filter_words[0];
+						mixed.filter = (2u << 16) | (1u << 24);
+						batch_words.push_back(mixed);
+						mixed.filter = (3u << 16) | (2u << 24);
+						batch_words.push_back(mixed);
+						auto anisotropic = filter_words[0];
+						anisotropic.control0 |= 7u << 4;
+						batch_words.push_back(anisotropic);
+						crop_start = batch_words.size();
+						for (const auto& crop : crops)
+							for (auto regs : point_words)
+							{
+								const auto& area = crop.rectangle;
+								regs.offset += guest_texture_block_offset(plan, plan.subresources[0], area.x, area.y, 0);
+								regs.image_rect = (area.width << 16) | area.height;
+								if (crop.pixels) regs.format |= 0x40u << 8;
+								crop_words.push_back(regs);
+							}
+						batch_words.insert(batch_words.end(), crop_words.begin(), crop_words.end());
+						// A raw, non-fragment request still needs its expanded raster.
+						const auto mask = (std::uint64_t{1} << batch_words.size()) - 1;
+						batch_words.push_back(r);
+						point = textures.prepare_versioned_batch(batch_words, surfaces, {}, {}, texture_upload_path::separate, mask).finish();
+						const auto expanded = point.back().image;
+						point.pop_back();
+						require(expanded.texture.sampleCount == 1 && expanded.texture.width == width && expanded.texture.height == height,
+							"Raw texture request did not keep the expanded MSAA raster");
+						const auto copies_after_first = surfaces.snapshot_statistics().created;
+						auto warm = textures.prepare_versioned_batch(batch_words, surfaces, {}, {}, texture_upload_path::separate, mask);
+						require(warm.ready() && surfaces.snapshot_statistics().created == copies_after_first &&
+							warm.finish().back().image.texture == expanded.texture, "MSAA storage variants displaced one another");
+						if (spilled_raster && depth)
+						{
+							for (std::size_t i = 0; i < point.size(); ++i)
+							{
+								const auto& image = point[i].image;
+								const auto area = i < crop_start ? clear_rectangle{0, 0, width, height} :
+									crops[(i - crop_start) / point_words.size()].rectangle;
+								require(image.texture.sampleCount == 1 && image.metadata.samples == 1 &&
+									image.texture.width == area.width && image.texture.height == area.height &&
+									image.metadata.coordinates.flags == texture_coordinate_sample_raster,
+									"Float spill did not bind an exact direct sample raster");
+							}
+							require(expanded.texture == point.front().image.texture && !expanded.metadata.coordinates.flags &&
+								surfaces.status(surface).spilled && surfaces.transaction_statistics().submitted == spill_submissions,
+								"Sample raster replaced the raw binding, restored its source or submitted separate work");
+						}
+						else
+						{
+							for (const auto& item : point)
+								require(item.image.texture == point.front().image.texture && item.image.texture.sampleCount == samples &&
+									item.image.metadata.samples == samples && item.image.texture.width == 4 && item.image.texture.height == 4,
+									"Point and filtered MSAA requests did not share one native sample snapshot");
+						}
+						if (!spilled_raster || !depth)
+							for (std::size_t i = 0; i < crop_words.size(); ++i)
+							{
+								const auto& area = crops[i / point_words.size()].rectangle;
+								const auto& coords = point[crop_start + i].image.metadata.coordinates;
+								require(coords.flags == texture_coordinate_msaa_window &&
+									coords.minimum == std::array{float(area.x), float(area.y)} &&
+									coords.maximum == std::array{float(area.x + area.width), float(area.y + area.height)},
+									"Coalesced native MSAA crop lost its own sample window");
+							}
 						const auto versioned = textures.resolve_versioned(r, surfaces);
+						require(versioned.image.texture == expanded.texture && copies_after_first == (spilled_raster && depth ? 3 : 2),
+							"Mixed point/filtered requests created the wrong snapshot variants");
 						require(versioned.revision.current(), "Fresh native MSAA source ticket is stale");
 						retained = versioned.image;
 						const auto copies = surfaces.snapshot_statistics().created;
@@ -2673,8 +5342,370 @@ fragment depth_sample sample_depth(float4 p [[position]],uint s [[sample_id]]) {
 							(void)commands.render(pass);commands.end_encoding();
 						});
 						surfaces.spill(surface);
+						const auto spilled = textures.prepare_versioned_batch(std::array{r}, surfaces, {}, {}, texture_upload_path::separate, 1).finish();
+						require(spilled[0].image.metadata.samples == (depth ? 1 : samples) && spilled[0].image.texture.sampleCount == (depth ? 1 : samples) &&
+							ram->reads == reads && ram->version == revision, "Spilled MSAA did not retain its native color or expanded depth snapshot");
 						++ram->version;
-						require(!versioned.revision.current(), "Native MSAA source ticket ignored a CPU revision change");
+						require(!versioned.revision.current() && !point.front().revision.current(), "Native MSAA source ticket ignored a CPU revision change");
+					}
+					// Each physical sample has a unique oracle, checked after the source and cache die.
+					for (const unsigned p : {0u, 3u})
+						for (unsigned s = 0; s < samples; ++s)
+							for (const unsigned opcode : {23u, 24u, 25u, 47u, 49u})
+							{
+								const float x = (2 * p + s % 2 + .5f) / width;
+								const float y = ((samples / 2) * p + s / 2 + .5f) / height;
+								const color coords = opcode == 24 ? color{2 * x, 2 * y, 1.2f, 2} : color{x, y, .6f, 1};
+								const float z = .50123456f + float(s) / 16 + float(p) / 256 + float(p) / 64;
+								color result{float(s + 1) / 8, float(p) / 8, float(p) / 8, 1};
+								if (depth) result.fill(z);
+								sample(point[0].image, point_words[0], coords, result, opcode, 2);
+								if (depth)
+								{
+									result.fill(z < .6f ? 1.f : 0.f);
+									sample(point[1].image, point_words[1], coords, result, opcode, 2);
+									const auto bits = format_code == 0x90 ? static_cast<std::uint32_t>(z * 16777215.f) :
+										std::bit_cast<std::uint32_t>(z) >> 7;
+									sample(point[2].image, point_words[2], coords,
+										{float((bits >> 8) & 255) / 255, float(bits & 255) / 255,
+											float(17 + s * 53 + p + p * 7) / 255, float((bits >> 16) & 255) / 255}, opcode, 2);
+								}
+							}
+					const auto axis_weights = [](float coordinate, float step, unsigned extent)
+					{
+						const float uv = 1.f / extent;
+						const float base = std::floor(coordinate / uv);
+						if (std::abs(step - uv) < .000001f)
+							return std::array{1.f, 0.f, 0.f};
+						if (step < uv)
+						{
+							const float fraction = coordinate / uv - base;
+							return std::array{1.f - fraction, fraction, 0.f};
+						}
+						const float end = coordinate + step;
+						const float one = (base + 1.f) * uv;
+						const float two = (base + 2.f) * uv;
+						const float middle = std::min(two, end) - one;
+						const float last = std::max(two, end) - two;
+						return std::array{1.f - middle - last, middle, last};
+					};
+					const auto address = [](int tap, int extent, unsigned mode)
+					{
+						if (mode == 4)
+							return tap;
+						if (mode == 1 || mode == 2)
+						{
+							const int period = mode == 1 ? extent : extent * 2;
+							const int phase = (tap % period + period) % period;
+							return phase >= extent ? period - 1 - phase : phase;
+						}
+						return std::clamp(tap, 0, extent - 1);
+					};
+					for (const auto [scale, bias] : std::array{std::pair{.0625f, .15625f}, std::pair{.125f, .0625f},
+						std::pair{.375f, .0625f}, std::pair{-.125f, .5625f}, std::pair{.1875f, .8125f}})
+						for (const unsigned opcode : {23u, 24u, 25u, 47u, 49u})
+						{
+							fragment_context vary;
+							vary.wpos_scale = scale;
+							vary.wpos_bias_x = vary.wpos_bias_y = bias;
+							const float w = opcode == 24 ? 2.f : 1.f;
+							const color coord{0, 0, .6f * w, w};
+							std::array<color, 4> pixels, shadow_pixels, packed_pixels, point_pixels, point_shadows;
+							for (unsigned y = 0; y < 2; ++y)
+								for (unsigned x = 0; x < 2; ++x)
+								{
+									const float u = ((x + .5f) * std::abs(scale) + bias) / w;
+									const float v = ((y + .5f) * scale + bias) / w;
+									const auto ix = static_cast<unsigned>(std::clamp(u, 0.f, 1.f) * width);
+									const auto iy = static_cast<unsigned>(std::clamp(v, 0.f, 1.f) * height);
+									const auto wx = axis_weights(u, std::abs(scale) / w, width);
+									const auto wy = axis_weights(v, scale / w, height);
+									const auto read = [&](unsigned xx, unsigned yy)
+									{
+										const auto px = xx / 2, py = yy / (samples / 2);
+										const auto s = xx % 2 + 2 * (yy % (samples / 2));
+										const float z = .50123456f + float(s) / 16 + float(px) / 256 + float(py) / 64;
+										return depth ? color{z, z, z, z} : color{float(s + 1) / 8, float(px) / 8, float(py) / 8, 1};
+									};
+									auto& result = pixels[y * 2 + x];
+									result.fill(0);
+									for (unsigned dy = 0; dy < 2; ++dy)
+										for (unsigned dx = 0; dx < 3; ++dx)
+										{
+											const auto texel = read(std::min(ix + dx, width - 1), std::min(iy + dy, height - 1));
+											for (unsigned lane = 0; lane < 4; ++lane)
+												result[lane] += texel[lane] * wx[dx] * (dy ? wy[1] + wy[2] : wy[0]);
+										}
+									shadow_pixels[y * 2 + x].fill(result[0] < .6f ? 1.f : 0.f);
+									const auto px = std::min(ix, width - 1), py = std::min(iy, height - 1);
+									const auto s = px % 2 + 2 * (py % (samples / 2));
+									const auto value = read(px, py);
+									const auto z = value[0];
+									point_pixels[y * 2 + x] = value;
+									point_shadows[y * 2 + x].fill(z < .6f ? 1.f : 0.f);
+									const auto bits = format_code == 0x90 ? static_cast<std::uint32_t>(z * 16777215.f) :
+										std::bit_cast<std::uint32_t>(z) >> 7;
+									packed_pixels[y * 2 + x] = {float((bits >> 8) & 255) / 255, float(bits & 255) / 255,
+										float(17 + s * 53 + px / 2 + py / (samples / 2) * 7) / 255, float((bits >> 16) & 255) / 255};
+								}
+							const auto offset = point_words.size();
+							sample(point[offset].image, filter_words[0], coord, {}, opcode, 2, &vary, 0, {}, &pixels);
+							if (depth)
+							{
+								sample(point[offset + 1].image, filter_words[1], coord, {}, opcode, 2, &vary, 0, {}, &shadow_pixels);
+								sample(point[offset + 2].image, filter_words[2], coord, {}, opcode, 2, &vary, 0, {}, &packed_pixels);
+							}
+							filtered_draws += depth ? 3 : 1;
+							const float slope = std::abs(scale) / w * std::max(width, height);
+							const bool implicit_min = slope > 1.f;
+							const auto gradient_axis = scale < 0 ? 1u : 0u;
+							const float gradient = scale == .0625f ? .25f : scale == .375f ? .03125f : .125f;
+							const float level_or_bias = scale == .0625f ? 2.f : scale == .375f ? -2.f : 0.f;
+							const float operand = opcode == 25 ? gradient : level_or_bias;
+							bool minifies = implicit_min;
+							if (opcode == 25)
+								minifies = gradient * (gradient_axis ? height : width) > 1.f;
+							if (opcode == 47)
+								minifies = operand > 0.f;
+							if (opcode == 49)
+								minifies = slope * std::exp2(operand) > 1.f;
+							for (const bool min_linear : {false, true})
+							{
+								const unsigned min = min_linear ? (linear ? 2u : 4u) : (linear ? 1u : 5u);
+								const unsigned mag = min_linear ? 1u : linear ? 2u : 4u;
+								auto regs = filter_words[0];
+								regs.filter = (min << 16) | (mag << 24);
+								const bool selected_linear = min_linear == minifies;
+								sample(point[offset].image, regs, coord, {}, opcode, operand, &vary, gradient_axis,
+									{}, selected_linear ? &pixels : &point_pixels);
+								++mixed_draws;
+								if (depth)
+								{
+									auto shadow_regs = filter_words[1];
+									shadow_regs.filter = regs.filter;
+									sample(point[offset + 1].image, shadow_regs, coord, {}, opcode, operand, &vary, gradient_axis,
+										{}, min_linear == implicit_min ? &shadow_pixels : &point_shadows);
+									++mixed_draws;
+								}
+							}
+						}
+					struct wrap_profile { float scale, x, y; unsigned s, t; };
+					constexpr std::array wrap_profiles{
+						wrap_profile{.0625f, .90625f, -.09375f, 1, 1},
+						wrap_profile{.25f, .8125f, -1.09375f, 1, 2},
+						wrap_profile{.0625f, .90625f, -.09375f, 2, 1},
+						wrap_profile{.0625f, -.09375f, .90625f, 4, 4},
+						wrap_profile{.0625f, 1.125f, -1.125f, 4, 4},
+						wrap_profile{.1875f, -1.125f, -.1875f, 6, 7},
+						wrap_profile{-.1875f, -.125f, -.75f, 7, 8},
+						wrap_profile{.0625f, -.96875f, .90625f, 8, 3}};
+					for (const auto& profile : wrap_profiles)
+						for (const unsigned opcode : {23u, 24u})
+						{
+							const float w = opcode == 24 ? 2.f : 1.f;
+							fragment_context vary;
+							vary.wpos_scale = profile.scale * w;
+							vary.wpos_bias_x = profile.x * w;
+							vary.wpos_bias_y = profile.y * w;
+							std::array<color, 4> pixels, shadow_pixels;
+							const color border{39.f / 255, 1.f, 225.f / 255, 163.f / 255};
+							for (unsigned y = 0; y < 2; ++y)
+								for (unsigned x = 0; x < 2; ++x)
+								{
+									float dx = std::abs(profile.scale), dy = profile.scale;
+									float u = (x + .5f) * dx + profile.x, v = (y + .5f) * dy + profile.y;
+									if (profile.s >= 6 && u < 0) { u = -u; dx = -dx; }
+									if (profile.t >= 6 && v < 0) { v = -v; dy = -dy; }
+									const auto ix = static_cast<int>(std::floor(u * width));
+									const auto iy = static_cast<int>(std::floor(v * height));
+									const auto wx = axis_weights(u, dx, width), wy = axis_weights(v, dy, height);
+									auto& result = pixels[y * 2 + x];
+									result.fill(0);
+									for (int row = 0; row < 2; ++row)
+										for (int col = 0; col < 3; ++col)
+										{
+											const int xx = address(ix + col, width, profile.s);
+											const int yy = address(iy + row, height, profile.t);
+											auto tap = border;
+											if (xx >= 0 && yy >= 0 && xx < int(width) && yy < int(height))
+											{
+												const unsigned px = unsigned(xx) / 2, py = unsigned(yy) / (samples / 2);
+												const unsigned s = unsigned(xx) % 2 + 2 * (unsigned(yy) % (samples / 2));
+												const float z = .50123456f + float(s) / 16 + float(px) / 256 + float(py) / 64;
+												tap = depth ? color{z, 1, z, z} : color{float(s + 1) / 8, 1, float(py) / 8, 1};
+											}
+											const float weight = wx[col] * (row ? wy[1] + wy[2] : wy[0]);
+											for (unsigned lane = 0; lane < 4; ++lane)
+												result[lane] += tap[lane] * weight;
+										}
+									shadow_pixels[y * 2 + x].fill(result[0] < .6f ? 1.f : 0.f);
+								}
+							for (unsigned view = 0; view < (depth ? 2u : 1u); ++view)
+							{
+								auto regs = filter_words[view];
+								regs.address = (regs.address & ~0x0f0fu) | profile.s | (profile.t << 8);
+								regs.border_color = 0xa32779e1;
+								regs.control1 = 0x9ae4; // Force green to one in the texture and border.
+								sample(point[point_words.size() + view].image, regs, {0, 0, .6f * w, w}, {},
+									opcode, 2, &vary, 0, {}, view ? &shadow_pixels : &pixels);
+								++wrap_draws;
+							}
+						}
+					struct anisotropic_profile
+					{
+						unsigned opcode, gradient_axis, wrap_s, wrap_t;
+						float scale, bias_x, bias_y, operand;
+						bool min_linear;
+					};
+					constexpr std::array profiles{
+						anisotropic_profile{23, 0, 1, 4, .5f, .15625f, -.09375f, 0, true},
+						anisotropic_profile{24, 0, 2, 3, .5f, -.15625f, .09375f, 0, false},
+						anisotropic_profile{25, 0, 1, 4, .0625f, .90625f, -.0625f, 2.25f, true},
+						anisotropic_profile{25, 1, 4, 2, .125f, -.09375f, .90625f, 2.5f, false},
+						anisotropic_profile{49, 0, 3, 1, .5f, -.03125f, .40625f, -1.f, false},
+						anisotropic_profile{47, 0, 1, 3, .125f, .90625f, .09375f, 2.f, true}};
+					constexpr std::array limits{1u, 2u, 4u, 6u, 8u, 10u, 12u, 16u};
+					for (unsigned factor = 0; factor < limits.size(); ++factor)
+						for (const auto& profile : profiles)
+							for (unsigned view = 0; view < (depth ? 2u : 1u); ++view)
+							{
+								const float w = profile.opcode == 24 ? 2.f : 1.f;
+								fragment_context vary;
+								vary.wpos_scale = profile.scale * w;
+								vary.wpos_bias_x = profile.bias_x * w;
+								vary.wpos_bias_y = profile.bias_y * w;
+								const float slope = std::abs(profile.scale);
+								std::array<float, 2> dx{slope, 0.f}, dy{0.f, profile.scale};
+								if (!view && profile.opcode == 25)
+								{
+									dx = {};
+									dy = {};
+									dx[profile.gradient_axis] = profile.operand;
+								}
+								const float x_length = std::hypot(dx[0] * width, dx[1] * height);
+								const float y_length = std::hypot(dy[0] * width, dy[1] * height);
+								const bool major_x = x_length >= y_length;
+								const float major_length = std::max(x_length, y_length);
+								const bool explicit_level = !view && profile.opcode == 47;
+								const unsigned taps = explicit_level ? 1u :
+									std::min(limits[factor], unsigned(std::ceil(major_length / std::max(1.f, std::min(x_length, y_length)))));
+								const float bias = !view && profile.opcode == 49 ? profile.operand : 0.f;
+								const bool minifies = taps > 1 || (explicit_level ? profile.operand > 0 :
+									major_length * std::exp2(bias) > 1.f);
+								const bool filter_linear = minifies == profile.min_linear;
+								const auto major = major_x ? dx : dy;
+								const float x_step = taps > 1 ? dx[0] / (major_x ? taps : 1u) : slope;
+								const float y_step = taps > 1 ? dy[1] / (major_x ? 1u : taps) : profile.scale;
+								const color border{39.f / 255, 121.f / 255, 225.f / 255, 163.f / 255};
+								const auto read = [&](int x, int y)
+								{
+									x = address(x, width, profile.wrap_s);
+									y = address(y, height, profile.wrap_t);
+									if (x < 0 || y < 0 || x >= int(width) || y >= int(height))
+										return border;
+									const unsigned px = unsigned(x) / 2, py = unsigned(y) / (samples / 2);
+									const unsigned s = unsigned(x) % 2 + 2 * (unsigned(y) % (samples / 2));
+									const float z = .50123456f + float(s) / 16 + float(px) / 256 + float(py) / 64;
+									return depth ? color{z, z, z, z} : color{float(s + 1) / 8, float(px) / 8, float(py) / 8, 1};
+								};
+								std::array<color, 4> pixels{};
+								for (unsigned y = 0; y < 2; ++y)
+									for (unsigned x = 0; x < 2; ++x)
+									{
+										auto& result = pixels[y * 2 + x];
+										for (unsigned tap = 1; tap <= taps; ++tap)
+										{
+											const float offset = float(tap) / float(taps + 1) - .5f;
+											const float u = (x + .5f) * slope + profile.bias_x + major[0] * offset;
+											const float v = (y + .5f) * profile.scale + profile.bias_y + major[1] * offset;
+											const int ix = int(std::floor(u * width)), iy = int(std::floor(v * height));
+											const auto wx = filter_linear ? axis_weights(u, x_step, width) : std::array{1.f, 0.f, 0.f};
+											const auto wy = filter_linear ? axis_weights(v, y_step, height) : std::array{1.f, 0.f, 0.f};
+											for (int row = 0; row < 2; ++row)
+												for (int col = 0; col < 3; ++col)
+												{
+													const auto value = read(ix + col, iy + row);
+													const float weight = wx[col] * (row ? wy[1] + wy[2] : wy[0]) / taps;
+													for (unsigned lane = 0; lane < 4; ++lane)
+														result[lane] += value[lane] * weight;
+												}
+										}
+										if (view) result.fill(result[0] < .6f ? 1.f : 0.f);
+									}
+								auto regs = filter_words[view];
+								regs.address = (regs.address & ~0x0f0fu) | profile.wrap_s | (profile.wrap_t << 8);
+								regs.border_color = 0xa32779e1;
+								regs.filter = profile.min_linear ? (2u << 16) | (1u << 24) : (1u << 16) | (2u << 24);
+								const texture_state_overrides overrides{.anisotropy = linear ? 0u : limits[factor]};
+								regs.control0 |= linear ? factor << 4 : 0u;
+								sample(point[point_words.size() + view].image, regs, {0, 0, .6f * w, w}, {},
+									profile.opcode, profile.operand, &vary, profile.gradient_axis, overrides, &pixels);
+								++anisotropic_draws;
+							}
+					for (unsigned index = 0; index < crops.size(); ++index)
+					{
+						const auto& [area, pixels] = crops[index];
+						const auto resource = crop_start + index * point_words.size();
+						const auto read = [&](unsigned x, unsigned y, unsigned view)
+						{
+							x += area.x;
+							y += area.y;
+							const unsigned px = x / 2, py = y / (samples / 2);
+							const unsigned s = x % 2 + 2 * (y % (samples / 2));
+							if (!depth)
+								return color{float(s + 1) / 8, float(px) / 8, float(py) / 8, 1};
+							const float z = .50123456f + float(s) / 16 + float(px) / 256 + float(py) / 64;
+							if (!view)
+								return color{z, z, z, z};
+							if (view == 1)
+							{
+								const float lit = z < .6f ? 1.f : 0.f;
+								return color{lit, lit, lit, lit};
+							}
+							const auto bits = format_code == 0x90 ? static_cast<std::uint32_t>(z * 16777215.f) :
+								std::bit_cast<std::uint32_t>(z) >> 7;
+							return color{float((bits >> 8) & 255) / 255, float(bits & 255) / 255,
+								float(17 + s * 53 + px + py * 7) / 255, float((bits >> 16) & 255) / 255};
+						};
+						const float scale_x = pixels ? 1.f : 1.f / area.width;
+						const float scale_y = pixels ? 1.f : 1.f / area.height;
+						for (unsigned view = 0; view < point_words.size(); ++view)
+							for (unsigned y = 0; y < area.height; ++y)
+								for (unsigned x = 0; x < area.width; ++x)
+								{
+									sample(point[resource + view].image, crop_words[index * point_words.size() + view],
+										{(2 * x + 1) * scale_x, (2 * y + 1) * scale_y, 1.2f, 2},
+										read(x, y, view), 24);
+									++window_draws;
+								}
+						auto regs = crop_words[index * point_words.size()];
+						regs.address = (regs.address & ~0x0f0fu) | 0x0101u;
+						regs.filter = (2u << 16) | (2u << 24);
+						color seam{};
+						for (unsigned y = 0; y < 2; ++y)
+							for (unsigned x = 0; x < 2; ++x)
+							{
+								const auto tap = read(x ? 0 : area.width - 1, y ? 0 : area.height - 1, 0);
+								const float weight = (x ? .75f : .25f) * (y ? .75f : .25f);
+								for (unsigned lane = 0; lane < 4; ++lane) seam[lane] += tap[lane] * weight;
+							}
+						sample(point[resource].image, regs, {(area.width - .25f) * scale_x, (area.height - .25f) * scale_y, 0, 1}, seam);
+						++window_draws;
+						regs.filter = (1u << 16) | (1u << 24);
+						regs.control0 |= 7u << 4;
+						constexpr float gradient = .625f;
+						const unsigned taps = unsigned(std::ceil(gradient * area.width));
+						color average{};
+						for (unsigned tap = 1; tap <= taps; ++tap)
+						{
+							const float displacement = gradient * area.width * (float(tap) / float(taps + 1) - .5f);
+							const unsigned x = unsigned(address(int(std::floor(.25f + displacement)), area.width, 1));
+							const auto value = read(x, 0, 0);
+							for (unsigned lane = 0; lane < 4; ++lane) average[lane] += value[lane] / taps;
+						}
+						sample(point[resource].image, regs, {.25f * scale_x, .25f * scale_y, 0, 1},
+							average, 25, pixels ? gradient * area.width : gradient);
+						++window_draws;
 					}
 					// Both APIs retain the same immutable heap after source/cache destruction.
 					const auto raw = make_buffer(ctx, 256 * height, buffer_storage::shared);
@@ -2704,7 +5735,1041 @@ fragment depth_sample sample_depth(float4 p [[position]],uint s [[sample_id]]) {
 						++checks;
 					}
 				}
-		std::cout << checks << " native MSAA API readbacks across8sample_id-written color/depth/stencil profiles:16 repeated hits per profile,whole/region share one immutable image,exact float bits,VM preservation,source overwrite/spill/cache destruction and revision conflicts passed\n";
+		if (spilled_raster)
+			std::cout << cases - before << " spilled MSAA draws: native float-color and direct depth sample-raster profiles, " << checks
+				<< " exact readbacks, point/linear/mixed/anisotropic footprints, wrap, crop, projection, depth, shadow and stencil\n";
+		else
+		{
+			std::cout << checks << " native MSAA API readbacks across 12 sample_id-written color/depth/stencil profiles:16 repeated hits per profile,whole/region share one immutable image,exact float bits,VM preservation,source overwrite/spill/cache destruction and revision conflicts passed\n";
+			std::cout << cases - before - filtered_draws - wrap_draws - mixed_draws - anisotropic_draws - window_draws << " direct MSAA point draws: 2x/4x, color/depth/shadow/redirected stencil, five TEX opcodes, linear/Morton sources and immutable sample order\n";
+			std::cout << filtered_draws << " direct MSAA draws with linear filters requested: derivative footprints, shadow after depth filtering and exact packed stencil\n";
+			std::cout << wrap_draws << " direct MSAA wrapped-filter draws: seam taps, mirror folding, custom border weights, constant channels and projected coordinates\n";
+			std::cout << mixed_draws << " direct MSAA mixed-filter draws: both Min/Mag orders, implicit and explicit LOD, gradients, bias and shadow selection\n";
+			std::cout << anisotropic_draws << " direct MSAA anisotropic draws: eight limits, major-axis taps, opcode gradients, projected coordinates, custom border and shadow\n";
+			std::cout << window_draws << " direct MSAA window draws: coalesced linear/Morton crops, sample-aligned and odd origins, projected and pixel coordinates, crop-local seams and anisotropy\n";
+		}
+	}
+	void float_multisample_spill_words()
+	{
+		const auto library = compile.library(R"msl(
+#include <metal_stdlib>
+using namespace metal;
+vertex float4 special_vertex(uint i [[vertex_id]]) {
+    const float2 p[] = {float2(-1,-1), float2(3,-1), float2(-1,3)};
+    return float4(p[i], 0, 1);
+}
+fragment float4 write_float_words(float4 p [[position]], uint sample [[sample_id]]) {
+    const uint words[] = {0u, 0x80000000u, 1u, 0x807fffffu, 0x00800001u, 0xbf234567u,
+        0x7f800000u, 0xff800000u, 0x7fc12345u, 0xffc04321u, 0x7f812345u, 0xff854321u};
+    uint4 lanes = uint(p.x) + 3 * uint(p.y) + 5 * sample + uint4(0, 1, 4, 7);
+    return as_type<float4>(uint4(words[lanes.x % 12], words[lanes.y % 12], words[lanes.z % 12], words[lanes.w % 12]));
+}
+fragment half4 write_half_words(float4 p [[position]], uint sample [[sample_id]]) {
+    const ushort words[] = {0u, 0x8000u, 1u, 0x83ffu, 0x0401u, 0xb923u,
+        0x7c00u, 0xfc00u, 0x7e55u, 0xfe21u, 0x7c55u, 0xfc21u};
+    uint4 lanes = uint(p.x) + 3 * uint(p.y) + 5 * sample + uint4(0, 1, 4, 7);
+    return as_type<half4>(ushort4(words[lanes.x % 12], words[lanes.y % 12], words[lanes.z % 12], words[lanes.w % 12]));
+}
+kernel void read_float_words(texture2d_ms<float> source [[texture(0)]], device uint4* out [[buffer(0)]],
+    uint2 p [[thread_position_in_grid]]) {
+    const uint sy = source.get_num_samples() / 2;
+    out[p.y * (2 * source.get_width()) + p.x] =
+        as_type<uint4>(source.read(p / uint2(2, sy), p.x % 2 + 2 * (p.y % sy)));
+}
+kernel void read_half_words(texture2d_ms<half> source [[texture(0)]], device ushort4* out [[buffer(0)]],
+    uint2 p [[thread_position_in_grid]]) {
+    const uint sy = source.get_num_samples() / 2;
+    out[p.y * (2 * source.get_width()) + p.x] =
+        as_type<ushort4>(source.read(p / uint2(2, sy), p.x % 2 + 2 * (p.y % sy)));
+}
+)msl", @"Independent float-color MSAA storage words");
+		unsigned checked_profiles = 0;
+		std::size_t checked_words = 0;
+		for (const auto samples : {2u, 4u})
+			for (const auto [code, color_format] : std::array{
+				std::pair{0x9au, surface_color::rgba16f}, std::pair{0x9bu, surface_color::rgba32f},
+				std::pair{0x9cu, surface_color::r32f}})
+			{
+				const bool half = code == 0x9a;
+				const unsigned word_bytes = half ? 2 : 4, channels = code == 0x9c ? 1 : 4;
+				const unsigned width = code == 0x9b && samples == 4 ? 257u : 17u;
+				const unsigned height = code == 0x9b && samples == 4 ? 129u : 9u;
+				const auto size = sample_expanded_size(width, height, samples);
+				const auto pitch = size[0] * word_bytes * channels;
+				context gpu{1};
+				auto budget = std::make_shared<heap_budget>(gpu, 64u << 20);
+				gpu.set_buffer_budget(budget);
+				surface_cache surfaces(gpu, ram, 64u << 20, budget);
+				guest_texture_cache textures(gpu, ram, [](unsigned offset, unsigned, std::size_t) { return 0x1000u + offset - 0x200u; },
+					8u << 20, budget);
+				ram->bytes.assign(pitch * size[1], std::byte{});
+				++ram->version;
+				const auto source = surfaces.acquire({0x1000, {width, height, samples, color_format, false}, pitch, {}});
+				const auto reference = make_buffer(gpu, size[0] * size[1] * 4 * word_bytes, buffer_storage::shared);
+				auto compute_descriptor = [MTL4ComputePipelineDescriptor new];
+				compute_descriptor.computeFunctionDescriptor = library_function(library, half ? @"read_half_words" : @"read_float_words");
+				const auto reader = compile.compute(compute_descriptor);
+				auto descriptor = [MTL4RenderPipelineDescriptor new];
+				descriptor.vertexFunctionDescriptor = library_function(library, @"special_vertex");
+				descriptor.fragmentFunctionDescriptor = library_function(library, half ? @"write_half_words" : @"write_float_words");
+				descriptor.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+				descriptor.rasterSampleCount = samples;
+				descriptor.colorAttachments[0].pixelFormat = describe_surface_color(color_format).format;
+				const auto pipeline = compile.render(descriptor);
+				surfaces.draw(std::array{cached_surface_use{source, true}}, [&](context& commands, auto attachments)
+				{
+					auto pass = [MTL4RenderPassDescriptor new];
+					pass.colorAttachments[0].texture = attachments[0];
+					pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+					pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+					raster_state raster;
+					raster.viewport = {0, 0, double(width), double(height), 0, 1};
+					raster.scissor = {0, 0, width, height};
+					render_commands draw(commands, pass);
+					draw.configure(pipeline, nil, raster, {}, {});
+					draw.draw(MTLPrimitiveTypeTriangle, 0, 3);
+					draw.end();
+					bindings reads;
+					reads.set_texture(0, attachments[0]);
+					reads.set_buffer(0, reference);
+					const auto table = reads.snapshot(commands);
+					const auto encoder = commands.compute();
+					[encoder setComputePipelineState:reader];
+					[encoder setArgumentTable:table];
+					[encoder dispatchThreads:MTLSizeMake(size[0], size[1], 1)
+						threadsPerThreadgroup:MTLSizeMake(reader.threadExecutionWidth, 1, 1)];
+				});
+				const auto contains_word = [&](std::uint32_t wanted)
+				{
+					const auto* bytes = static_cast<const std::byte*>(reference.contents);
+					for (std::size_t i = 0; i < size[0] * size[1]; ++i)
+						for (unsigned lane = 0; lane < channels; ++lane)
+						{
+							std::uint32_t actual = 0;
+							std::memcpy(&actual, bytes + (i * 4 + lane) * word_bytes, word_bytes);
+							if (actual == wanted) return true;
+						}
+					return false;
+				};
+				const auto specials = half ? std::array{0x8000u, 1u, 0x83ffu, 0x7c00u, 0xfc00u, 0x7e55u, 0xfe21u} :
+					std::array{0x80000000u, 1u, 0x807fffffu, 0x7f800000u, 0xff800000u, 0x7fc12345u, 0xffc04321u};
+				require(std::ranges::all_of(specials, contains_word), "Native MSAA writer did not store the special words required by the spill oracle");
+				const auto reads = ram->reads;
+				const auto version = ram->version;
+				surfaces.spill(source);
+				for (const auto crop : std::array{clear_rectangle{0, 0, size[0], size[1]}, clear_rectangle{1, 1, 3, 3},
+					clear_rectangle{size[0] - 3, size[1] - 1, 3, 1}})
+				{
+					auto regs = words(code, vertex_texture_dimension::two, true, crop.width, crop.height);
+					regs.offset += crop.y * pitch + crop.x * word_bytes * channels;
+					regs.control3 = (1u << 20) | pitch;
+					const auto image = textures.prepare_versioned_batch(std::array{regs}, surfaces, {}, {},
+						texture_upload_path::separate, 1).finish().front().image;
+					require(image.texture.sampleCount == samples && image.texture.width == width && image.texture.height == height &&
+						image.metadata.samples == samples && surfaces.status(source).spilled && ram->reads == reads && ram->version == version,
+						"Float special-value snapshot did not import its immutable native MSAA storage");
+					const auto output = make_buffer(gpu, reference.length, buffer_storage::shared);
+					gpu.begin();
+					bindings reads; reads.set_texture(0, image.texture); reads.set_buffer(0, output);
+					const auto table = reads.snapshot(gpu);
+					const auto encoder = gpu.compute();
+					[encoder setComputePipelineState:reader]; [encoder setArgumentTable:table];
+					[encoder dispatchThreads:MTLSizeMake(size[0], size[1], 1) threadsPerThreadgroup:MTLSizeMake(reader.threadExecutionWidth, 1, 1)];
+					gpu.submit().wait();
+					for (std::size_t y = 0; y < crop.height; ++y)
+						for (std::size_t x = 0; x < crop.width; ++x)
+						{
+							const auto* expected = static_cast<const std::byte*>(reference.contents) +
+								((crop.y + y) * size[0] + crop.x + x) * 4 * word_bytes;
+							const auto* actual = static_cast<const std::byte*>(output.contents) + ((crop.y + y) * size[0] + crop.x + x) * 4 * word_bytes;
+							if (std::memcmp(actual, expected, channels * word_bytes))
+								throw std::runtime_error("Float MSAA spill changed a native sample word, format " + std::to_string(code) +
+									", samples " + std::to_string(samples) + ", x " + std::to_string(x) + ", y " + std::to_string(y));
+							checked_words += channels;
+						}
+				}
+				++checked_profiles;
+			}
+		std::cout << "Float MSAA spill/import words: " << checked_profiles << " profiles, " << checked_words
+			<< " exact words against independent source and imported multisample reads, signed zero, subnormals, infinities and distinct NaN payloads, full and odd crops\n";
+		for (const auto color_format : {surface_color::rgba16f, surface_color::rgba32f, surface_color::r32f})
+			multisample_window_budget_case(true, color_format);
+	}
+	void deferred_multisample_snapshot_cases()
+	{
+		const auto before = cases;
+		unsigned crossing_draws = 0, split_plane_draws = 0, guest_background_draws = 0;
+		for (const unsigned samples : {2u, 4u})
+			for (const unsigned format : {0x85u, 0x90u, 0x91u})
+			{
+				context gpu{2};
+				auto budget = std::make_shared<heap_budget>(gpu, 8u << 20);
+				gpu.set_buffer_budget(budget);
+				surface_cache surfaces(gpu, ram, 8u << 20, budget);
+				guest_texture_cache textures(gpu, ram, [](unsigned offset, unsigned, std::size_t) { return 0x1000u + offset - 0x200u; },
+					1u << 20, budget);
+				ram->bytes.assign(0x6000, std::byte{});
+				++ram->version;
+				const bool depth = format != 0x85;
+				const surface_format native = depth ?
+					surface_format{format == 0x90 ? surface_depth::z24s8_uint : surface_depth::z24s8_float} : surface_format{surface_color::argb8};
+				const auto a = surfaces.acquire({0x3000, {4, 4, samples, native, false}, 32, {}});
+				const auto b = surfaces.acquire({0x5000, {4, 4, samples, native, false}, 32, {}});
+				const auto target = surfaces.acquire({0x1000, {6, 5, samples, native, false}, 64, {}});
+				constexpr std::array values{0x20408031u, 0x90402072u, 0x6080a045u};
+				const auto paint = [&](const cached_surface_ref& surface, unsigned i, clear_rectangle area)
+				{
+					const auto v = values[i];
+					surfaces.clear(surface, depth ? 3u : 0xf0u, 0xff000000u | (v >> 8), v, 255, area);
+				};
+				paint(a, 0, {0, 0, 4, 4});
+				paint(a, 1, {2, 0, 2, 4});
+				paint(b, 2, {0, 0, 4, 4});
+				surfaces.defer_copy(a, {1, 0, 2, 2}, target, 0, 0);
+				surfaces.defer_copy(b, {0, 1, 2, 2}, target, 3, 2);
+				const unsigned sy = samples / 2;
+				const auto crop = [&](unsigned x, unsigned y, bool pixels, unsigned codec)
+				{
+					auto regs = words(codec, vertex_texture_dimension::two, true, 2, 1);
+					regs.offset += y * 64 + x * 4;
+					regs.control3 = (1u << 20) | 64u;
+					if (pixels) regs.format |= 0x40u << 8;
+					return regs;
+				};
+				std::vector requests{crop(1, 0, false, format), crop(2, 1, true, format), crop(7, 2 * sy + 1, false, format)};
+				if (depth) requests.push_back(crop(1, 0, false, 0x85));
+				const auto mask = (std::uint64_t{1} << requests.size()) - 1;
+				const auto reads = ram->reads;
+				const auto version = ram->version;
+				const auto gate = [gpu.device() newSharedEvent];
+				struct unblock { id<MTLSharedEvent> event; ~unblock() { event.signaledValue = 1; } } release{gate};
+				auto old = textures.prepare_versioned_batch(requests, surfaces,
+					std::array{guest_texture_upload_dependency{gate, 1}}, {}, texture_upload_path::separate, mask);
+				require(!old.ready() && surfaces.snapshot_statistics().entries == 0 &&
+					!surfaces.status(target).initialized && surfaces.status(target).deferred_copies == 2,
+					"Deferred native MSAA job published or materialized before its dependency");
+				gate.signaledValue = 1;
+				gpu.wait_idle();
+				surfaces.defer_copy(b, {0, 0, 2, 2}, target, 0, 0);
+				const auto latest = textures.prepare_versioned_batch(std::span(requests).first(1), surfaces, {}, {},
+					texture_upload_path::separate, 1).finish().front();
+				const auto frozen = old.finish();
+				require(frozen[0].image.texture == frozen[1].image.texture &&
+					frozen[0].image.texture != frozen[2].image.texture &&
+					frozen[0].image.texture != latest.image.texture &&
+					(!depth || frozen[0].image.texture == frozen[3].image.texture),
+					"Deferred native MSAA windows did not isolate donors or coalesce matching windows");
+				require(surfaces.snapshot_statistics().created == 3 && surfaces.snapshot_statistics().entries == 1,
+					"Late deferred MSAA completion displaced the current donor snapshot");
+				require(
+					!surfaces.status(target).initialized && surfaces.status(target).deferred_copies == 3 &&
+					ram->reads == reads && ram->version == version,
+					"Covered deferred MSAA windows materialized their destination or read guest pixels");
+				auto warm = textures.prepare_versioned_batch(std::span(requests).first(1), surfaces, {}, {}, texture_upload_path::separate, 1);
+				require(warm.ready() && warm.finish().front().image.texture == latest.image.texture,
+					"Current native MSAA donor snapshot did not remain reusable");
+				for (const auto& item : frozen)
+					require(item.image.metadata.samples == samples && item.image.texture.width == 4 &&
+						item.image.metadata.coordinates.flags == texture_coordinate_msaa_window,
+						"Deferred window did not retain the donor's native sample texture");
+				const auto expected = [&](unsigned i, bool packed = false, std::optional<unsigned> stencil_owner = {})
+				{
+					const auto raw = values[i];
+					const auto byte = [](unsigned value, unsigned shift) { return float((value >> shift) & 255) / 255; };
+					if (!depth)
+						return color{byte(raw, 24), byte(raw, 16), byte(raw, 8), 1};
+					const float z = float(raw >> 8) / 16777215.f;
+					if (!packed) return color{z, z, z, z};
+					const unsigned bits = format == 0x90 ? static_cast<unsigned>(z * 16777215.f) : std::bit_cast<unsigned>(z) >> 7;
+					return color{byte(bits, 8), byte(bits, 0), byte(values[stencil_owner.value_or(i)], 0), byte(bits, 16)};
+				};
+				sample(frozen[0].image, requests[0], {.25f, .5f, 0, 1}, expected(0));
+				sample(frozen[0].image, requests[0], {.75f, .5f, 0, 1}, expected(1));
+				sample(frozen[1].image, requests[1], {.5f, .5f, 0, 1}, expected(1));
+				sample(frozen[2].image, requests[2], {.25f, .5f, 0, 1}, expected(2));
+				sample(latest.image, requests[0], {.25f, .5f, 0, 1}, expected(2));
+				if (depth) sample(frozen[3].image, requests[3], {.25f, .5f, 0, 1}, expected(0, true));
+				surfaces.cancel_deferred_copies(target);
+				paint(a, 2, {0, 0, 4, 4});
+				sample(frozen[0].image, requests[0], {.25f, .5f, 0, 1}, expected(0));
+				const auto cancelled = textures.prepare_versioned_batch(std::span(requests).first(1), surfaces, {}, {},
+					texture_upload_path::separate, 1).finish().front().image;
+				require(cancelled.metadata.samples == 1 && !surfaces.status(target).initialized &&
+					surfaces.status(target).deferred_copies == 0, "Cancelled copy retained native MSAA donor authority");
+				sample(cancelled, requests[0], {.25f, .5f, 0, 1}, {0, 0, 0, 0});
+				paint(a, 0, {0, 0, 4, 4});
+				paint(b, 1, {0, 0, 4, 4});
+				surfaces.defer_blit_typeless(b, {0, 0, 1, 1}, target, {0, 0, 1, 1});
+				surfaces.defer_copy(a, {0, 0, 1, 1}, target, 0, 0);
+				surfaces.defer_copy(b, {0, 0, 1, 1}, target, 1, 0);
+				const auto crossing_reads = ram->reads;
+				const auto crossing_submissions = surfaces.transaction_statistics().submitted;
+				const auto crossing_leases = surfaces.memory_statistics().leased_allocations;
+				const auto cross_gate = [gpu.device() newSharedEvent];
+				unblock cross_release{cross_gate};
+				auto crossing_job = textures.prepare_versioned_batch(std::span(requests).first(1), surfaces,
+					std::array{guest_texture_upload_dependency{cross_gate, 1}}, {}, texture_upload_path::separate, 1);
+				require(!crossing_job.ready() && !surfaces.status(target).initialized &&
+					surfaces.status(target).deferred_copies == 3 && ram->reads == crossing_reads &&
+					surfaces.transaction_statistics().submitted == crossing_submissions &&
+					surfaces.memory_statistics().leased_allocations == crossing_leases,
+					"Cross-donor MSAA snapshot materialized the cold destination before its dependency");
+				bool timed_out = false;
+				try { (void)crossing_job.finish(std::chrono::milliseconds(1)); }
+				catch (const submission_wait_timeout&) { timed_out = true; }
+				require(timed_out && !crossing_job.ready(), "Cross-donor snapshot did not retain its gated work");
+				cross_gate.signaledValue = 1;
+				gpu.wait_idle();
+				surfaces.defer_copy(b, {1, 0, 1, 1}, target, 0, 0);
+				const auto replacement = textures.prepare_versioned_batch(std::span(requests).first(1), surfaces, {}, {},
+					texture_upload_path::separate, 1).finish().front().image;
+				const auto crossing = crossing_job.finish().front().image;
+				require(crossing.texture.sampleCount == 1 && crossing.texture.width == 2 &&
+					crossing.metadata.coordinates.flags == texture_coordinate_sample_raster &&
+					replacement.texture != crossing.texture && !surfaces.status(target).initialized &&
+					surfaces.status(target).deferred_copies == 4 && ram->reads == crossing_reads &&
+					surfaces.transaction_statistics().submitted == crossing_submissions &&
+					surfaces.memory_statistics().leased_allocations == crossing_leases,
+					"Cross-donor MSAA snapshot changed target state or lost its frozen epoch");
+				auto crossing_warm = textures.prepare_versioned_batch(std::span(requests).first(1), surfaces, {}, {},
+					texture_upload_path::separate, 1);
+				require(crossing_warm.ready() && crossing_warm.finish().front().image.texture == replacement.texture &&
+					surfaces.snapshot_statistics().entries == 1, "Late composed snapshot displaced or republished over the current epoch");
+				sample(crossing, requests[0], {.25f, .5f, 0, 1}, expected(0));
+				sample(crossing, requests[0], {.75f, .5f, 0, 1}, expected(1));
+				sample(replacement, requests[0], {.25f, .5f, 0, 1}, expected(1));
+				crossing_draws += 3;
+
+				surfaces.cancel_deferred_copies(target);
+				if (depth)
+				{
+					// Each plane is supplied by a different donor and overwrite
+					// sequence. There is no previous target allocation.
+					surfaces.defer_blit_nearest(a, {0, 0, 2, 2}, target, {0, 0, 2, 1}, texture_plane::depth, {true, true, false});
+					surfaces.defer_copy(b, {0, 0, 2, 1}, target, 0, 0, texture_plane::stencil);
+					surfaces.defer_copy(b, {0, 0, 1, 1}, target, 1, 0, texture_plane::depth);
+					surfaces.defer_copy(a, {0, 0, 1, 1}, target, 1, 0, texture_plane::stencil);
+					const auto reads_before = ram->reads;
+					const auto submits_before = surfaces.transaction_statistics().submitted;
+					const auto leases_before = surfaces.memory_statistics().leased_allocations;
+					const std::array selected_requests{requests[0], requests[3]};
+					const auto split_gate = [gpu.device() newSharedEvent];
+					unblock split_release{split_gate};
+					auto job = textures.prepare_versioned_batch(selected_requests, surfaces,
+						std::array{guest_texture_upload_dependency{split_gate, 1}}, {}, texture_upload_path::separate, 3);
+					require(!job.ready() && !surfaces.status(target).initialized && surfaces.status(target).deferred_copies == 4,
+						"Independent MSAA planes materialized the cold destination before their dependency");
+					split_gate.signaledValue = 1;
+					const auto split = job.finish();
+					require(split.front().image.texture == split.back().image.texture &&
+						split.front().image.metadata.coordinates.flags == texture_coordinate_sample_raster &&
+						!surfaces.status(target).initialized && surfaces.status(target).deferred_copies == 4 &&
+						ram->reads == reads_before && surfaces.transaction_statistics().submitted == submits_before &&
+						surfaces.memory_statistics().leased_allocations == leases_before,
+						"Independent MSAA planes lost their shared snapshot or restored the cold target");
+					auto warm_split = textures.prepare_versioned_batch(selected_requests, surfaces, {}, {}, texture_upload_path::separate, 3);
+					require(warm_split.ready() && warm_split.finish().front().image.texture == split.front().image.texture,
+						"Independent MSAA planes missed the current ready snapshot");
+					sample(split.front().image, selected_requests[0], {.25f, .5f, 0, 1}, expected(0));
+					sample(split.front().image, selected_requests[0], {.75f, .5f, 0, 1}, expected(1));
+					sample(split.back().image, selected_requests[1], {.25f, .5f, 0, 1}, expected(0, true, 1));
+					sample(split.back().image, selected_requests[1], {.75f, .5f, 0, 1}, expected(1, true, 0));
+					split_plane_draws += 4;
+					surfaces.cancel_deferred_copies(target);
+					surfaces.defer_copy(a, {0, 0, 1, 1}, target, 0, 0, texture_plane::depth);
+					surfaces.defer_copy(b, {0, 0, 1, 1}, target, 1, 0, texture_plane::depth);
+					const auto missing_stencil_reads = ram->reads;
+					const auto guest_gate = [gpu.device() newSharedEvent];
+					unblock guest_release{guest_gate};
+					auto guest_job = textures.prepare_versioned_batch(selected_requests, surfaces,
+						std::array{guest_texture_upload_dependency{guest_gate, 1}}, {}, texture_upload_path::separate, 3);
+					bool guest_timeout = false;
+					try { (void)guest_job.finish(std::chrono::milliseconds(1)); }
+					catch (const submission_wait_timeout&) { guest_timeout = true; }
+					require(guest_timeout && !guest_job.ready() && !surfaces.status(target).initialized &&
+						surfaces.status(target).deferred_copies == 2 && ram->reads == missing_stencil_reads + 1,
+						"Guest MSAA background was not retained across the event timeout");
+					guest_gate.signaledValue = 1;
+					gpu.wait_idle();
+					surfaces.defer_copy(b, {0, 0, 2, 1}, target, 0, 0, texture_plane::stencil);
+					const auto latest_guest = textures.prepare_versioned_batch(selected_requests, surfaces, {}, {},
+						texture_upload_path::separate, 3).finish();
+					const auto fallback = guest_job.finish();
+					require(!surfaces.status(target).initialized && surfaces.status(target).deferred_copies == 3 &&
+						ram->reads == missing_stencil_reads + 1 && fallback.front().image.texture == fallback.back().image.texture,
+						"Missing MSAA stencil background materialized the target or lost its shared snapshot");
+					auto warm_guest = textures.prepare_versioned_batch(selected_requests, surfaces, {}, {}, texture_upload_path::separate, 3);
+					require(warm_guest.ready() && warm_guest.finish().front().image.texture == latest_guest.front().image.texture &&
+						latest_guest.front().image.texture != fallback.front().image.texture,
+						"Late guest-background snapshot displaced the newer stencil epoch");
+					sample(fallback.front().image, selected_requests[0], {.25f, .5f, 0, 1}, expected(0));
+					sample(fallback.front().image, selected_requests[0], {.75f, .5f, 0, 1}, expected(1));
+					auto left = expected(0, true), right = expected(1, true);
+					left[2] = right[2] = 0; // Stencil came from the untouched guest background.
+					sample(fallback.back().image, selected_requests[1], {.25f, .5f, 0, 1}, left);
+					sample(fallback.back().image, selected_requests[1], {.75f, .5f, 0, 1}, right);
+					sample(latest_guest.back().image, selected_requests[1], {.25f, .5f, 0, 1}, expected(0, true, 1));
+					sample(latest_guest.back().image, selected_requests[1], {.75f, .5f, 0, 1}, expected(1, true, 1));
+					guest_background_draws += 6;
+				}
+				paint(target, 2, {0, 0, 6, 5});
+				for (const bool spill : {false, true})
+				{
+					if (spill)
+					{
+						surfaces.cancel_deferred_copies(target);
+						surfaces.spill(target);
+					}
+					const unsigned first_row = spill ? 3 : 0, y_origin = spill ? first_row * sy - 1 : 0;
+					surfaces.defer_copy(a, {0, 0, 2, 2}, target, 0, first_row);
+					surfaces.defer_copy(b, {1, 1, 2, 1}, target, 1, first_row + 1);
+					if (depth)
+					{
+						surfaces.defer_copy(b, {2, 2, 1, 1}, target, 0, first_row, texture_plane::stencil);
+						surfaces.defer_copy(a, {1, 1, 1, 1}, target, 1, first_row + 1, texture_plane::depth);
+					}
+					auto overlap = crop(1, y_origin, false, format);
+					const unsigned height = sy * 2 + 1;
+					overlap.image_rect = (6u << 16) | height;
+					auto packed = overlap;
+					packed.format = (packed.format & ~(0x9fu << 8)) | (0x85u << 8);
+					const auto pending_background = surfaces.status(target);
+					const auto background_reads = ram->reads;
+					const auto background_submissions = surfaces.transaction_statistics().submitted;
+					const std::array background_requests{overlap, packed};
+					const auto background = textures.prepare_versioned_batch(std::span(background_requests).first(depth ? 2 : 1),
+						surfaces, {}, {}, texture_upload_path::separate, depth ? 3 : 1).finish();
+					const auto after = surfaces.status(target);
+					require(background.front().image.texture.width == 6 && background.front().image.texture.height == height &&
+						background.front().image.metadata.coordinates.flags == texture_coordinate_sample_raster &&
+						(!depth || background.front().image.texture == background.back().image.texture) &&
+						after.spilled == spill && after.deferred_copies == (depth ? 4 : 2) && after.content_generation == pending_background.content_generation &&
+						ram->reads == background_reads && surfaces.transaction_statistics().submitted == background_submissions,
+						"Overlapping MSAA sections materialized the destination or lost its native background");
+					for (unsigned y = 0; y < height; ++y)
+						for (unsigned x = 0; x < 6; ++x)
+						{
+							const unsigned cell_x = (x + 1) / 2, cell_y = (y + y_origin) / sy;
+							const unsigned i = cell_y == first_row + 1 && cell_x >= 1 && cell_x < 3 ? 1 :
+								cell_y >= first_row && cell_y < first_row + 2 && cell_x < 2 ? 0 : 2;
+							const unsigned z = depth && cell_x == 1 && cell_y == first_row + 1 ? 0 : i;
+							const unsigned s = depth && cell_x == 0 && cell_y == first_row ? 1 : i;
+							const color uv{(x + .5f) / 6, (y + .5f) / height, 0, 1};
+							sample(background.front().image, overlap, uv, expected(z));
+							if (depth) sample(background.back().image, packed, uv, expected(z, true, s));
+							crossing_draws += depth ? 2 : 1;
+						}
+				}
+			}
+		std::cout << cases - before - crossing_draws - split_plane_draws - guest_background_draws << " deferred native MSAA draws: separate donors in one epoch, shared windows, gate, replacement, old completion and cancellation\n";
+		std::cout << crossing_draws << " composed MSAA raster draws: cold/overlapping windows, resident and spilled backgrounds, hidden incompatible copy, timeout and late replacement without materialization or guest reads\n";
+		std::cout << split_plane_draws << " independent depth/stencil MSAA draws: cold targets with no allocation, mixed projection and plane order, packed and depth bindings share one snapshot\n";
+		std::cout << guest_background_draws << " missing-plane MSAA draws: guest stencil captured once into the shared snapshot, event timeout, late completion and newer stencil epoch without target materialization\n";
+	}
+	void deferred_guest_multisample_cases()
+	{
+		const std::array formats{
+			surface_format{surface_color::x1rgb5_zero}, surface_format{surface_color::x1rgb5_one},
+			surface_format{surface_color::rgb565}, surface_format{surface_color::xrgb8_zero}, surface_format{surface_color::xrgb8_one},
+			surface_format{surface_color::argb8}, surface_format{surface_color::b8}, surface_format{surface_color::gb8},
+			surface_format{surface_color::rgba16f}, surface_format{surface_color::rgba32f}, surface_format{surface_color::r32f},
+			surface_format{surface_color::xbgr8_zero}, surface_format{surface_color::xbgr8_one}, surface_format{surface_color::abgr8},
+			surface_format{surface_depth::z16_uint}, surface_format{surface_depth::z16_float},
+			surface_format{surface_depth::z24s8_uint}, surface_format{surface_depth::z24s8_float}};
+		unsigned windows = 0, profiles = 0;
+		std::size_t checked_bytes = 0;
+		for (const auto& format : formats)
+			for (const unsigned samples : {2u, 4u})
+				for (unsigned storage = 0; storage < 5; ++storage)
+				{
+					context gpu{1};
+					auto budget = std::make_shared<heap_budget>(gpu, 8u << 20);
+					gpu.set_buffer_budget(budget);
+					surface_cache surfaces(gpu, ram, 8u << 20, budget);
+					const auto* color_format = std::get_if<surface_color>(&format);
+					const bool depth = !color_format;
+					const auto metadata = depth ? describe_surface_depth(std::get<surface_depth>(format)) : surface_depth_descriptor{};
+					const auto color_metadata = depth ? surface_color_layout{} : color_layout(*color_format);
+					const auto bytes = depth ? metadata.guest_bytes : color_metadata.pixel_bytes;
+					const auto native_bytes = depth ? metadata.depth_bytes : bytes;
+					const auto size = sample_expanded_size(6, 5, samples);
+					const unsigned width = size[0], height = size[1];
+					const bool banked = storage >= 3, morton = storage == 2 || storage == 4;
+					cached_surface_description descriptor{banked ? 0x10400u + 2 * bytes : 0x1000u,
+						{6, 5, samples, format, false}, morton ? 0u : banked ? 512u : width * bytes + 3 * bytes + unsigned(storage == 1), {}};
+					if (morton) descriptor.morton = swizzle_region{{32, 16, banked ? 1u : 2u}, {3, 2, banked ? 0u : 1u}, {width, height, 1}};
+					if (banked) descriptor.tile = banked_tile_layout{0x10000, 0x20000, 512, 3, 1024 + 2 * bytes};
+					ram->bytes.assign(0x30000, std::byte{0xda});
+					++ram->version;
+					std::vector<std::byte> guest(width * height * bytes);
+					for (unsigned y = 0; y < height; ++y)
+						for (unsigned x = 0; x < width; ++x)
+							for (unsigned c = 0; c < bytes; ++c)
+								guest[(y * width + x) * bytes + c] = std::byte(0x30 + ((x * 3 + y * 7 + c * 5) & 15));
+					// Preserve special float words in guest holes without passing
+					// them through a render shader or a normalized MSAA import.
+					if (color_format && (*color_format == surface_color::rgba16f || *color_format == surface_color::rgba32f || *color_format == surface_color::r32f))
+					{
+						const unsigned element = color_metadata.endian_element_bytes;
+						const auto special = element == 2 ? std::array{0x8000u, 1u, 0x83ffu, 0x7c00u, 0xfc00u, 0x7e55u, 0xfe21u} :
+							std::array{0x80000000u, 1u, 0x807fffffu, 0x7f800000u, 0xff800000u, 0x7fc12345u, 0xffc04321u};
+						for (unsigned i = 0; i < guest.size() / element; ++i)
+							for (unsigned c = 0; c < element; ++c)
+								guest[i * element + c] = std::byte(special[i % special.size()] >> (8 * (element - c - 1)));
+					}
+					auto layout = plan_guest_surface(descriptor.address, width, height, bytes, descriptor.row_pitch, descriptor.morton);
+					if (banked)
+					{
+						layout = attach_banked_tile(layout, *descriptor.tile);
+						std::vector<std::byte> tile(descriptor.tile->size, std::byte{0xda});
+						for (unsigned y = 0; y < height; ++y)
+							for (unsigned x = 0; x < width; ++x)
+								for (unsigned c = 0; c < bytes; ++c)
+								{
+									const auto& bank = *descriptor.tile;
+									const auto logical = bank.offset + (morton ? morton_index({x + 3, y + 2, 0}, plan_swizzle(*descriptor.morton, bytes).log2) * bytes : y * bank.pitch + x * bytes) + c;
+									std::array<char, 4> word{};
+									const rsx::detiler_config config{0, banked_tile_factor(bank.pitch), bank.pitch / 256, bank.address, bank.size,
+										static_cast<std::uint32_t>(logical & ~std::size_t(3)), 0, bank.pitch, bank.bank, 1, 1, 4, 4};
+									rsx::tiled_dma_copy(0, 0, config, reinterpret_cast<char*>(tile.data()), word.data(), 1);
+									word[logical & 3] = std::to_integer<char>(guest[(y * width + x) * bytes + c]);
+									rsx::tiled_dma_copy(0, 0, config, reinterpret_cast<char*>(tile.data()), word.data(), 0);
+								}
+						std::copy(tile.begin(), tile.end(), ram->bytes.begin() + descriptor.tile->address - 0x1000);
+					}
+					else
+						for (unsigned y = 0; y < height; ++y)
+							for (unsigned x = 0; x < width; ++x)
+								for (unsigned c = 0; c < bytes; ++c)
+								{
+									const auto offset = morton ? morton_index({x + 3, y + 2, 1}, plan_swizzle(*descriptor.morton, bytes).log2) * bytes : y * descriptor.row_pitch + x * bytes;
+									ram->bytes[offset + c] = guest[(y * width + x) * bytes + c];
+								}
+					const auto original = ram->bytes;
+					const auto target = surfaces.acquire(descriptor);
+					std::array<cached_surface_ref, 2> donors;
+					std::array<id<MTLBuffer>, 2> donor_words, donor_stencil;
+					for (unsigned i = 0; i < donors.size(); ++i)
+					{
+						donors[i] = surfaces.acquire({0x5000u + i * 0x1000, {3, 3, 1, format, false}, 3 * bytes, {}});
+						surfaces.prepare(donors[i], surface_initialization::background);
+						surfaces.clear(donors[i], depth ? 3u : 0xf0u, i ? 0xffa04020u : 0xff204080u,
+							i ? 0x40800052u : 0x30800031u, 255, {0, 0, 3, 3});
+						donor_words[i] = make_buffer(gpu, native_bytes, buffer_storage::shared);
+						if (metadata.stencil) donor_stencil[i] = make_buffer(gpu, 1, buffer_storage::shared);
+						surfaces.draw(std::array{cached_surface_use{donors[i], false}}, [&](context& commands, auto images)
+						{
+							texture_region area; area.size = MTLSizeMake(1, 1, 1);
+							texture_to_buffer(commands, images[0], area, donor_words[i], 0, native_bytes, 0, depth ? texture_plane::depth : texture_plane::all);
+							if (metadata.stencil) texture_to_buffer(commands, images[0], area, donor_stencil[i], 0, 1, 0, texture_plane::stencil);
+						});
+					}
+					for (unsigned mode = 0; mode < (metadata.stencil ? 4u : 1u); ++mode)
+					{
+						const auto first_plane = mode == 0 ? texture_plane::all : mode == 2 ? texture_plane::stencil : texture_plane::depth;
+						const auto second_plane = mode == 3 ? texture_plane::stencil : first_plane;
+						surfaces.defer_copy(donors[0], {0, 0, 2, 3}, target, 2, 2, first_plane);
+						surfaces.defer_copy(donors[1], {0, 0, 2, 1}, target, 1, 3, second_plane);
+						for (const auto crop : std::array{clear_rectangle{0, 0, width, height}, clear_rectangle{1, 1, width - 2, height - 2}, clear_rectangle{1, height - 1, width - 1, 1}})
+						{
+							auto reads = ram->reads;
+							const auto submitted = surfaces.transaction_statistics().submitted;
+							const auto leases = surfaces.memory_statistics().leased_allocations;
+							const auto prepare = [&]
+							{
+								return surfaces.snapshot_texture_mapping(std::array{banked ? guest_byte_coverage(layout.range) : layout}, [&](const auto&) -> std::optional<surface_texture_region>
+									{ return surface_texture_region{crop, 0, true}; }, budget);
+							};
+							if (windows == 0)
+							{
+								@autoreleasepool
+								{
+									const auto before = budget->statistics();
+									const auto blocker = budget->shared_buffer(((before.budget - before.reserved_bytes) / 16384) * 16384);
+									std::vector<id<MTLBuffer>> remaining;
+									while (const auto tail = budget->try_shared_buffer(1)) remaining.push_back(tail);
+									bool refused = false;
+									try { (void)prepare(); } catch (const heap_budget_error&) { refused = true; }
+									require(blocker && refused && !surfaces.status(target).initialized && surfaces.status(target).deferred_copies == 2 &&
+										surfaces.snapshot_statistics().entries == 0 && surfaces.memory_statistics().leased_allocations == leases,
+										"Guest-hole MSAA pressure refusal changed the target authority or published partial work");
+								}
+								ram->short_read = true;
+								bool short_refused = false;
+								try { (void)prepare(); }
+								catch (const std::runtime_error& error) { short_refused = std::string_view(error.what()) == "VM surface snapshot has the wrong byte count"; }
+								ram->short_read = false;
+								require(short_refused && !surfaces.status(target).initialized && surfaces.status(target).deferred_copies == 2 &&
+									surfaces.snapshot_statistics().entries == 0 && surfaces.memory_statistics().leased_allocations == leases && ram->bytes == original,
+									"Short guest-hole capture changed authority or published incomplete pixels");
+								reads = ram->reads;
+							}
+							const auto snapshot = prepare();
+							require(snapshot && snapshot.sampleCount == 1 && snapshot.width == crop.width && snapshot.height == crop.height && ram->reads == reads + 1,
+								"Deferred guest-hole snapshot did not capture exactly one guest background");
+							require(!surfaces.status(target).initialized && surfaces.status(target).deferred_copies == 2 &&
+								surfaces.memory_statistics().leased_allocations == leases && surfaces.transaction_statistics().submitted == submitted + 1 && ram->bytes == original,
+								"Deferred guest-hole snapshot mutated the target authority or guest bytes");
+							const auto warm = prepare();
+							require(warm == snapshot && ram->reads == reads + 1 && surfaces.transaction_statistics().submitted == submitted + 1,
+								"Deferred guest-hole snapshot missed the ready cache or recaptured VM");
+							const auto row = crop.width * native_bytes;
+							const auto packed = make_buffer(gpu, row * crop.height, buffer_storage::shared);
+							const auto stencil = metadata.stencil ? make_buffer(gpu, crop.width * crop.height, buffer_storage::shared) : nil;
+							texture_region area; area.size = MTLSizeMake(crop.width, crop.height, 1);
+							gpu.begin();
+							texture_to_buffer(gpu, snapshot, area, packed, 0, row, 0, depth ? texture_plane::depth : texture_plane::all);
+							if (metadata.stencil) texture_to_buffer(gpu, snapshot, area, stencil, 0, crop.width, 0, texture_plane::stencil);
+							gpu.submit().wait();
+							for (unsigned y = 0; y < crop.height; ++y)
+								for (unsigned x = 0; x < crop.width; ++x)
+								{
+									const unsigned gx = x + crop.x, gy = y + crop.y, nx = gx / 2, ny = gy / (samples / 2);
+									const auto owner = [&](texture_plane selected) -> std::optional<unsigned>
+									{
+										if (nx >= 1 && nx < 3 && ny == 3 && (second_plane == texture_plane::all || second_plane == selected)) return 1;
+										if (nx >= 2 && nx < 4 && ny >= 2 && (first_plane == texture_plane::all || first_plane == selected)) return 0;
+										return {};
+									};
+									std::array<std::byte, 16> expected{};
+									if (const auto input = owner(depth ? texture_plane::depth : texture_plane::all))
+										std::memcpy(expected.data(), donor_words[*input].contents, native_bytes);
+									else if (depth)
+									{
+										unsigned raw = 0;
+										for (unsigned c = 0; c < bytes; ++c) raw = raw * 256 + std::to_integer<unsigned>(guest[(gy * width + gx) * bytes + c]);
+										const auto type = std::get<surface_depth>(format);
+										const unsigned bits = type == surface_depth::z16_uint ? raw : type == surface_depth::z16_float ?
+											(raw << 11) + (120u << 23) : type == surface_depth::z24s8_float ? (raw >> 8) << 7 : std::bit_cast<unsigned>(float(raw >> 8) / 16777215.f);
+										std::memcpy(expected.data(), &bits, native_bytes);
+									}
+									else
+										for (unsigned c = 0; c < bytes; ++c)
+											expected[c] = guest[(gy * width + gx) * bytes + (c ^ (color_metadata.endian_element_bytes - 1))];
+									if (std::memcmp(expected.data(), static_cast<const std::byte*>(packed.contents) + y * row + x * native_bytes, native_bytes))
+										throw std::runtime_error("Deferred guest-hole raw word mismatch: format " + std::to_string(profiles) + ", storage " + std::to_string(storage) + ", mode " + std::to_string(mode) + ", x " + std::to_string(gx) + ", y " + std::to_string(gy));
+									if (metadata.stencil)
+									{
+										const auto input = owner(texture_plane::stencil);
+										const auto expected_stencil = input ? *static_cast<const std::byte*>(donor_stencil[*input].contents) : guest[(gy * width + gx) * bytes + 3];
+										require(static_cast<const std::byte*>(stencil.contents)[y * crop.width + x] == expected_stencil,
+											"Deferred guest-hole stencil overwrite order differs from its independent oracle");
+									}
+									checked_bytes += native_bytes + unsigned(metadata.stencil);
+								}
+							++windows;
+						}
+						surfaces.cancel_deferred_copies(target);
+						++profiles;
+					}
+				}
+		std::cout << "Deferred guest-hole MSAA: " << profiles << " format/storage/aspect profiles, " << windows << " windows, " << checked_bytes
+			<< " exact native bytes; all 18 formats, 2/4 samples, aligned/odd pitches, Morton volume slice and banked linear/Morton, overlaps, final-row crops, float special words, independent depth/stencil, ready-cache, pressure refusal/retry, short-read refusal and unchanged target/VM passed\n";
+	}
+	void projected_deferred_multisample_cases()
+	{
+		const auto writer = compile.library(R"msl(
+#include <metal_stdlib>
+using namespace metal;
+vertex float4 project_vertex(uint i [[vertex_id]]) {
+    const float2 p[] = {float2(-1,-1), float2(3,-1), float2(-1,3)};
+    return float4(p[i], 0, 1);
+}
+float4 project_color(float4 p, uint s) {
+    return float4(uint(p.x) + 1, uint(p.y) + 2, s + 3, 64) / 64.0f;
+}
+struct depth_word { float z [[depth(any)]]; uint stencil [[stencil]]; };
+depth_word project_depth(float4 p, uint s) {
+    return {0.25f + float(13 * uint(p.x) + 7 * uint(p.y) + s) / 512.0f,
+        20 + 3 * uint(p.x) + 11 * uint(p.y) + 37 * s};
+}
+fragment float4 write_color(float4 p [[position]], uint s [[sample_id]]) { return project_color(p, s); }
+fragment float4 write_color_single(float4 p [[position]]) { return project_color(p, 0); }
+fragment depth_word write_depth(float4 p [[position]], uint s [[sample_id]]) { return project_depth(p, s); }
+fragment depth_word write_depth_single(float4 p [[position]]) { return project_depth(p, 0); }
+)msl", @"Independent source for projected deferred MSAA");
+		auto ds = [MTLDepthStencilDescriptor new];
+		ds.depthCompareFunction = MTLCompareFunctionAlways;
+		ds.depthWriteEnabled = YES;
+		auto stencil = [MTLStencilDescriptor new];
+		stencil.stencilCompareFunction = MTLCompareFunctionAlways;
+		stencil.depthStencilPassOperation = MTLStencilOperationReplace;
+		ds.frontFaceStencil = ds.backFaceStencil = stencil;
+		const auto depth_state = [ctx.device() newDepthStencilStateWithDescriptor:ds];
+		struct profile { clear_rectangle source, destination; std::array<bool, 3> flip; bool overlap = false; };
+		const std::array profiles{profile{{1, 1, 3, 2}, {1, 1, 4, 3}, {true, false, false}},
+			profile{{0, 0, 5, 4}, {1, 0, 3, 2}, {false, true, false}},
+			profile{{1, 1, 3, 2}, {0, 2, 3, 2}, {true, true, false}, true}};
+		const auto axis = [](unsigned i, unsigned source, unsigned destination, bool flip)
+		{
+			const auto numerator = (2 * i + 1) * source, divisor = 2 * destination;
+			return flip ? (2 * source * destination - numerator) / divisor : numerator / divisor;
+		};
+		std::size_t pixels = 0;
+		unsigned windows = 0;
+		for (const unsigned output_samples : {2u, 4u})
+			for (const unsigned input_samples : {1u, 2u, 4u})
+				for (const auto [code, format] : std::array{
+					std::pair{0x85u, surface_format{surface_color::argb8}}, std::pair{0x9au, surface_format{surface_color::rgba16f}},
+					std::pair{0x9bu, surface_format{surface_color::rgba32f}}, std::pair{0x9cu, surface_format{surface_color::r32f}},
+					std::pair{0x90u, surface_format{surface_depth::z24s8_uint}},
+					std::pair{0x91u, surface_format{surface_depth::z24s8_float}}})
+				{
+					const bool depth = code == 0x90 || code == 0x91, single = input_samples == 1;
+					const auto in = single ? sample_layout{1, 1} : rsx_sample_layout(input_samples);
+					const auto out = rsx_sample_layout(output_samples);
+					const auto bytes = describe_guest_texture_format(code).block.bytes;
+					const auto native = depth ? MTLPixelFormatDepth32Float_Stencil8 : describe_surface_color(std::get<surface_color>(format)).format;
+					context gpu{1};
+					auto budget = std::make_shared<heap_budget>(gpu, 8u << 20);
+					gpu.set_buffer_budget(budget);
+					surface_cache surfaces(gpu, ram, 8u << 20, budget);
+					guest_texture_cache textures(gpu, ram, [](unsigned offset, unsigned, std::size_t) { return 0x1000u + offset - 0x200u; },
+						1u << 20, budget);
+					ram->bytes.assign(0x7000, std::byte{});
+					++ram->version;
+					const auto source = surfaces.acquire({0x4000, {5, 4, input_samples, format, false}, 256, {}});
+					const auto target = surfaces.acquire({0x1000, {6, 5, output_samples, format, false}, 256, {}});
+					auto descriptor = [MTL4RenderPipelineDescriptor new];
+					descriptor.vertexFunctionDescriptor = library_function(writer, @"project_vertex");
+					descriptor.fragmentFunctionDescriptor = library_function(writer, depth ?
+						(single ? @"write_depth_single" : @"write_depth") : (single ? @"write_color_single" : @"write_color"));
+					descriptor.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+					descriptor.rasterSampleCount = input_samples;
+					if (!depth) descriptor.colorAttachments[0].pixelFormat = native;
+					const auto pipeline = compile.render(descriptor);
+					surfaces.draw(std::array{cached_surface_use{source, true}}, [&](context& commands, auto attachments)
+					{
+						auto pass = [MTL4RenderPassDescriptor new];
+						if (depth)
+						{
+							pass.depthAttachment.texture = pass.stencilAttachment.texture = attachments[0];
+							pass.depthAttachment.loadAction = pass.stencilAttachment.loadAction = MTLLoadActionDontCare;
+							pass.depthAttachment.storeAction = pass.stencilAttachment.storeAction = MTLStoreActionStore;
+						}
+						else
+						{
+							pass.colorAttachments[0].texture = attachments[0];
+							pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+							pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+						}
+						raster_state raster;
+						raster.viewport = {0, 0, 5, 4, 0, 1};
+						raster.scissor = {0, 0, 5, 4};
+						render_commands draw(commands, pass);
+						draw.configure(pipeline, depth ? depth_state : nil, raster, {}, {});
+						draw.draw(MTLPrimitiveTypeTriangle, 0, 3);
+						draw.end();
+					});
+					for (const auto& [sr, dr, flip, overlap] : profiles)
+					{
+						surfaces.defer_blit_nearest(source, sr, target, dr, texture_plane::all, flip);
+						if (overlap)
+						{
+							surfaces.defer_copy(source, {4, 3, 1, 1}, target, dr.x + 1, dr.y + 1,
+								depth ? texture_plane::depth : texture_plane::all);
+							if (depth) surfaces.defer_copy(source, {0, 0, 1, 1}, target, dr.x + 1, dr.y + 1, texture_plane::stencil);
+						}
+						const unsigned width = dr.width * out.x - 1, height = dr.height * out.y - 1;
+						auto request = words(code, vertex_texture_dimension::two, true, width, height);
+						request.offset += (dr.x * out.x + 1) * bytes + (dr.y * out.y + 1) * 256;
+						request.control3 = (1u << 20) | 256u;
+						const auto reads = ram->reads;
+						const auto submitted = surfaces.transaction_statistics().submitted;
+						const auto lease_count = surfaces.memory_statistics().leased_allocations;
+						const auto image = textures.prepare_versioned_batch(std::array{request}, surfaces, {}, {},
+							texture_upload_path::separate, 1).finish().front().image;
+						require(image.metadata.coordinates.flags == texture_coordinate_sample_raster &&
+							image.texture.width == width && image.texture.height == height &&
+							!surfaces.status(target).initialized &&
+							surfaces.status(target).deferred_copies == 1 + unsigned(overlap) * (depth ? 2 : 1) &&
+							ram->reads == reads && surfaces.transaction_statistics().submitted == submitted &&
+							surfaces.memory_statistics().leased_allocations == lease_count,
+							"Projected MSAA snapshot materialized its destination or read guest pixels");
+						auto warm = textures.prepare_versioned_batch(std::array{request}, surfaces, {}, {}, texture_upload_path::separate, 1);
+						require(warm.ready() && warm.finish().front().image.texture == image.texture, "Projected MSAA window missed its ready snapshot");
+						const auto row = width * bytes;
+						const auto packed = make_buffer(gpu, row * height, buffer_storage::shared);
+						const auto stencil_words = depth ? make_buffer(gpu, width * height, buffer_storage::shared) : nil;
+						texture_region area;
+						area.size = MTLSizeMake(width, height, 1);
+						gpu.begin();
+						texture_to_buffer(gpu, image.texture, area, packed, 0, row, 0, depth ? texture_plane::depth : texture_plane::all);
+						if (depth) texture_to_buffer(gpu, image.texture, area, stencil_words, 0, width, 0, texture_plane::stencil);
+						gpu.submit().wait();
+						for (unsigned y = 0; y < height; ++y)
+							for (unsigned x = 0; x < width; ++x)
+							{
+								const bool patch = overlap && (x + 1) / out.x == 1 && (y + 1) / out.y == 1;
+								const auto sx = patch ? 4 * in.x + axis((x + 1) % out.x, in.x, out.x, false) :
+									sr.x * in.x + axis(x + 1, sr.width * in.x, dr.width * out.x, flip[0]);
+								const auto sy = patch ? 3 * in.y + axis((y + 1) % out.y, in.y, out.y, false) :
+									sr.y * in.y + axis(y + 1, sr.height * in.y, dr.height * out.y, flip[1]);
+								const auto px = sx / in.x, py = sy / in.y, sample = sx % in.x + in.x * (sy % in.y);
+								const auto* actual = static_cast<const std::byte*>(packed.contents) + y * row + x * bytes;
+								if (depth)
+								{
+									const float z = .25f + float(13 * px + 7 * py + sample) / 512;
+									const unsigned s = patch ? 20 + 37 * sample : 20 + 3 * px + 11 * py + 37 * sample;
+									require(std::memcmp(actual, &z, bytes) == 0 &&
+										static_cast<const unsigned char*>(stencil_words.contents)[y * width + x] == s,
+										"Projected depth/stencil used the wrong source texel or sample");
+								}
+								else
+								{
+									const color rgba{float(px + 1) / 64, float(py + 2) / 64, float(sample + 3) / 64, 1};
+									const std::array bgra{static_cast<unsigned char>(std::lround(rgba[2] * 255)),
+										static_cast<unsigned char>(std::lround(rgba[1] * 255)), static_cast<unsigned char>(std::lround(rgba[0] * 255)),
+										static_cast<unsigned char>(255)};
+									const std::array half{_Float16(rgba[0]), _Float16(rgba[1]), _Float16(rgba[2]), _Float16(rgba[3])};
+									const void* expected = code == 0x85 ? static_cast<const void*>(bgra.data()) :
+										code == 0x9a ? static_cast<const void*>(half.data()) : static_cast<const void*>(rgba.data());
+									require(std::memcmp(actual, expected, bytes) == 0, "Projected color used the wrong source texel or sample");
+								}
+								++pixels;
+							}
+						surfaces.cancel_deferred_copies(target);
+						++windows;
+					}
+				}
+		std::cout << "Projected deferred MSAA: " << windows << " windows, " << pixels
+			<< " exact color/depth/stencil texels; 1/2/4 source samples, 2/4 destination samples, odd crops, scaling, X/Y flips and newer overlapping copy, no materialization or guest reads\n";
+	}
+	void deferred_typeless_multisample_cases()
+	{
+		context gpu{1};
+		auto budget = std::make_shared<heap_budget>(gpu, 32u << 20);
+		gpu.set_buffer_budget(budget);
+		surface_color_transfer colors(gpu);
+		surface_depth_transfer depths(gpu);
+		sample_transfer sample_copy(gpu);
+		const std::array<surface_format, 6> formats{surface_color::rgb565, surface_color::argb8,
+			surface_color::rgba16f, surface_color::rgba32f, surface_depth::z24s8_uint, surface_depth::z24s8_float};
+		const std::array destinations{
+			std::pair{surface_format{surface_color::argb8}, 0x85u}, std::pair{surface_format{surface_color::gb8}, 0x8bu},
+			std::pair{surface_format{surface_color::rgba16f}, 0x9au}, std::pair{surface_format{surface_color::rgba32f}, 0x9bu},
+			std::pair{surface_format{surface_depth::z24s8_uint}, 0x90u}, std::pair{surface_format{surface_depth::z24s8_float}, 0x91u}};
+		const auto axis = [](unsigned i, unsigned from, unsigned to, bool flip)
+		{
+			const auto numerator = (2 * i + 1) * from, denominator = 2 * to;
+			return flip ? (from * denominator - numerator) / denominator : numerator / denominator;
+		};
+		unsigned windows = 0;
+		std::size_t bytes_checked = 0;
+		for (const auto& sf : formats)
+			for (const auto& [df, code] : destinations)
+				for (const unsigned input_samples : {1u, 2u, 4u})
+					for (const unsigned output_samples : {2u, 4u})
+						for (const auto flip : {std::array{true, false, false}, std::array{false, true, false}})
+						{
+							@autoreleasepool
+							{
+								const auto in = input_samples == 1 ? sample_layout{1, 1} : rsx_sample_layout(input_samples);
+								const auto out = rsx_sample_layout(output_samples);
+								const auto sb = surface_guest_bytes(sf), db = surface_guest_bytes(df);
+								const unsigned expanded_width = 64 / sb, expanded_height = 8;
+								const clear_rectangle sr{1, 1, 32 / (in.x * sb), 2}, dr{1, 1, 4, 3};
+								surface_cache surfaces(gpu, ram, 16u << 20, budget);
+								guest_texture_cache textures(gpu, ram, [](unsigned offset, unsigned, std::size_t) { return 0x1000u + offset - 0x200u; },
+									4u << 20, budget);
+								ram->bytes.assign(0x9000, std::byte{0xe7});
+								++ram->version;
+								const auto source = surfaces.acquire({0x4000, {expanded_width / in.x, expanded_height / in.y, input_samples, sf, false}, 128, {}});
+								const auto target = surfaces.acquire({0x1000, {6, 5, output_samples, df, false}, 256, {}});
+								surfaces.prepare(source, surface_initialization::background);
+								std::vector<std::byte> original(64 * expanded_height);
+								for (unsigned y = 0; y < expanded_height; ++y)
+									for (unsigned x = 0; x < 64; x += 2)
+									{
+										original[y * 64 + x] = std::byte(0x34 + ((x / 2 + y) % 3) * 2);
+										original[y * 64 + x + 1] = std::byte((x / 2 + y) & 7);
+									}
+								const auto input = make_upload(gpu, original);
+								surfaces.draw(std::array{cached_surface_use{source, true}}, [&](context& commands, auto images)
+								{
+									id<MTLTexture> expanded = images[0];
+									if (input_samples > 1)
+									{
+										auto descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:images[0].pixelFormat
+											width:expanded_width height:expanded_height mipmapped:NO];
+										descriptor.storageMode = MTLStorageModePrivate;
+										descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView;
+										expanded = make_texture(commands, descriptor);
+									}
+									texture_region area;
+									area.size = MTLSizeMake(expanded_width, expanded_height, 1);
+									if (const auto color = std::get_if<surface_color>(&sf)) colors.upload(commands, *color, input, {0, 64}, expanded, area);
+									else depths.upload(commands, std::get<surface_depth>(sf), input, {0, 64}, expanded, area);
+									if (input_samples > 1) sample_copy.import(commands, expanded, images[0]);
+								});
+								surfaces.defer_blit_typeless(source, sr, target, dr, flip);
+								const bool split = std::holds_alternative<surface_depth>(df);
+								if (split)
+								{
+									const auto stencil = surfaces.acquire({0x6000, {6, 5, output_samples, df, false}, 256, {}});
+									surfaces.clear(stencil, 3, 0, 0xffffff99, 255, {0, 0, 6, 5});
+									surfaces.defer_copy(stencil, {0, 0, 1, 1}, target, dr.x + 1, dr.y + 1, texture_plane::stencil);
+								}
+								const unsigned width = dr.width * out.x - 1, height = dr.height * out.y - 1;
+								auto regs = words(code, vertex_texture_dimension::two, true, width, height);
+								regs.offset += (dr.x * out.x + 1) * db + (dr.y * out.y + 1) * 256;
+								regs.control3 = (1u << 20) | 256u;
+								const auto reads = ram->reads;
+								const auto submitted = surfaces.transaction_statistics().submitted;
+								const auto leases = surfaces.memory_statistics().leased_allocations;
+								if (windows == 0)
+								{
+									@autoreleasepool
+									{
+										const auto before = budget->statistics();
+										const auto block_bytes = ((before.budget - before.reserved_bytes) / 16384) * 16384;
+										const auto blocker = budget->shared_buffer(block_bytes);
+										std::vector<id<MTLBuffer>> remaining_space;
+										while (const auto remainder = budget->try_shared_buffer(1))
+											remaining_space.push_back(remainder);
+										bool refused = false;
+										try { (void)textures.prepare_versioned_batch(std::array{regs}, surfaces, {}, {}, texture_upload_path::separate, 1).finish(); }
+										catch (const heap_budget_error&) { refused = true; }
+										require(blocker && refused && surfaces.snapshot_statistics().entries == 0 &&
+											!surfaces.status(target).initialized && surfaces.status(target).deferred_copies == 1 && ram->reads == reads,
+											"Typeless MSAA ledger-pressure refusal changed authority or published a partial result");
+									}
+								}
+								const auto gate = windows == 0 ? [gpu.device() newSharedEvent] : nil;
+								struct release { id<MTLSharedEvent> event; ~release() { if (event) event.signaledValue = 1; } } unblock{gate};
+								const std::array dependency{guest_texture_upload_dependency{gate, 1}};
+								auto job = textures.prepare_versioned_batch(std::array{regs}, surfaces,
+									gate ? std::span<const guest_texture_upload_dependency>{dependency} : std::span<const guest_texture_upload_dependency>{},
+									{}, texture_upload_path::separate, 1);
+								if (gate)
+								{
+									bool timed_out = false;
+									try { (void)job.finish(std::chrono::milliseconds(1)); }
+									catch (const submission_wait_timeout&) { timed_out = true; }
+									require(timed_out && !job.ready() && surfaces.snapshot_statistics().entries == 0 &&
+										!surfaces.status(target).initialized, "Typeless MSAA timeout lost its sources or published before completion");
+									gate.signaledValue = 1;
+								}
+								const auto image = job.finish().front().image;
+								require(image.metadata.coordinates.flags == texture_coordinate_sample_raster &&
+									image.texture.width == width && image.texture.height == height && !surfaces.status(target).initialized &&
+									surfaces.status(target).deferred_copies == (split ? 2 : 1) && ram->reads == reads &&
+									surfaces.transaction_statistics().submitted == submitted && surfaces.memory_statistics().leased_allocations == leases,
+									"Deferred typeless MSAA window materialized its destination or read guest pixels");
+								auto warm = textures.prepare_versioned_batch(std::array{regs}, surfaces, {}, {}, texture_upload_path::separate, 1);
+								require(warm.ready() && warm.finish().front().image.texture == image.texture,
+									"Deferred typeless MSAA window missed its current snapshot");
+								const auto row = width * db;
+								const auto output = make_buffer(gpu, row * height, buffer_storage::shared);
+								texture_region area;
+								area.size = MTLSizeMake(width, height, 1);
+								gpu.begin();
+								if (const auto color = std::get_if<surface_color>(&df)) colors.download(gpu, *color, image.texture, area, output, {0, row});
+								else depths.download(gpu, std::get<surface_depth>(df), image.texture, area, output, {0, row});
+								gpu.submit().wait();
+								for (unsigned y = 0; y < height; ++y)
+									for (unsigned x = 0; x < width; ++x)
+									{
+										const auto sx = axis(x + 1, sr.width * in.x * sb / db, dr.width * out.x, flip[0]);
+										const auto sy = axis(y + 1, sr.height * in.y, dr.height * out.y, flip[1]);
+										const auto start = (sr.y * in.y + sy) * 64 + sr.x * in.x * sb + sx * db;
+										for (unsigned byte = 0; byte < db; ++byte)
+										{
+											const bool newer_stencil = split && byte == 3 && (x + 1) / out.x == 1 && (y + 1) / out.y == 1;
+											const auto expected = newer_stencil ? std::byte{0x99} : original[start + byte];
+											require(static_cast<const std::byte*>(output.contents)[y * row + x * db + byte] == expected,
+												"Deferred typeless MSAA projection changed a guest byte or another plane");
+											++bytes_checked;
+										}
+									}
+								++windows;
+							}
+						}
+		std::cout << "Deferred typeless MSAA: " << windows << " windows, " << bytes_checked
+			<< " exact BE guest bytes; six source/target formats, 1/2/4 to 2/4 samples, scaling, flips, odd crops and newer stencil, ledger-pressure refusal/retry and event timeout, no target materialization or guest reads\n";
+	}
+	void multisample_window_budget_case(bool spill = false, surface_color color_format = surface_color::argb8)
+	{
+		context gpu{1};
+		const bool float_color = color_format == surface_color::rgba16f || color_format == surface_color::rgba32f || color_format == surface_color::r32f;
+		const auto budget_bytes = (float_color ? 128u : 32u) << 20;
+		auto budget = std::make_shared<heap_budget>(gpu, budget_bytes);
+		gpu.set_buffer_budget(budget);
+		surface_cache surfaces(gpu, ram, budget_bytes, budget);
+		guest_texture_cache textures(gpu, ram, [](unsigned offset, unsigned, std::size_t) { return 0x1000u + offset - 0x200u; },
+			1u << 20, budget);
+		constexpr unsigned size = 512;
+		const auto pitch = size * 2 * color_layout(color_format).pixel_bytes;
+		ram->bytes.resize(std::max<std::size_t>(5u << 20, pitch * size * 2));
+		++ram->version;
+		const auto source = surfaces.acquire({0x1000, {size, size, 4, color_format, false}, pitch, {}});
+		if (float_color)
+		{
+			// The conventional RSX clear is a NOP for float surfaces. Seed
+			// this fixture with an actual native attachment clear instead.
+			surfaces.prepare(source, surface_initialization::background);
+			surfaces.draw(std::array{cached_surface_use{source, true}}, [&](context& commands, auto images)
+			{
+				auto pass = [MTL4RenderPassDescriptor new];
+				pass.colorAttachments[0].texture = images[0];
+				pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+				pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+				pass.colorAttachments[0].clearColor = MTLClearColorMake(32. / 255, 64. / 255, 128. / 255, 1);
+				(void)commands.render(pass);
+			});
+		}
+		else surfaces.clear(source, 0xf0, 0xff204080, 0, 255, {0, 0, size, size});
+		if (spill) surfaces.spill(source);
+		auto descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:describe_surface_color(color_format).format
+			width:size height:size mipmapped:NO];
+		descriptor.textureType = MTLTextureType2DMultisample;
+		descriptor.sampleCount = 4;
+		descriptor.storageMode = MTLStorageModePrivate;
+		descriptor.hazardTrackingMode = MTLHazardTrackingModeUntracked;
+		descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+		if (spill) descriptor.usage |= MTLTextureUsageRenderTarget;
+		const auto full_charge = [gpu.device() heapTextureSizeAndAlignWithDescriptor:descriptor].size;
+		const auto headroom = spill ? full_charge + full_charge / 2 : full_charge / 2;
+		const auto before = budget->statistics();
+		require(before.budget - before.reserved_bytes > headroom, "MSAA pressure fixture cannot hold its source and blocker");
+		const auto blocker = budget->shared_buffer(before.budget - before.reserved_bytes - headroom);
+		const auto limited = budget->statistics();
+		require(blocker && limited.budget - limited.reserved_bytes == headroom,
+			"MSAA pressure fixture did not reserve the expected headroom");
+		if (spill)
+		{
+			auto expanded = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:descriptor.pixelFormat
+				width:size * 2 height:size * 2 mipmapped:NO];
+			expanded.storageMode = descriptor.storageMode;
+			expanded.hazardTrackingMode = descriptor.hazardTrackingMode;
+			expanded.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+			const auto scratch_charge = [gpu.device() heapTextureSizeAndAlignWithDescriptor:expanded].size;
+			require(full_charge <= headroom && headroom - full_charge < scratch_charge,
+				"MSAA spill pressure fixture did not isolate scratch allocation failure");
+		}
+		const auto code = color_format == surface_color::rgba16f ? 0x9au : color_format == surface_color::rgba32f ? 0x9bu : color_format == surface_color::r32f ? 0x9cu : 0x85u;
+		auto regs = words(code, vertex_texture_dimension::two, true, 3, 2);
+		regs.offset += pitch + color_layout(color_format).pixel_bytes;
+		regs.control3 = (1u << 20) | pitch;
+		const auto reads = ram->reads;
+		const auto revision = ram->version;
+		const auto result = textures.prepare_versioned_batch(std::array{regs}, surfaces, {}, {}, texture_upload_path::separate, 1).finish().front().image;
+		const auto after = budget->statistics();
+		if (!(result.texture.sampleCount == 1 && result.texture.width == 3 && result.texture.height == 2 &&
+			result.metadata.coordinates.flags == texture_coordinate_sample_raster &&
+			surfaces.snapshot_statistics().created == 1 && ram->reads == reads && ram->version == revision &&
+			(!spill || (surfaces.status(source).spilled && after.created == limited.created + 2 &&
+				after.reserved_bytes < limited.reserved_bytes + full_charge))))
+			throw std::runtime_error("MSAA window pressure did not fall back to its small exact native crop: format " + std::to_string(code) +
+			", samples " + std::to_string(result.texture.sampleCount) + ", width " + std::to_string(result.texture.width) +
+			", flags " + std::to_string(result.metadata.coordinates.flags) + ", created " + std::to_string(after.created - limited.created) +
+			", reserved delta " + std::to_string(after.reserved_bytes - limited.reserved_bytes) + ", full charge " + std::to_string(full_charge));
+		color expected{32.f / 255, 64.f / 255, 128.f / 255, 1};
+		if (color_format == surface_color::rgba16f) for (auto& lane : expected) lane = float(_Float16(lane));
+		if (color_format == surface_color::r32f) expected.fill(expected[0]);
+		sample(result, regs, {.5f, .5f, 0, 1}, expected);
+		std::cout << (spill ? "MSAA spill budget: import scratch refused, native output released" : "MSAA window budget: full native copy refused")
+			<< ", one exact 3x2 expanded snapshot published without guest reads\n";
 	}
 	void cache_cases()
 	{
@@ -2909,13 +6974,143 @@ fragment depth_sample sample_depth(float4 p [[position]],uint s [[sample_id]]) {
 	}
 };
 } // namespace
-int main()
+int main(int argc,char** argv)
 {
 	@autoreleasepool
 	{
 		try
 		{
 			fixture f;
+			if (argc == 2 && std::string_view(argv[1]) == "direct-msaa")
+			{
+				f.multisample_snapshot_cases();
+				f.multisample_window_budget_case();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "deferred-msaa")
+			{
+				f.deferred_multisample_snapshot_cases();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "guest-hole-msaa")
+			{
+				f.deferred_guest_multisample_cases();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "projected-msaa")
+			{
+				f.projected_deferred_multisample_cases();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "typeless-msaa")
+			{
+				f.deferred_typeless_multisample_cases();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "float-msaa-spill")
+			{
+				f.multisample_snapshot_cases(true);
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "float-msaa-spill-words")
+			{
+				f.float_multisample_spill_words();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "redirected-depth")
+			{
+				f.redirected_depth_shader();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "packed-depth-color")
+			{
+				f.packed_depth_color_filtering();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "cold-spill")
+			{
+				f.region_alias_cases(fixture::region_source::spilled);
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "native-msaa-spill")
+			{
+				f.region_alias_cases(fixture::region_source::native_spilled);
+				f.multisample_window_budget_case(true);
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "cold-deferred")
+			{
+				f.region_alias_cases(fixture::region_source::deferred);
+				f.deferred_snapshot_epochs();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "conversion-dependencies")
+			{
+				f.conversion_dependencies();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "stored-border")
+			{
+				f.stored_border_cases();
+				f.stored_morton_border_cases();
+				f.stored_border_clamp_cases();
+				f.stored_depth_border_cases();
+				f.stored_border_assembly_cases();
+				f.stored_border_assembly_cases(true);
+				f.stored_border_adjusted_pitch_cases();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "stored-border-anisotropy")
+			{
+				f.stored_border_anisotropic_cases();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "stored-border-cube")
+			{
+				f.stored_border_cube_cases();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "stored-border-volume")
+			{
+				f.stored_border_volume_cases();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "paired-morton")
+			{ f.morton_paired_cases(); return 0; }
+			if (argc == 2 && std::string_view(argv[1]) == "paired-border")
+			{
+				f.paired_border_cases();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "stored-border-1d")
+			{
+				f.stored_border_1d_cases();
+				return 0;
+			}
+			if (argc == 2 && std::string_view(argv[1]) == "stored-border-mip-atlas")
+			{
+				f.stored_border_mip_atlas_cases();
+				f.sampled_border_atlas_cases();
+				return 0;
+			}
+			f.adjusted_pitch_cases();
+			f.adjusted_pitch_aliases();
+			if(argc==2&&std::string_view(argv[1])=="adjusted-pitch")return 0;
+			f.stored_border_cases();
+			f.stored_border_anisotropic_cases();
+			f.stored_border_cube_cases();
+			f.stored_border_volume_cases();
+			f.paired_border_cases();
+			f.morton_paired_cases();
+			f.stored_border_1d_cases();
+			f.stored_border_mip_atlas_cases();
+			f.sampled_border_atlas_cases();
+			f.stored_morton_border_cases();
+			f.stored_border_clamp_cases();
+			f.stored_depth_border_cases();
+			f.stored_border_assembly_cases();
+			f.stored_border_assembly_cases(true);
+			f.stored_border_adjusted_pitch_cases();
 			f.depth_volume_cases();
 			f.depth_volume_specials();
 			f.depth_volume_owners();
@@ -2935,10 +7130,13 @@ int main()
 			f.assembly_alias_pieces();
 			f.all();
 			f.upload_work_cases();
+			f.conversion_dependencies();
 			f.upload_job_cases();
 			f.captured_lifetime_cases();
 			f.versioned_cases();
 			f.cache_cases();
+			f.packed_depth_color_filtering();
+			f.redirected_depth_shader();
 			f.surface_alias_cases();
 			f.native_snapshot_cache_cases();
 			f.typeless_surface_cases();
@@ -2946,7 +7144,19 @@ int main()
 			f.block_surface_cases();
 			f.clean_surface_cpu_changes();
 			f.region_alias_cases();
+			f.region_alias_cases(fixture::region_source::spilled);
+			f.region_alias_cases(fixture::region_source::native_spilled);
+			f.multisample_window_budget_case(true);
+			f.region_alias_cases(fixture::region_source::deferred);
+			f.deferred_snapshot_epochs();
 			f.multisample_snapshot_cases();
+			f.multisample_snapshot_cases(true);
+			f.float_multisample_spill_words();
+			f.multisample_window_budget_case();
+			f.deferred_multisample_snapshot_cases();
+			f.deferred_guest_multisample_cases();
+			f.projected_deferred_multisample_cases();
+			f.deferred_typeless_multisample_cases();
 		}
 		catch (const std::exception& e)
 		{

@@ -82,6 +82,12 @@ bool supports_native_depth_bounds(id<MTLDevice> device)
 }
 
 render_commands::render_commands(context& ctx, MTL4RenderPassDescriptor* descriptor)
+	: render_commands(ctx, descriptor, MTLStageAll, context::render_writes::opaque)
+{
+}
+
+render_commands::render_commands(context& ctx, MTL4RenderPassDescriptor* descriptor, MTLStages before,
+	context::render_writes writes, const bindings* vertex, id<MTLBuffer> geometry, context::shared_guest_pass* shared)
 	: m_context(ctx)
 {
 	const auto [width, height] = pass_extent(descriptor);
@@ -89,7 +95,40 @@ render_commands::render_commands(context& ctx, MTL4RenderPassDescriptor* descrip
 	m_height = height;
 	m_visibility = descriptor.visibilityResultBuffer;
 	m_depth_bounds_supported = supports_native_depth_bounds(ctx.device());
-	m_encoder = ctx.render(descriptor);
+	m_full_barrier = before == MTLStageAll && !vertex;
+	m_encoder = ctx.render_encoder(descriptor, before, writes, vertex, geometry, shared);
+}
+
+void render_commands::materialize_attachments(context& ctx, MTL4RenderPassDescriptor* descriptor)
+{
+	(void)ctx.render_encoder(descriptor, MTLStageAll, context::render_writes::attachments);
+	ctx.end_encoding();
+}
+
+void render_commands::draw_prepared_guest(context& ctx, MTL4RenderPassDescriptor* descriptor, const prepared_geometry& geometry,
+	id<MTLRenderPipelineState> pipeline, id<MTLDepthStencilState> depth_stencil, const raster_state& state,
+	const bindings& vertex, const bindings& fragment, MTLVisibilityResultMode visibility, std::size_t visibility_offset,
+	const conditional_draw* conditional, bool retain_guest_pass)
+{
+	context::shared_guest_pass shared{fragment, visibility, visibility_offset};
+	render_commands commands(ctx, descriptor, MTLStageAll, context::render_writes::attachments,
+		conditional ? nullptr : &vertex, geometry.buffer(), retain_guest_pass ? &shared : nullptr);
+	if (shared.reused ? shared.visibility_changed : visibility != MTLVisibilityResultModeDisabled)
+		commands.visibility(visibility, visibility_offset);
+	if (conditional) commands.draw_geometry(*conditional, pipeline, depth_stencil, state, vertex, fragment);
+	else commands.draw_geometry(geometry, pipeline, depth_stencil, state, vertex, fragment);
+	if (!retain_guest_pass) commands.end();
+}
+
+void render_commands::draw_fragment_triangle(context& ctx, MTL4RenderPassDescriptor* descriptor, id<MTLRenderPipelineState> pipeline,
+	id<MTLDepthStencilState> depth_stencil, const raster_state& state, const bindings& fragment)
+{
+	// Attachments and fragment resources still wait for all earlier queue
+	// stages, including writers behind views or aliasing allocations.
+	render_commands commands(ctx, descriptor, MTLStageFragment | MTLStageTile, context::render_writes::attachments);
+	commands.configure(pipeline, depth_stencil, state, {}, fragment);
+	commands.draw(MTLPrimitiveTypeTriangle, 0, 3);
+	commands.end();
 }
 
 void render_commands::require_active() const
@@ -193,6 +232,23 @@ void render_commands::draw(MTLPrimitiveType primitive, std::size_t first, std::s
 		instanceCount:instances baseInstance:base_instance];
 }
 
+void render_commands::draw(const conditional_draw& conditional)
+{
+	if (!m_full_barrier || !conditional.m_recording.same_batch(m_context.recording_submission()))
+		throw std::invalid_argument("Metal 4 conditional draw requires a fully ordered render pass in its recording");
+	if (!should_draw(conditional.m_primitive, conditional.m_count, conditional.m_instances)) return;
+	m_context.use_resource(conditional.m_arguments);
+	if (conditional.m_index_bytes)
+	{
+		m_context.use_resource(conditional.m_geometry);
+		[m_encoder drawIndexedPrimitives:conditional.m_primitive indexType:conditional.m_index_type
+			indexBuffer:conditional.m_geometry.gpuAddress + conditional.m_index_offset
+			indexBufferLength:conditional.m_index_bytes indirectBuffer:conditional.m_arguments.gpuAddress];
+	}
+	else
+		[m_encoder drawPrimitives:conditional.m_primitive indirectBuffer:conditional.m_arguments.gpuAddress];
+}
+
 void render_commands::draw_indexed(MTLPrimitiveType primitive, id<MTLBuffer> indices, std::size_t offset,
 	MTLIndexType type, std::size_t count, std::size_t instances, std::ptrdiff_t base_vertex, std::size_t base_instance)
 {
@@ -254,9 +310,7 @@ void render_commands::draw_geometry(const prepared_geometry& geometry, id<MTLRen
 	const bindings& fragment, std::size_t instances, std::size_t base_instance)
 {
 	require_active();
-	const auto topology = geometry.references().topology;
-	const auto primitive = topology == list_topology::points ? MTLPrimitiveTypePoint :
-		topology == list_topology::lines ? MTLPrimitiveTypeLine : MTLPrimitiveTypeTriangle;
+	const auto primitive = geometry.primitive();
 	validate_draw_ids(base_instance,instances);
 	if (!geometry.count() || !instances) return;
 	const auto buffer = geometry.buffer();
@@ -267,6 +321,18 @@ void render_commands::draw_geometry(const prepared_geometry& geometry, id<MTLRen
 	if (geometry.index_width()) draw_indexed(primitive,buffer,geometry.index_offset(),
 		geometry.index_width() == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32,geometry.count(),instances,0,base_instance);
 	else draw(primitive,0,geometry.count(),instances,base_instance);
+}
+
+void render_commands::draw_geometry(const conditional_draw& conditional, id<MTLRenderPipelineState> pipeline,
+	id<MTLDepthStencilState> depth_stencil, const raster_state& state,
+	const bindings& vertex, const bindings& fragment)
+{
+	if (!conditional.m_geometry || conditional.m_geometry.device != m_context.device())
+		throw std::invalid_argument("Metal 4 conditional geometry requires a prepared packet on the context device");
+	auto resources = vertex;
+	resources.set_buffer(geometry_binding, conditional.m_geometry);
+	configure(pipeline, depth_stencil, state, resources, fragment);
+	draw(conditional);
 }
 
 }

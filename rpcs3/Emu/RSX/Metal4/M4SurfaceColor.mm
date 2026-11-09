@@ -1,4 +1,5 @@
 #include "M4SurfaceColor.h"
+#include <cstring>
 #include "M4SurfaceColorKernels.h"
 #include "M4SurfaceValidation.h"
 
@@ -103,6 +104,13 @@ surface_color_transfer::surface_color_transfer(context& ctx) : m_device(ctx.devi
 void surface_color_transfer::convert(context& ctx, surface_color format, std::size_t width, std::size_t height,
 	id<MTLBuffer> source, const surface_byte_region& input, id<MTLBuffer> destination, const surface_byte_region& output) const
 {
+	convert_impl(ctx, format, width, height, source, input, destination, output, nil);
+}
+
+void surface_color_transfer::convert_impl(context& ctx, surface_color format, std::size_t width, std::size_t height,
+	id<MTLBuffer> source, const surface_byte_region& input, id<MTLBuffer> destination,
+	const surface_byte_region& output, id<MTLBuffer> prepared) const
+{
 	if (ctx.device() != m_device) throw std::invalid_argument("Native surface transfer belongs to another Metal device");
 	const auto layout = color_layout(format);
 	const auto source_layout = surface_byte_layout(format, width, height, input);
@@ -116,22 +124,20 @@ void surface_color_transfer::convert(context& ctx, surface_color format, std::si
 	bindings resources;
 	resources.set_buffer(0, source);
 	resources.set_buffer(1, destination);
-	ctx.keep_alive(m_pipeline);
 	constexpr std::size_t max_count = 1u << 30;
 	for (std::size_t first = 0; first < pixels;)
 	{
 		const auto count = std::min(pixels - first, max_count);
 		const color_parameters params{input.offset, output.offset, source_layout.bytes_per_row, destination_layout.bytes_per_row,
 			width, count, first, layout.pixel_bytes, layout.endian_element_bytes};
-		const auto uniforms = ctx.upload(std::as_bytes(std::span{&params, 1}), 256);
+		const auto uniforms = prepared ? upload_slice{prepared, (first / max_count) * 256, sizeof(params)} :
+			ctx.upload(std::as_bytes(std::span{&params, 1}), 256);
 		resources.set_buffer(2, uniforms.buffer, uniforms.offset);
-		const auto table = resources.snapshot(ctx);
-		const auto encoder = ctx.compute();
-		ctx.barrier(MTLStageDispatch | MTLStageBlit, MTLStageDispatch);
-		[encoder setComputePipelineState:m_pipeline];
-		[encoder setArgumentTable:table];
-		[encoder dispatchThreads:MTLSizeMake(count, 1, 1)
-			threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(256, m_pipeline.maxTotalThreadsPerThreadgroup), 1, 1)];
+		const std::array accesses{
+			context::accessed_resource{source, input.offset, source_layout.allocation_size},
+			context::accessed_resource{destination, output.offset, destination_layout.allocation_size, true},
+			context::accessed_resource{uniforms.buffer, uniforms.offset, uniforms.size}};
+		ctx.checked_dispatch(m_pipeline, resources, accesses, count);
 		first += count;
 	}
 }
@@ -149,17 +155,51 @@ void surface_color_transfer::upload(context& ctx, surface_color format, id<MTLBu
 	buffer_to_texture(ctx, native, 0, texture, region, pitch);
 }
 
+surface_color_transfer::download_storage surface_color_transfer::prepare_download(context& ctx, surface_color format,
+	const texture_region& region, id<MTLBuffer> guest, const surface_byte_region& output) const
+{
+	if (ctx.device() != m_device) throw std::invalid_argument("Native surface transfer belongs to another Metal device");
+	const auto width = region.size.width, height = region.size.height;
+	const auto layout = color_layout(format);
+	const auto destination = surface_byte_layout(format, width, height, output);
+	validate_range(ctx, guest, output, destination);
+	const auto pitch = staging_pitch(format, region);
+	const auto native = make_buffer(ctx, checked_texture_product(pitch, height), buffer_storage::private_gpu);
+	const auto pixels = checked_texture_product(width, height);
+	constexpr std::size_t max_count = 1u << 30;
+	static_assert(sizeof(color_parameters) <= 256);
+	const auto uniforms = make_buffer(ctx, checked_texture_product((pixels - 1) / max_count + 1, 256), buffer_storage::shared);
+	auto* bytes = static_cast<std::byte*>(uniforms.contents);
+	for (std::size_t first = 0; first < pixels;)
+	{
+		const auto count = std::min(pixels - first, max_count);
+		const color_parameters params{0, output.offset, pitch, destination.bytes_per_row,
+			width, count, first, layout.pixel_bytes, layout.endian_element_bytes};
+		std::memcpy(bytes, &params, sizeof(params));
+		bytes += 256;
+		first += count;
+	}
+	return {native, uniforms, pitch};
+}
+
 void surface_color_transfer::download(context& ctx, surface_color format, id<MTLTexture> texture, const texture_region& region,
 	id<MTLBuffer> guest, const surface_byte_region& output) const
 {
+	download_impl(ctx, format, texture, region, guest, output, nullptr);
+}
+
+void surface_color_transfer::download_impl(context& ctx, surface_color format, id<MTLTexture> texture,
+	const texture_region& region, id<MTLBuffer> guest, const surface_byte_region& output, const download_storage* prepared) const
+{
 	if (ctx.device() != m_device) throw std::invalid_argument("Native surface transfer belongs to another device");
 	validate_surface_texture(ctx, describe_surface_color(format).format, texture, region);
-	const auto pitch = staging_pitch(format, region);
-	const auto size = checked_texture_product(pitch, region.size.height);
+	const auto pitch = prepared ? prepared->pitch : staging_pitch(format, region);
 	// Validate destination before recording texture reads.
 	validate_range(ctx, guest, output, surface_byte_layout(format, region.size.width, region.size.height, output));
-	const auto native = make_buffer(ctx, size, buffer_storage::private_gpu);
+	const auto native = prepared ? prepared->native :
+		make_buffer(ctx, checked_texture_product(pitch, region.size.height), buffer_storage::private_gpu);
 	texture_to_buffer(ctx, texture, region, native, 0, pitch);
-	convert(ctx, format, region.size.width, region.size.height, native, {0, pitch}, guest, output);
+	convert_impl(ctx, format, region.size.width, region.size.height, native, {0, pitch}, guest, output,
+		prepared ? prepared->uniforms : nil);
 }
 }

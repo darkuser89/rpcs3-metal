@@ -302,10 +302,8 @@ void buffer_to_texture(context& ctx, id<MTLBuffer> source, std::size_t offset,
 					   std::size_t row_pitch, std::size_t image_pitch, texture_plane plane)
 {
 	const auto layout = validate_transfer(ctx, destination, region, source, offset, row_pitch, image_pitch, plane);
-	ctx.use_resource(source);
-	ctx.use_resource(destination);
-	auto encoder = ctx.compute();
-	ctx.barrier(MTLStageDispatch | MTLStageBlit, MTLStageBlit);
+	auto encoder = ctx.checked_blit({source, offset, layout.allocation_size},
+		{destination, 0, 0, true, region.level, region.slice, {region.origin, region.size}});
 	[encoder copyFromBuffer:source
 			   sourceOffset:offset
 		  sourceBytesPerRow:layout.bytes_per_row
@@ -323,10 +321,8 @@ void texture_to_buffer(context& ctx, id<MTLTexture> source, const texture_region
 					   std::size_t row_pitch, std::size_t image_pitch, texture_plane plane)
 {
 	const auto layout = validate_transfer(ctx, source, region, destination, offset, row_pitch, image_pitch, plane);
-	ctx.use_resource(source);
-	ctx.use_resource(destination);
-	auto encoder = ctx.compute();
-	ctx.barrier(MTLStageDispatch | MTLStageBlit, MTLStageBlit);
+	auto encoder = ctx.checked_blit({source, 0, 0, false, region.level, region.slice, {region.origin, region.size}},
+		{destination, offset, layout.allocation_size});
 	[encoder copyFromTexture:source
 					 sourceSlice:region.slice
 					 sourceLevel:region.level
@@ -406,16 +402,10 @@ void copy_texture(context& ctx, id<MTLTexture> source, const texture_region& sr,
 			descriptor.storageMode = MTLStorageModePrivate;
 			descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView;
 			readable = make_texture(ctx, descriptor);
-			ctx.use_resource(source);
-			ctx.use_resource(readable);
-			const auto encoder = ctx.compute();
-			ctx.barrier(MTLStageDispatch | MTLStageBlit, MTLStageBlit);
+			const auto encoder = ctx.checked_blit({source}, {readable});
 			[encoder copyFromTexture:source toTexture:readable];
 		}
-		ctx.use_resource(readable);
-		ctx.use_resource(destination);
-		const auto encoder = ctx.compute();
-		ctx.barrier(MTLStageDispatch | MTLStageBlit, MTLStageBlit, aliased);
+		const auto encoder = ctx.checked_blit({readable}, {destination});
 		[encoder copyFromTexture:readable
 					 sourceSlice:sr.slice
 					 sourceLevel:sr.level
@@ -432,10 +422,8 @@ void copy_texture(context& ctx, id<MTLTexture> source, const texture_region& sr,
 	// Parent views and heap placements must be proven disjoint first.
 	if (sd == dd && (!combined || plane == texture_plane::all) && !aliased)
 	{
-		ctx.use_resource(source);
-		ctx.use_resource(destination);
-		const auto encoder = ctx.compute();
-		ctx.barrier(MTLStageDispatch | MTLStageBlit, MTLStageBlit);
+		const auto encoder = ctx.checked_blit({source, 0, 0, false, sr.level, sr.slice, {sr.origin, sr.size}},
+			{destination, 0, 0, true, dr.level, dr.slice, {dr.origin, dr.size}});
 		[encoder copyFromTexture:source
 					 sourceSlice:sr.slice
 					 sourceLevel:sr.level
@@ -475,7 +463,6 @@ void copy_texture(context& ctx, id<MTLTexture> source, const texture_region& sr,
 		prepare(plane);
 	for (const auto& transfer : transfers)
 		texture_to_buffer(ctx, source, sr, transfer.buffer, 0, transfer.layout.bytes_per_row, transfer.layout.bytes_per_image, transfer.plane);
-	if (aliased) ctx.barrier(MTLStageBlit, MTLStageBlit, true);
 	for (const auto& transfer : transfers)
 		buffer_to_texture(ctx, transfer.buffer, 0, destination, dr, transfer.layout.bytes_per_row, transfer.layout.bytes_per_image, transfer.plane);
 }

@@ -1,5 +1,6 @@
 #include "M4RenderPipeline.h"
 #include "M4FragmentShader.h"
+#include "M4ShaderCache.h"
 
 #if !__has_feature(objc_arc)
 #error "The native Metal 4 backend requires ARC."
@@ -535,26 +536,47 @@ render_pipeline_bundle make_render_pipeline(const compiler& compiler, const rend
 		throw std::invalid_argument("Native shader ROP pipeline requires a verified fragment_shader contract");
 	return compile_pipeline(compiler, config, vertex, fragment);
 }
-static void validate_fragment_contract(const compiler& compiler, const render_pipeline_configuration& config, const fragment_shader& fragment)
+struct fragment_contract_view
+{
+    const logic_rop_configuration& logic;
+    const blend_rop_configuration& blend;
+    const output_rop_configuration& output;
+    std::uint32_t half_storage;
+    bool float32;
+    std::uint32_t samples;
+    const depth_mirror_configuration& mirror;
+};
+static void validate_fragment_contract(const compiler& compiler, const render_pipeline_configuration& config, const fragment_contract_view& fragment)
 {
 	const auto state = decode_render_state(config.state);
 	for (unsigned i = 0; i < 4; ++i)
-		if ((config.native_blend_mask & (1u << i)) && !native_export_eligible(config, state, i, fragment.float32_exports()))
+		if ((config.native_blend_mask & (1u << i)) && !native_export_eligible(config, state, i, fragment.float32))
 			throw std::invalid_argument("Native RSX blend selection changes fragment export precision");
-	if (fragment.logic_rop() != config.shader_logic)
+	if (fragment.logic != config.shader_logic)
 		throw std::invalid_argument("Compiled fragment logic ROP differs from pipeline contract");
-	if (fragment.blend_rop() != config.shader_blend)
+	if (fragment.blend != config.shader_blend)
 		throw std::invalid_argument("Compiled fragment blend ROP differs from pipeline contract");
-	if (fragment.output_rop() != config.shader_output)
+	if (fragment.output != config.shader_output)
 		throw std::invalid_argument("Compiled fragment output ROP differs from pipeline contract");
-	if (fragment.half_storage_mask() != config.shader_half_storage_mask)
+	if (fragment.half_storage != config.shader_half_storage_mask)
 		throw std::invalid_argument("Compiled fragment half storage exports differ from pipeline contract");
-	if (fragment.raster_sample_count() != config.state.sample_count)
+	if (fragment.samples != config.state.sample_count)
 		throw std::invalid_argument("Compiled fragment shading sample count differs from pipeline contract");
-	if (fragment.depth_mirror() != config.depth_mirror)
+	if (fragment.mirror != config.depth_mirror)
 		throw std::invalid_argument("Compiled stored-depth mirror differs from pipeline contract");
 	if ((config.shader_logic.enabled || config.shader_blend.enabled() || config.depth_mirror.enabled()) && !compiler.device().rasterOrderGroupsSupported)
 		throw std::invalid_argument("Native shader ROP requires Apple raster order groups");
+}
+
+static void validate_fragment_contract(const compiler& compiler, const render_pipeline_configuration& config, const fragment_shader& fragment)
+{
+    validate_fragment_contract(compiler,config,fragment_contract_view{fragment.logic_rop(),fragment.blend_rop(),fragment.output_rop(),
+        fragment.half_storage_mask(),fragment.float32_exports(),fragment.raster_sample_count(),fragment.depth_mirror()});
+}
+static void validate_fragment_contract(const compiler& compiler, const render_pipeline_configuration& config, const fragment_program_options& fragment)
+{
+    validate_fragment_contract(compiler,config,fragment_contract_view{fragment.logic_rop,fragment.blend_rop,fragment.output_rop,
+        fragment.half_storage_mask,fragment.float32_exports,fragment.raster_sample_count,fragment.depth_mirror});
 }
 
 render_pipeline_bundle make_render_pipeline(const compiler& compiler, const render_pipeline_configuration& config,
@@ -643,12 +665,31 @@ struct render_pipeline_cache::implementation
 struct render_pipeline_cache::preparation
 {
 	implementation::key description;
+	bool described = true;
+	MTL4RenderPipelineDescriptor* descriptor = nil;
+	std::optional<compiler_function> vertex, fragment;
 	render_pipeline_configuration validated;
 	render_pipeline_bundle bundle;
 	std::optional<compiler_job> job;
 	std::exception_ptr error;
 	std::uint64_t generation = 0;
 	bool adopted = false;
+	bool materialize_description()
+	{
+		if (described) return true;
+		if (!vertex->ready() || !fragment->ready()) return false;
+		try
+		{
+			description = implementation::describe(descriptor, vertex->descriptor(), fragment->descriptor(), bundle.state);
+			described = true;
+		}
+		catch (...) { error = std::current_exception(); return false; }
+		return true;
+	}
+	bool matches(const implementation::key& key)
+	{
+		return materialize_description() && description == key;
+	}
 };
 
 bool render_pipeline_cache::prepared_pipeline::ready() const { return !m_entry || m_entry->error || m_entry->bundle.pipeline || m_entry->job->ready(); }
@@ -723,7 +764,7 @@ render_pipeline_bundle render_pipeline_cache::get(const render_pipeline_configur
 		}
 	}
 	for (const auto& weak : m_impl->pending)
-		if (const auto pending = weak.lock(); pending && !pending->adopted && !pending->error && pending->description == key)
+		if (const auto pending = weak.lock(); pending && !pending->adopted && !pending->error && pending->matches(key))
 		{
 			++m_impl->stats.pending_reused;
 			return get(prepared_pipeline(m_impl->identity, pending, decoded, config.depth_mirror));
@@ -752,6 +793,12 @@ std::optional<render_pipeline_cache::prepared_pipeline> render_pipeline_cache::p
 	const auto fp = fragment.function();
 	if ([vertex class] != [MTL4LibraryFunctionDescriptor class] || [fp class] != [MTL4LibraryFunctionDescriptor class]) return {};
 	const auto vp = static_cast<MTL4LibraryFunctionDescriptor*>(vertex);
+	return prewarm_ready(config, vp, fp);
+}
+
+std::optional<render_pipeline_cache::prepared_pipeline> render_pipeline_cache::prewarm_ready(const render_pipeline_configuration& config,
+	MTL4LibraryFunctionDescriptor* vp, MTL4LibraryFunctionDescriptor* fp)
+{
 	const auto decoded = decode_render_state(config.state);
 	auto normalized = config; normalized.state.front.reference = normalized.state.back.reference = 0;
 	if (!m_impl->entries.empty() && m_impl->entries.front().validated == normalized && m_impl->entries.front().description.functions(vp, fp))
@@ -759,7 +806,7 @@ std::optional<render_pipeline_cache::prepared_pipeline> render_pipeline_cache::p
 		++m_impl->stats.fast_hits; ++m_impl->stats.reused;
 		return prepared_pipeline(m_impl->identity, m_impl->entries.front().bundle, decoded, config.depth_mirror);
 	}
-	const auto descriptor = make_render_descriptor(config, vertex, fp);
+	const auto descriptor = make_render_descriptor(config, vp, fp);
 	++m_impl->stats.descriptor_lookups;
 	for (auto function : {vp, fp})
 		if (!function.library || function.library.device != m_impl->compile.device() || !function.name.length ||
@@ -777,7 +824,7 @@ std::optional<render_pipeline_cache::prepared_pipeline> render_pipeline_cache::p
 		}
 	std::erase_if(m_impl->pending, [](const auto& weak) { const auto entry = weak.lock(); return !entry || entry->adopted || entry->error; });
 	for (const auto& weak : m_impl->pending)
-		if (const auto pending = weak.lock(); pending && pending->description == key)
+		if (const auto pending = weak.lock(); pending && pending->matches(key))
 		{
 			++m_impl->stats.pending_reused;
 			return prepared_pipeline(m_impl->identity, pending, decoded, config.depth_mirror);
@@ -787,6 +834,44 @@ std::optional<render_pipeline_cache::prepared_pipeline> render_pipeline_cache::p
 	pending->description = key; pending->validated = normalized; pending->generation = m_impl->generation;
 	pending->bundle = prepare_pipeline_state(m_impl->compile, config);
 	pending->job = m_impl->compile.tasks().render(descriptor);
+	if (!pending->job) { ++m_impl->stats.prewarm_refused; return {}; }
+	m_impl->pending.push_back(pending); ++m_impl->stats.prewarmed;
+	return prepared_pipeline(m_impl->identity, std::move(pending), decoded, config.depth_mirror);
+}
+
+std::optional<render_pipeline_cache::prepared_pipeline> render_pipeline_cache::prewarm(const render_pipeline_configuration& config,
+	const prepared_shader_stages& stages)
+{
+	validate_fragment_contract(m_impl->compile, config, stages.m_contract);
+	if (stages.m_vertex.ready() && stages.m_fragment.ready())
+		return prewarm_ready(config, stages.m_vertex.descriptor(), stages.m_fragment.descriptor());
+	const auto decoded = decode_render_state(config.state);
+	auto normalized = config; normalized.state.front.reference = normalized.state.back.reference = 0;
+	// Validate the complete descriptor before admission. These concrete empty
+	// function descriptors are never handed to Metal: the worker installs the
+	// actual immutable library functions only after both dependencies finish.
+	const auto descriptor = make_render_descriptor(config, [MTL4LibraryFunctionDescriptor new], [MTL4LibraryFunctionDescriptor new]);
+	descriptor.vertexFunctionDescriptor = nil; descriptor.fragmentFunctionDescriptor = nil;
+	++m_impl->stats.descriptor_lookups;
+	const auto key = implementation::describe(descriptor, nil, nil, decoded);
+	std::erase_if(m_impl->pending, [](const auto& weak) { const auto entry = weak.lock(); return !entry || entry->adopted || entry->error; });
+	for (const auto& weak : m_impl->pending)
+		if (const auto pending = weak.lock(); pending && pending->vertex &&
+			pending->description.raster == key.raster && pending->description.colors == key.colors && pending->description.depth == key.depth)
+		{
+			if (pending->vertex->same_function(stages.m_vertex) && pending->fragment->same_function(stages.m_fragment))
+			{
+				++m_impl->stats.pending_reused;
+				return prepared_pipeline(m_impl->identity, pending, decoded, config.depth_mirror);
+			}
+		}
+	if (m_impl->pending.size() == 64) { ++m_impl->stats.prewarm_refused; return {}; }
+	auto pending = std::make_shared<preparation>();
+	pending->description = key; pending->described = false; pending->descriptor = descriptor;
+	pending->vertex = stages.m_vertex; pending->fragment = stages.m_fragment;
+	pending->validated = normalized; pending->generation = m_impl->generation;
+	pending->bundle = prepare_pipeline_state(m_impl->compile, config);
+	pending->job = m_impl->compile.tasks().render(descriptor, stages.m_vertex, stages.m_fragment);
 	if (!pending->job) { ++m_impl->stats.prewarm_refused; return {}; }
 	m_impl->pending.push_back(pending); ++m_impl->stats.prewarmed;
 	return prepared_pipeline(m_impl->identity, std::move(pending), decoded, config.depth_mirror);
@@ -810,6 +895,11 @@ render_pipeline_bundle render_pipeline_cache::get(const prepared_pipeline& prepa
 			throw;
 		}
 		entry->job.reset(); ++m_impl->stats.created;
+	}
+	if (!entry->materialize_description())
+	{
+		if (entry->error) std::rethrow_exception(entry->error);
+		throw std::logic_error("Completed native pipeline has unresolved library dependencies");
 	}
 	if (!entry->adopted && entry->generation == m_impl->generation && m_impl->stats.capacity)
 	{

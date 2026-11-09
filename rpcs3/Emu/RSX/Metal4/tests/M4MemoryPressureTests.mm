@@ -361,13 +361,61 @@ void fsr_frame_pressure()
 	require(frame.reclaim_fsr(),"FSR frame did not reconstruct its cache after pressure");
 	std::cout<<"FSR native_frame:real full-ledger pressure evicts working images with one recovery,then rebuilds;foreign-frame registration refused\n";
 }
+
+void overlay_frame_pressure()
+{
+	context device(1);
+	const auto budget = std::make_shared<heap_budget>(device, 16u << 20);
+	device.set_buffer_budget(budget);
+	const auto ram = std::make_shared<memory>();
+	surface_cache surfaces(device, ram, 16u << 20, budget);
+	guest_texture_cache textures(device, ram, [](unsigned offset, unsigned, std::size_t) { return offset; }, 8u << 20, budget);
+	native_frame frame(device);
+	memory_pressure_owner pressure(device, surfaces, textures, budget, nullptr, &frame);
+	const auto descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:8 height:8 mipmapped:NO];
+	descriptor.storageMode = MTLStorageModePrivate;
+	descriptor.usage = MTLTextureUsageRenderTarget;
+	const auto target = make_texture(device, descriptor);
+	overlay_frame overlays;
+	overlays.images.push_back({512, 512, 1, false, std::vector<std::uint8_t>(512u * 512u * 4, 255)});
+	overlay_draw draw;
+	draw.virtual_extent = {8, 8};
+	draw.image = 0;
+	draw.vertices = {{0, 0, 0, 0}, {8, 0, 1, 0}, {0, 8, 0, 1}, {8, 8, 1, 1}};
+	overlays.draws.push_back(std::move(draw));
+	const frame_policy policy{{8, 8}, 1};
+	const auto render = [&]
+	{
+		@autoreleasepool
+		{
+			device.begin();
+			frame.encode({}, target, policy, overlays);
+			device.submit().wait();
+		}
+	};
+	render();
+	(void)device.trim_upload_pages();
+	const auto cached = budget->statistics();
+	require(cached.live_heaps == 1 && cached.reserved_bytes > 0, "No reusable overlay texture remained under the shared ledger");
+	@autoreleasepool
+	{
+		const auto blocker = budget->shared_buffer(cached.budget - cached.reserved_bytes);
+		const auto recovered = budget->shared_buffer(4096);
+		const auto after = budget->statistics();
+		require(blocker && recovered && after.live_heaps == 0 && after.recovery_successes == cached.recovery_successes + 1,
+			"Full-ledger recovery failed to reclaim the ready overlay texture");
+	}
+	render();
+	require(budget->statistics().live_heaps == 1, "Overlay cache did not rebuild after recovery");
+	std::cout << "Native overlay pressure: shared ledger reclaimed the ready texture in one retry and rebuilt the cache passed\n";
+}
 }
 int main()
 {
 	std::cout.setf(std::ios::unitbuf);
 	@autoreleasepool
 	{
-		try { transaction_boundaries(); cross_cache(); native_authority(); queries_and_uploads(); completion_and_views(); idle_pins_and_deferred(); native_snapshot_pressure(); local_pool_quota(); fsr_frame_pressure(); }
+		try { transaction_boundaries(); cross_cache(); native_authority(); queries_and_uploads(); completion_and_views(); idle_pins_and_deferred(); native_snapshot_pressure(); local_pool_quota(); fsr_frame_pressure(); overlay_frame_pressure(); }
 		catch (const heap_budget_error& error) { std::cerr << error.what() << " requested=" << error.requested << " reserved=" << error.reserved << " budget=" << error.budget << '\n'; return 1; }
 		catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 	}

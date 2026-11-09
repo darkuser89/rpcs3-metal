@@ -30,7 +30,14 @@ struct present_image
 	bool limited_rgb = false;
 	std::optional<present_eye> right_eye;
 	stereo_output stereo;
+	std::array<std::optional<submission>, 2> uploads;
+
+	void depend_on_uploads(context& ctx) const;
 };
+
+// An explicit-predecessor context can record into a free slot while the
+// latest upload runs. Unrelated prior work follows normal queue admission.
+void begin_present_commands(context& ctx, const present_image* image);
 
 // Native final-image pass. The caller resolves the display-buffer epoch first;
 // this object never reads guest VM or selects an RSX display buffer implicitly.

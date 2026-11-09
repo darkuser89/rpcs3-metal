@@ -39,7 +39,7 @@ class transfer_engine final
 	// source/destination buffer ranges, including caller-owned heap aliases.
 	void nearest(context& ctx, id<MTLBuffer> source, std::size_t source_offset, nearest_image source_image,
 				 id<MTLBuffer> destination, std::size_t destination_offset, nearest_image destination_image,
-				 std::uint32_t texel_bytes, std::array<bool, 3> flip = {}) const;
+				 std::uint32_t texel_bytes, std::array<bool, 3> flip = {}, nearest_projection projection = {}) const;
 };
 
 } // namespace metal4

@@ -24,18 +24,40 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
+#include <stdexcept>
 #include <utility>
 
 namespace metal4
 {
 
+// CPU readiness only. Callers still record the original native queue wait
+// and validate its device; opaque/nil events cannot prove readiness here.
+[[nodiscard]] inline bool shared_event_reached(id<MTLEvent> event, std::uint64_t value)
+{
+	return [event conformsToProtocol:@protocol(MTLSharedEvent)] &&
+		static_cast<id<MTLSharedEvent>>(event).signaledValue >= value;
+}
+
 struct completion_state;
+// A CPU wait deadline is distinct from a completed GPU submission failure.
+// The token may finish immediately after the deadline;owners still choose
+// when to retry/finalize the retained transaction.
+class submission_wait_timeout final : public std::runtime_error
+{
+  public:
+	submission_wait_timeout():std::runtime_error("Timed out waiting for Metal 4 submission"){}
+};
 struct upload_plan_state;
 class heap_budget;
 class helper_catalog;
 struct helper_catalog_state;
 class constant_upload_cache;
+class bindings;
+class guest_texture_resolver;
+struct texture_region;
+enum class texture_plane;
 
 struct upload_slice
 {
@@ -67,6 +89,16 @@ struct argument_table_statistics
 struct command_encoding_statistics
 {
 	std::uint64_t compute_encoders = 0, render_encoders = 0;
+	std::uint64_t buffer_blit_queue_barriers = 0, buffer_blit_barriers = 0;
+	std::uint64_t buffer_blit_alias_barriers = 0, buffer_blit_barriers_elided = 0;
+	std::uint64_t texture_blit_queue_barriers = 0, texture_blit_barriers = 0;
+	std::uint64_t texture_blit_alias_barriers = 0, texture_blit_barriers_elided = 0;
+	std::uint64_t checked_blit_raw_transitions = 0;
+	std::uint64_t checked_dispatches = 0, dispatch_queue_barriers = 0;
+	std::uint64_t dispatch_barriers = 0, dispatch_barriers_elided = 0;
+	std::uint64_t blit_to_dispatch_barriers = 0, dispatch_to_blit_barriers = 0;
+	std::uint64_t full_render_barriers = 0, fragment_render_barriers = 0;
+	std::uint64_t guest_draw_full_barriers = 0, guest_draw_fragment_barriers = 0;
 };
 
 // A completion remains valid even after its command slot has been reused.
@@ -103,14 +135,81 @@ class context final
 	std::unique_ptr<constant_upload_cache> m_vertex_uploads;
 	std::unique_ptr<constant_upload_cache> m_geometry_uploads;
 	friend class helper_catalog;
+	friend class guest_texture_resolver;
+	friend class surface_color_transfer;
+	friend class surface_depth_transfer;
+	friend class sample_transfer;
+	friend class surface_banked_transfer;
+	friend class swizzle_engine;
+	friend class transfer_engine;
+	friend class dma_compute;
+	friend class scaled_image_compute;
+	friend class vertex_fetch_engine;
+	friend class fsr_upscaler;
+	friend class border_coverage_cache;
+	friend class border_texture_preparation;
+	friend class versioned_guest_texture_job;
+	friend class vertex_shader;
+	friend class render_commands;
+	friend class draw_executor;
+	friend struct present_image;
+	void end_guest_render_pass();
+	friend class query_pool;
+	friend class surface_cache;
+	[[nodiscard]] bool can_begin_after(const submission& predecessor) const;
+	[[nodiscard]] std::optional<upload_plan> plan_uploads(std::span<const upload_requirement> requirements, bool allow_recovery);
+	// Same-queue dependency. The worker requires success unless the caller
+	// supplies a retained, shared uint32 slot for the query outcome.
+	void depend_on_predecessor(const submission& producer, std::byte* query_outcome = nullptr);
+	friend class depth_bounds_pass;
+	friend void copy_buffer(context&, id<MTLBuffer>, std::size_t, id<MTLBuffer>, std::size_t, std::size_t);
+	friend void fill_buffer(context&, id<MTLBuffer>, std::size_t, std::size_t, std::uint8_t);
+	friend void buffer_to_texture(context&, id<MTLBuffer>, std::size_t, id<MTLTexture>,
+		const texture_region&, std::size_t, std::size_t, texture_plane);
+	friend void texture_to_buffer(context&, id<MTLTexture>, const texture_region&, id<MTLBuffer>,
+		std::size_t, std::size_t, std::size_t, texture_plane);
+	friend void copy_texture(context&, id<MTLTexture>, const texture_region&, id<MTLTexture>,
+		const texture_region&, texture_plane);
+	[[nodiscard]] id<MTL4ComputeCommandEncoder> compute_encoder(MTLStages before);
+	enum class render_writes { opaque, attachments };
+	struct shared_guest_pass
+	{
+		const bindings& fragment;
+		MTLVisibilityResultMode visibility;
+		std::size_t visibility_offset;
+		bool reused = false;
+		bool visibility_changed = false;
+	};
+	[[nodiscard]] bool render_reads_wait_needed(const bindings& inputs, id<MTLBuffer> geometry,
+		id<MTLBuffer> owned_visibility) const;
+	[[nodiscard]] id<MTL4RenderCommandEncoder> render_encoder(MTL4RenderPassDescriptor* descriptor, MTLStages before,
+		render_writes writes, const bindings* vertex = nullptr, id<MTLBuffer> geometry = nil, shared_guest_pass* shared = nullptr);
+	static constexpr std::size_t max_dispatch_accesses = 16;
+	struct accessed_resource
+	{
+		id<MTLResource> resource;
+		std::size_t offset = 0, size = 0; // Zero for a texture access.
+		bool writes = false;
+		// Optional proven subresource coordinates, relative to the named texture.
+		std::optional<std::size_t> mip = {}, slice = {};
+		MTLRegion box = {}; // Zero width means the whole selected subresource.
+	};
+	[[nodiscard]] id<MTL4ComputeCommandEncoder> checked_blit(accessed_resource source, accessed_resource destination);
+	[[nodiscard]] id<MTL4ComputeCommandEncoder> checked_compute(MTLStages stage, std::span<const accessed_resource> resources, bool texture_blit);
+	void checked_dispatch(id<MTLComputePipelineState> pipeline, const bindings& arguments, std::span<const accessed_resource> resources,
+		MTLSize grid, MTLSize group);
+	void checked_dispatch(id<MTLComputePipelineState> pipeline, const bindings& arguments,
+		std::span<const accessed_resource> resources, std::size_t threads);
 	// Shared device/options catalogue; native feedback retains individual PSOs.
 	std::shared_ptr<helper_catalog_state> m_helpers;
 	const std::shared_ptr<const std::byte> m_identity = std::make_shared<const std::byte>();
 
 public:
 
+	enum class recording_overlap { unrestricted, explicit_predecessor };
 	explicit context(std::uint32_t max_in_flight = 3, std::size_t argument_tables_per_slot = 64,
-		std::chrono::milliseconds event_wait_timeout = std::chrono::seconds(30));
+		std::chrono::milliseconds event_wait_timeout = std::chrono::seconds(30),
+		recording_overlap overlap = recording_overlap::unrestricted);
 	~context();
 	context(const context&) = delete;
 	context& operator=(const context&) = delete;
@@ -142,7 +241,11 @@ public:
 	// CPU-only preflight for preparation that may later begin encoding. Does
 	// not wait for an in-flight slot or change a caller's current recording.
 	void validate_begin() const;
-	void begin();
+	// The last submitted work, excluding any open recording.
+	[[nodiscard]] std::optional<submission> last_submission() const;
+	// In explicit-predecessor mode, only work with this successful-
+	// completion dependency can record ahead of the previous submission.
+	void begin(const submission* predecessor = nullptr);
 	// The context owns encoder lifetimes; callers must not call endEncoding.
 	[[nodiscard]] id<MTL4ComputeCommandEncoder> compute();
 	[[nodiscard]] id<MTL4RenderCommandEncoder> render(MTL4RenderPassDescriptor* descriptor);

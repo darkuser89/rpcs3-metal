@@ -10,6 +10,9 @@ namespace metal4
 // with its own sample count before nearest/typeless transfer. Equal unflipped
 // MSAA copies still use the bit-exact native texture-copy path. Raster sample
 // bridges retain their explicit finite [0,1] depth validation requirement.
+// Scratch and expansion cover only the copied windows. Partial imports load
+// selected target attachments and preserve exterior samples without reading
+// or reconstructing their background in a separate sample raster.
 class surface_sample_blitter final
 {
 	sample_transfer m_samples;

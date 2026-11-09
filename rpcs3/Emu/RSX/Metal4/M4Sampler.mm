@@ -86,7 +86,6 @@ native_sampler_key resolve_sampler(const guest_sampler_state& state, const sampl
 	key.mip_filter = MTLSamplerMipFilterNotMipmapped;
 	if (policy.stage == sampler_stage::vertex)
 	{
-		key.wrap[2] = MTLSamplerAddressModeRepeat;
 		key.anisotropy = 1;
 		key.compare = MTLCompareFunctionNever;
 		key.min_lod = state.min_lod;
@@ -159,17 +158,23 @@ native_sampler_key resolve_sampler(const guest_sampler_state& state, const sampl
 		if ((policy.dimension != vertex_texture_dimension::one && policy.dimension != vertex_texture_dimension::two) ||
 			key.wrap[0] != MTLSamplerAddressModeClampToEdge || key.wrap[1] != MTLSamplerAddressModeClampToEdge || key.min_lod != 0 || key.max_lod != 0)
 			throw std::invalid_argument("Unnormalized RSX vertex sampling requires a native coordinate/LOD emulation path");
+		// The R axis is unused in 1D/2D, but Metal still validates its address mode.
+		key.wrap[2] = MTLSamplerAddressModeClampToEdge;
 		key.mip_filter = MTLSamplerMipFilterNotMipmapped;
 	}
 	return key;
 }
 MTLSamplerDescriptor* make_sampler_descriptor(const native_sampler_key& key)
 {
+	const bool invalid_pixel_coordinates = !key.normalized &&
+		(std::any_of(key.wrap.begin(), key.wrap.end(), [](auto mode) { return mode != MTLSamplerAddressModeClampToEdge; }) ||
+		 key.min_filter != key.mag_filter || key.mip_filter != MTLSamplerMipFilterNotMipmapped ||
+		 key.anisotropy != 1 || key.min_lod != 0 || key.max_lod != 0);
 	if (std::any_of(key.wrap.begin(), key.wrap.end(), [](auto mode)
 					{
 						return mode > MTLSamplerAddressModeClampToBorderColor;
 					}) ||
-		key.min_filter > MTLSamplerMinMagFilterLinear || key.mag_filter > MTLSamplerMinMagFilterLinear || key.mip_filter > MTLSamplerMipFilterLinear || key.border > MTLSamplerBorderColorOpaqueWhite || key.compare > MTLCompareFunctionAlways || !key.anisotropy || key.anisotropy > 16 || !std::isfinite(key.min_lod) || !std::isfinite(key.max_lod) || !std::isfinite(key.bias) || key.min_lod < 0 || key.max_lod < key.min_lod || key.bias < -16 || key.bias > 15.999f || (!key.normalized && (key.wrap[0] != MTLSamplerAddressModeClampToEdge || key.wrap[1] != MTLSamplerAddressModeClampToEdge || key.mip_filter != MTLSamplerMipFilterNotMipmapped || key.min_lod != 0 || key.max_lod != 0)))
+		key.min_filter > MTLSamplerMinMagFilterLinear || key.mag_filter > MTLSamplerMinMagFilterLinear || key.mip_filter > MTLSamplerMipFilterLinear || key.border > MTLSamplerBorderColorOpaqueWhite || key.compare > MTLCompareFunctionAlways || !key.anisotropy || key.anisotropy > 16 || !std::isfinite(key.min_lod) || !std::isfinite(key.max_lod) || !std::isfinite(key.bias) || key.min_lod < 0 || key.max_lod < key.min_lod || key.bias < -16 || key.bias > 15.999f || invalid_pixel_coordinates)
 		throw std::invalid_argument("Invalid resolved native sampler descriptor");
 	auto descriptor = [MTLSamplerDescriptor new];
 	descriptor.sAddressMode = key.wrap[0];
@@ -195,21 +200,21 @@ sampler_cache::sampler_cache(context& ctx, std::size_t capacity, std::shared_ptr
 		throw std::invalid_argument("Native sampler cache needs nonzero capacity");
 	m_statistics.capacity = capacity;
 }
-id<MTLTexture> sampler_cache::border_coverage(id<MTLTexture> source)
+id<MTLTexture> sampler_cache::border_coverage(id<MTLTexture> source, border_texture_preparation* preparation)
 {
 	if (!m_coverage)
 	{
 		if (!m_budget) m_budget = std::make_shared<heap_budget>(m_context, 128u << 20);
 		m_coverage = std::make_unique<border_coverage_cache>(m_context, m_budget, std::min<std::size_t>(m_statistics.capacity, 4096));
 	}
-	return m_coverage->get(source);
+	return m_coverage->get(source, preparation);
 }
-id<MTLTexture> sampler_cache::border_color_view(id<MTLTexture> source, std::array<std::uint32_t,4> channels)
+id<MTLTexture> sampler_cache::border_color_view(id<MTLTexture> source, std::array<std::uint32_t,4> channels, border_texture_preparation* preparation)
 {
-	(void)border_coverage(source);
-	return m_coverage->color_view(source,channels);
+	(void)border_coverage(source, preparation);
+	return m_coverage->color_view(source, channels, preparation);
 }
-id<MTLTexture> sampler_cache::border_shadow_view(id<MTLTexture> source, float value)
+id<MTLTexture> sampler_cache::border_shadow_view(id<MTLTexture> source, float value, border_texture_preparation* preparation)
 {
 	if (!m_coverage)
 	{
@@ -217,7 +222,7 @@ id<MTLTexture> sampler_cache::border_shadow_view(id<MTLTexture> source, float va
 			m_budget = std::make_shared<heap_budget>(m_context, 128u << 20);
 		m_coverage = std::make_unique<border_coverage_cache>(m_context, m_budget, std::min<std::size_t>(m_statistics.capacity, 4096));
 	}
-	return m_coverage->shadow_view(source, value);
+	return m_coverage->shadow_view(source, value, preparation);
 }
 sampler_binding sampler_cache::acquire(const guest_sampler_state& state, const sampler_texture_policy& policy)
 {

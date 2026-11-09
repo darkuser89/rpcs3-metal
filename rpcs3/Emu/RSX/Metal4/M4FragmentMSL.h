@@ -35,9 +35,12 @@ struct fragment_program_options
 		return result;
 	}();
 	// Native depth comparison: height-one 1D,2D and cube use dedicated MSL
-	// depth types and matching sampler metadata. Redirected/MSAA depth and
-	// 3D shadow textures still require a separate texture emulation layer.
+	// depth types and matching sampler metadata. Direct MSAA can filter
+	// individual samples; 3D shadow textures require a separate policy.
 	std::uint32_t border_textures = 0;
+	std::uint32_t stored_repeat_textures = 0;
+	std::uint32_t stored_mixed_filter_textures = 0;
+	std::uint32_t stored_border_atlas_textures = 0;
 	std::uint32_t shadow_textures = 0;
 	// Ordinary 3D depth reads use RG32Float volume R;3D shadows remain explicit
 	// emulation work. Ordinary depth reads are distinct from shadow comparisons and redirected
@@ -46,6 +49,7 @@ struct fragment_program_options
 	std::array<depth_sample_remap, 16> depth_remap{};
 	std::uint32_t redirected_textures = 0;
 	std::uint32_t multisampled_textures = 0;
+	std::uint32_t sample_raster_textures = 0;
 	bool operator==(const fragment_program_options&) const = default;
 };
 

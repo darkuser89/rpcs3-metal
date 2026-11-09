@@ -13,6 +13,7 @@
 #include "M4TileState.h"
 
 #include <atomic>
+#include <mutex>
 
 namespace metal4
 {
@@ -27,6 +28,19 @@ struct memory_fault_request
 // Platform/VM integration must supply these concrete services before renderer
 // activation. No default unprotected VM or legacy GL/VK presentation path.
 class rsx_mapping_observer;
+class rsx_vm_access;
+class arm64_fault_channel;
+struct renderer_arm64_fault_bindings
+{
+	std::shared_ptr<rsx_vm_access> vm;
+	// Grant a lease only for an original parked PC known to be immutable
+	// since the fault, and keep its executable identity until completion.
+	std::function<std::shared_ptr<const void>(std::uint64_t pc)> retain_instruction;
+	// Publish the channel to the platform bridge. The bridge owns producer
+	// registration, passive-lock release, signal routing and render wakeups.
+	// Publication itself must not wait for a fault to be handled.
+	std::function<void(std::shared_ptr<const arm64_fault_channel>)> install_channel;
+};
 struct renderer_bindings
 {
 	std::shared_ptr<guarded_guest_memory> memory;
@@ -50,7 +64,10 @@ struct renderer_bindings
 	std::function<void(const utils::address_range32&, rsx::invalidation_cause)> memory_invalidated;
 	// Service-specific work only; renderer always runs the common RSX task pump.
 	std::function<void(rsx::FIFO::state)> local_task;
+	// Retire and drain every borrowed runtime reference, including after a
+	// partially failed bind. Report errors only after references are retired.
 	std::function<void()> shutdown;
+	std::optional<renderer_arm64_fault_bindings> arm64_faults;
 	std::size_t heap_bytes = 512u << 20, snapshot_bytes = 64u << 20;
 	bool writer_and_mapping_hooks_installed = false;
 };
@@ -68,7 +85,11 @@ class gs_renderer : public rsx_program_frontend<GSRender>
 	mapping_notifications m_mapping_notifications;
 	std::unique_ptr<runtime> m_runtime;
 	std::atomic<bool> m_failed = false;
+	std::mutex m_instruction_channel_mutex;
+	std::shared_ptr<arm64_fault_channel> m_instruction_channel;
 	static utils::serial* validate_bindings(utils::serial* archive, const renderer_bindings& bindings);
+	void fail_renderer() noexcept;
+	void set_instruction_channel(std::shared_ptr<arm64_fault_channel> channel);
 	[[nodiscard]] std::optional<framebuffer_snapshot> current_framebuffer(rsx::framebuffer_creation_context mode);
 	[[nodiscard]] runtime& device_runtime();
 	void service_mapping_notifications(std::size_t range_limit = 256);
@@ -81,6 +102,8 @@ class gs_renderer : public rsx_program_frontend<GSRender>
 	void on_exit() override;
 	void begin() override;
 	void end() override;
+	void begin_conditional_rendering(const std::vector<rsx::reports::occlusion_query_info*>& sources) override;
+	void end_conditional_rendering() override;
 	void clear_surface(u32 mask) override;
 	void flip(const rsx::display_flip_info_t& info) override;
 	bool on_access_violation(u32 address, bool writing) override;

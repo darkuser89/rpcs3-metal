@@ -1,5 +1,7 @@
 #include "stdafx.h"
 #include "M4RSXVMAccess.h"
+#include "M4DrawClauseDriver.h"
+#include "Emu/RSX/NV47/FW/draw_call.hpp"
 #include "M4RSXMappingObserver.h"
 #include "M4HostWriterGate.h"
 #include "M4HostStoreTransaction.h"
@@ -16,6 +18,7 @@ extern atomic_t<bool> g_headless;
 void test_real_vm_cache_watches();
 void test_real_vm_cache_faults();
 void test_arm64_memory_instructions();
+void test_rsx_overlay_icon();
 
 namespace
 {
@@ -98,8 +101,20 @@ void actual_page_protection()
 	rsx_page_protection::token dirty, clean;
 	{
 		const vm::writer_lock lock;
+		const auto before = service->statistics(lock);
+		require(before.refreshed_logical_pages == (1u << 20), "Native protection did not reconcile the address space once on bind");
 		dirty = service->protect({fixture::base + 17, 1}, mode::trap_reads_and_writes, lock);
 		clean = service->protect({fixture::base + 18, 1}, mode::trap_writes, lock);
+		const auto after = service->statistics(lock);
+		require(after.refreshed_logical_pages == before.refreshed_logical_pages &&
+			after.protection.native_pages - before.protection.native_pages == 4 &&
+			after.protection.logical_pages - before.protection.logical_pages == 4 * host_page / 4096 &&
+			after.protection.protection_runs - before.protection.protection_runs == 4 &&
+			after.visited_index_nodes > before.visited_index_nodes &&
+			after.visited_index_nodes - before.visited_index_nodes < 256,
+			"Native protection scanned beyond the two physical aliases for each watch");
+		std::cout << "Real VM protection index: two watches touch four native pages in four protection calls and visit "
+			<< after.visited_index_nodes - before.visited_index_nodes << " index nodes\n";
 		const auto tokens = service->fault_tokens(fixture::alias + static_cast<u32>(host_page - 1), lock);
 		require(tokens.size() == 2 && std::find(tokens.begin(), tokens.end(), dirty) != tokens.end() &&
 			std::find(tokens.begin(), tokens.end(), clean) != tokens.end(), "Native fault selection omitted physical aliases or host-page neighbours");
@@ -140,7 +155,12 @@ void actual_page_protection()
 		const vm::writer_lock lock; shared = vm::get_backing_segment(fixture::base, 1, lock).memory;
 	}
 	const auto third = fixture::base + 3 * 65536;
+	const auto before_late_map = [&] { const vm::writer_lock lock; return service->statistics(lock); }();
 	require(f.block->falloc(third, 65536, &shared, vm::block_size_64k), "Could not map late physical alias");
+	const auto after_late_map = [&] { const vm::writer_lock lock; return service->statistics(lock); }();
+	require(after_late_map.refreshed_logical_pages - before_late_map.refreshed_logical_pages == 16 &&
+		after_late_map.mapped_logical_pages - before_late_map.mapped_logical_pages == 16,
+		"Late native alias refreshed beyond the changed 64-KiB mapping");
 	shared.reset();
 	require(actual_host_protection(third) == VM_PROT_READ, "Productive VM callback exposed a new unprotected physical alias");
 	require(vm::page_protect(fixture::alias, 65536, vm::page_allocated, 0, vm::page_writable), "Could not restrict logical alias permissions");
@@ -171,6 +191,7 @@ void actual_page_protection()
 	f.block.reset();
 	f.mappings.reset();
 	require(!service->failed(), "Native protection latched unresolved allocation metadata");
+	std::cout << "Real VM protection index: one initial 1048576-page reconciliation; late alias refreshes 16 logical pages\n";
 	{
 		const vm::writer_lock lock;
 		refuses([&] { (void)service->protect({fixture::base, 1}, mode::trap_writes, lock); }, "Detached native protection remained available");
@@ -930,17 +951,52 @@ int main()
 {
 	// Initialize only VM address-space/allocation bookkeeping. Do not initialize
 	// Emulator,Qt application,RSX renderer,PPU/SPU threads,a guest or a game.
+	std::cout.setf(std::ios::unitbuf);
 	try
 	{
 		g_headless = true; // Route shared fatal diagnostics to stderr, never a dialog.
 		std::cout << "Headless real VM test beginning;no application initialization\n" << std::flush;
 		require(!cpu_thread::get_current() && !g_fxo->try_get<rsx::thread>(), "Real VM test unexpectedly has an emulator CPU/renderer");
 		const auto created = cpu_thread::g_threads_created.load();
+		for (bool first_dependencies : {false, true})
+		{
+			rsx::draw_clause clause;
+			clause.reset(rsx::primitive_type::triangles);
+			clause.command = rsx::draw_command::inlined_array;
+			clause.inline_vertex_array.push_back(0x12345678);
+			unsigned emits = 0;
+			require(metal4::drive_draw_clause(clause, static_cast<rsx::context*>(nullptr), [&](unsigned pass, unsigned flags)
+			{
+				require(!pass && flags == 4 && clause.is_rendering && clause.pass_count() == 1,
+					"Actual inline clause lost its single owned pass");
+				++emits;
+			}, 4, metal4::clause_cleanup_owner::rsx_thread_end, first_dependencies) == 1 && emits == 1 && !clause.is_rendering,
+				"Actual inline clause did not normalize before RSX cleanup");
+			require(!metal4::owned_clause_requires_draw_completion(clause, true), "Actual inline clause retained a GPU completion boundary");
+			clause.post_execute_cleanup(nullptr);
+			clause.inline_vertex_array.clear();
+			require(clause.empty(), "Actual inline cleanup retained its input buffer");
+		}
+		for (bool trailing : {false, true})
+		{
+			rsx::draw_clause clause;
+			clause.reset(rsx::primitive_type::triangles);
+			clause.command = rsx::draw_command::array;
+			clause.append(0,3);
+			if (trailing) clause.insert_command_barrier(rsx::vertex_base_modifier_barrier, 0);
+			require(metal4::owned_clause_requires_draw_completion(clause, false) == trailing && !clause.is_rendering,
+				"Actual trailing RSX dependency lost its GPU completion boundary");
+			clause.begin();
+			require(clause.get_range().count == 3 && !clause.next() && !clause.is_rendering,
+				"Actual completion policy consumed or corrupted a clause range");
+		}
+		std::cout << "Actual RSX clause completion: two owned-inline first-dependency profiles and two ordinary/trailing-barrier profiles; one pass, cursor normalization and retained trailing wait; no renderer or guest CPU\n";
 		vm::init();
 		try { actual_mapping_hook_pairing(); automatic_mapping_delivery(); actual_mapping_backing_identity(); actual_page_protection(); actual_watch_protection(); actual_fault_receipts(); capture_and_exception(); physical_aliases_and_atomic_stores(); exact_storage_queries(); common_backing_offsets();
 			remap_and_retained_publication(); actual_host_instruction(); actual_dma_stores(); actual_dma_failure(); actual_dma_shutdown(); test_real_vm_cache_watches(); test_real_vm_cache_faults(); test_arm64_memory_instructions(); }
 		catch (...) { vm::close(); throw; }
 		vm::close();
+		test_rsx_overlay_icon();
 		require(cpu_thread::g_threads_created.load() == created && !cpu_thread::get_current() && !g_fxo->try_get<rsx::thread>(),
 			"Headless real VM test created an emulator CPU or renderer");
 		std::cout << "Concrete Metal4 rsx_vm_access executed against actual VM;memory initialized/closed;no RPCS3 App/UI/renderer/guest CPU/game started\n";

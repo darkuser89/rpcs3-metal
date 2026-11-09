@@ -6,8 +6,8 @@
 #include "M4GuestTexture.h"
 #include "M4IOMappingEpoch.h"
 #include "M4RSXCacheFault.h"
+#include "M4RendererRuntimeRegistration.h"
 #include "M4ARM64FaultChannel.h"
-#include "M4DarwinInstruction.h"
 #include <signal.h>
 
 #include <iostream>
@@ -68,6 +68,55 @@ struct vm_fixture
 		(void)vm::unmap(base, false, &block); block.reset();
 	}
 };
+
+void test_runtime_registration(context& device, vm_fixture& f, const cpu_capture_dispatch& capture,
+	const std::shared_ptr<heap_budget>& budget)
+{
+	surface_cache surfaces(device, f.memory, 8u << 20, budget, capture);
+	guest_texture_cache textures(device, f.memory, [](unsigned offset, unsigned, std::size_t) { return offset; },
+		1u << 20, budget, 4, {capture, std::make_shared<io_mapping_epoch>()});
+	const auto target = surfaces.acquire({vm_fixture::input, {4, 4, 1, surface_color::argb8, false}, 16, {}});
+	unsigned retired = 0;
+	std::unique_ptr<rsx_cache_fault> fault;
+	for (unsigned scenario = 0; scenario < 4; ++scenario)
+	{
+		surfaces.clear(target, 0xf0, 0xff123456 + scenario, 0, 255, {0, 0, 4, 4});
+		std::string_view expected;
+		if (scenario == 1) expected = "Partial runtime bind";
+		if (scenario == 2) expected = "Runtime work failed";
+		if (scenario == 3) expected = "Runtime shutdown failed after retirement";
+		bool flushed = false;
+		try
+		{
+			renderer_runtime_registration registration;
+			registration.install([&]
+			{
+				if (fault)
+				{
+					const auto prepared = fault->prepare(vm_fixture::input, false);
+					flushed = prepared && prepared->published_surfaces == 1 && !surfaces.status(target).dirty;
+					fault.reset();
+				}
+				++retired;
+				if (scenario == 3) throw std::runtime_error("Runtime shutdown failed after retirement");
+			}, [&]
+			{
+				fault = std::make_unique<rsx_cache_fault>(device, f.access, f.memory, surfaces, textures);
+				if (scenario == 1) throw std::runtime_error("Partial runtime bind");
+			});
+			if (scenario == 2) throw std::runtime_error("Runtime work failed");
+			registration.close();
+			registration.close();
+			require(expected.empty(), "Expected runtime failure was swallowed");
+		}
+		catch (const std::runtime_error& error)
+		{
+			require(error.what() == expected, "Runtime cleanup masked the original failure");
+		}
+		require(flushed && !fault && retired == scenario + 1, "Runtime did not retire exactly once while its caches were live");
+	}
+	std::cout << "Metal4 runtime registration: four exit paths retire exactly once with live real-VM fault service; 4 native writebacks\n";
+}
 } // namespace
 
 // Called only by the separate headless test after vm::init. Construct native
@@ -91,7 +140,17 @@ void test_real_vm_cache_watches()
 				"Actual native GPU output exposed stale guest bytes or lost its watch");
 			auto fault = f.access->capture_fault(vm_fixture::alias);
 			require(fault && !guest_memory_epoch::active(), "Actual native cache fault receipt retained VM exclusion across GPU work");
+			const auto index_before = [&] { const vm::writer_lock lock; return f.service->statistics(lock); }();
+			const auto base_reservation = vm::reservation_acquire(vm_fixture::base).load();
+			const auto alias_reservation = vm::reservation_acquire(vm_fixture::alias).load();
 			surfaces.flush(target);
+			const auto index_after = [&] { const vm::writer_lock lock; return f.service->statistics(lock); }();
+			require(index_after.refreshed_logical_pages == index_before.refreshed_logical_pages &&
+				index_after.visited_index_nodes > index_before.visited_index_nodes &&
+				index_after.visited_index_nodes - index_before.visited_index_nodes < 256 &&
+				vm::reservation_acquire(vm_fixture::base).load() != base_reservation &&
+				vm::reservation_acquire(vm_fixture::alias).load() != alias_reservation,
+				"Actual GPU writeback bypassed the alias index or missed a reservation");
 			f.access->capture_cpu([&]
 			{
 				constexpr std::array<u8, 4> expected{255, 0x12, 0x34, 0x56};
@@ -99,6 +158,8 @@ void test_real_vm_cache_watches()
 					require(vm::g_sudo_addr[vm_fixture::base + i] == expected[i % 4] && vm::g_sudo_addr[vm_fixture::alias + i] == expected[i % 4],
 						"Actual native GPU flush lost real VM bytes or physical alias output");
 			});
+			std::cout << "Real VM native writeback used the physical index without a mapping refresh and notified both alias reservations; visited "
+				<< index_after.visited_index_nodes - index_before.visited_index_nodes << " index nodes for 64 bytes\n";
 			require(!surfaces.status(target).dirty && protection(vm_fixture::base) == VM_PROT_NONE,
 				"Actual Surfacecache publication prematurely released input watch lifetime");
 			{
@@ -179,6 +240,7 @@ void test_real_vm_cache_watches()
 		f.access->capture_cpu([] {});
 		require(protection(vm_fixture::input) == (VM_PROT_READ | VM_PROT_WRITE) && !f.service->failed(),
 			"Actual Texturecache retirement retained orphan protection or failed VM metadata");
+		test_runtime_registration(device, f, capture, budget);
 		std::cout << "Real VM native cache watches:actual Metal4 Surfacecache acquisition/clear/physical flush;fixed ARGB bytes in actual VM aliases;owned fault receipt across GPU flush outside VM exclusion;virtual+physical invalidation;actual GPUdirty VA remap preserves old alias output and replacement bytes;dirty and external-owner watch lifetime;GPU completion retirement;actual native Texturecache upload/hit/clear;real suspended provider releases last registration;no App/UI/GSRender/guest CPU/game\n";
 	}
 }
@@ -427,13 +489,15 @@ rsx_cache_fault::completion run_vm_fault(rsx_cache_fault& faults, unsigned form,
 		std::optional<rsx_cache_fault::completion> completed;
 		const auto drained = channel.drain([&](const auto& input) -> std::optional<arm64_memory_state>
 		{
-			// Linked test assembler is immutable. The kernel copies the exact
-			// executable word;the handler never dereferences an arbitrary PC.
-			const auto instruction = capture_darwin_instruction(input.before.pc);
-			require(bool(instruction), "Owner could not safely capture actual VM fault instruction");
-			const auto request = arm64_memory_request::decode(*instruction, input.before);
-			require(bool(request), "Actual VM ARM context did not describe a supported data abort");
-			completed = faults.complete(*request, input.fault, input.writing);
+			// The original thread is parked in immutable linked test code.
+			std::weak_ptr<const void> held;
+			completed = faults.complete_parked(input, [&](std::uint64_t)
+			{
+				auto lease = std::make_shared<const std::byte>();
+				held = lease;
+				return lease;
+			});
+			require(completed && held.expired(), "Owner rejected the parked instruction or retained its code lease");
 			require(completed->reply.pc == input.before.pc + 4, "Actual VM ARM reply did not complete the exact instruction");
 			return completed->reply;
 		});
@@ -480,6 +544,13 @@ void test_real_vm_arm_completion()
 			payload[i] = std::byte{static_cast<u8>(0x80 + i)};
 		}
 		vm_native_result actual;
+		unsigned refused_captures = 0;
+		f.before_guard = [&] { ++refused_captures; };
+		const arm64_fault_channel::input unleased{{}, reinterpret_cast<std::uint64_t>(vm::g_base_addr + fault_address), false};
+		require(!faults.complete_parked(unleased, [](std::uint64_t) -> std::shared_ptr<const void> { return {}; }) &&
+			!faults.complete_parked(unleased, [](std::uint64_t) { return std::make_shared<const std::byte>(); }) &&
+			refused_captures == 0, "Unleased or invalid executable code reached VM capture");
+		f.before_guard = {};
 		const auto read = run_vm_fault(faults, 0, fault_address, payload, actual);
 		require(read.host_pages == 2 && read.watched_pages == 2 && read.published_surfaces == 2 && actual.vectors == expected &&
 			actual.base == reinterpret_cast<std::uint64_t>(vm::g_base_addr + fault_address + 32) && surfaces.status(untouched).dirty,
@@ -622,6 +693,6 @@ void test_real_vm_arm_completion()
 	}
 	device.begin(); device.cancel(); f.access->capture_cpu([] {});
 	require(protection(vm_fixture::base) == (VM_PROT_READ | VM_PROT_WRITE) && !f.service->failed(), "Actual VM ARM test leaked owned protection");
-	std::cout << "Real VM ARM completion:" << (page > 4096 ? 8 : 7) << " actual protected native instructions;parked host thread,actual Metal4 dirty outputs and real suspended VM;two-host-page combined authority preflight;canonical/alias bytes,scalar/SIMD/pairs/sign/XZR/writeback/PC replies;virtual+physical revisions and all physical-alias reservations;full logical permissions/foreign owner/held epoch refused;all CPU pages remain NO during completion;registered fixed fault-channel slots;handler only copies/spins;owner kernel instruction fetch;test-only signal installation,no App/guest CPU\n";
+	std::cout << "Real VM ARM completion:" << (page > 4096 ? 8 : 7) << " actual protected native instructions via shared parked-instruction service; unleased or invalid code refused before VM capture; parked host thread,actual Metal4 dirty outputs and real suspended VM;two-host-page combined authority preflight;canonical/alias bytes,scalar/SIMD/pairs/sign/XZR/writeback/PC replies;virtual+physical revisions and all physical-alias reservations;full logical permissions/foreign owner/held epoch refused;all CPU pages remain NO during completion;registered fixed fault-channel slots;handler only copies/spins;owner kernel instruction fetch;test-only signal installation,no App/guest CPU\n";
 }
 } // namespace

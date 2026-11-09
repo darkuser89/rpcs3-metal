@@ -14,6 +14,7 @@ struct library_cache_statistics
 	std::size_t entries = 0, capacity = 0, source_bytes = 0, source_budget = 0;
 	std::uint64_t created = 0, reused = 0, evicted = 0, bypassed = 0;
 	std::uint64_t candidates = 0;
+	std::size_t prepared_source_bytes = 0, prepared_source_budget = 0;
 };
 
 class compiler final
@@ -28,8 +29,10 @@ class compiler final
   public:
 	// Render-thread cache keyed by exact MSL bytes under fixed compile options.
 	// Labels are diagnostic;the first compilation supplies the cached name.
-	// Zero capacity disables caching. Source quota excludes opaque driver data.
-	explicit compiler(context& ctx, std::size_t library_capacity = 256, std::size_t source_budget = 16u << 20);
+	// Zero capacity disables caching. Completed and ticket-owned sources
+	// have separate quotas. Both exclude opaque driver data.
+	explicit compiler(context& ctx, std::size_t library_capacity = 256, std::size_t source_budget = 16u << 20,
+		id<MTL4Compiler> native = nil);
 	[[nodiscard]] id<MTLDevice> device() const noexcept;
 	// Shared bounded native task service. Prewarm callers may admit/poll jobs
 	// without waiting; ordinary getters wait only when they need a cold result.
@@ -44,11 +47,13 @@ class compiler final
 	  public:
 		[[nodiscard]] bool ready() const;
 		[[nodiscard]] bool failed() const noexcept;
+		[[nodiscard]] compiler_function function(NSString* name) const;
 		// Host charge for the owned source key/state, excluding native job inputs.
 		[[nodiscard]] std::size_t retained_bytes() const noexcept;
 	};
 	// Render-thread cache access; nonblocking native admission. A full queue
-	// returns nullopt without dropping a draw. Tickets own exact source bytes and
+	// or a full ticket source budget returns nullopt without dropping a draw.
+	// Tickets own exact source bytes and
 	// survive clear/eviction; only this compiler or its copies may consume them.
 	[[nodiscard]] std::optional<prepared_library> prewarm_library(std::string_view msl, NSString* label = nil) const;
 	[[nodiscard]] id<MTLLibrary> library(const prepared_library& prepared,

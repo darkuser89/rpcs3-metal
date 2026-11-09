@@ -23,7 +23,7 @@ bool same_input(const auto& a,const auto& b)
 {
 	return a.segments==b.segments&&a.plan.location==b.plan.location&&a.plan.offset==b.plan.offset&&a.plan.format==b.plan.format&&a.plan.width==b.plan.width&&a.plan.height==b.plan.height&&
 		a.plan.depth==b.plan.depth&&a.plan.mips==b.plan.mips&&a.plan.layers==b.plan.layers&&a.plan.dimension==b.plan.dimension&&
-		a.plan.swizzled==b.plan.swizzled&&a.plan.subresources[0].row_pitch==b.plan.subresources[0].row_pitch;
+		a.plan.swizzled==b.plan.swizzled&&a.plan.stored_border==b.plan.stored_border&&a.plan.subresources[0].row_pitch==b.plan.subresources[0].row_pitch;
 }
 display_storage_source source_layout(const cached_surface_description& description)
 {
@@ -75,12 +75,71 @@ void guest_texture_resolver::prepare_texture_assembly(texture_assembly_input& in
 		helper_render_configuration config;config.colors[0]=target;slice.normalizer=compile.render(library,@"rtt_vertex",@"rtt_channels",config);
 	}
 }
-void guest_texture_resolver::encode_texture_assembly(const texture_assembly_input& input,id<MTLTexture> texture)
+namespace
 {
+struct assembly_normalize_parameters
+{
+	std::array<std::uint32_t, 4> map;
+	std::array<std::uint32_t, 2> origin, extent;
+};
+static_assert(sizeof(assembly_normalize_parameters) == 32);
+}
+
+bool guest_texture_resolver::can_record_draw_cast(const native_cast_input& input)
+{
+	if (input.display_morton || !input.display_vm_patches.empty()) return false;
+	return !input.assembly || std::ranges::all_of(input.assembly->slices, [](const auto& slice)
+	{
+		return !slice.cast || can_record_draw_cast(*slice.cast);
+	});
+}
+
+guest_texture_resolver::prepared_texture_assembly guest_texture_resolver::prepare_draw_assembly(const texture_assembly_input& input)
+{
+	prepared_texture_assembly prepared{allocate(input.input.plan), {}};
+	prepared.slices.reserve(input.slices.size());
+	const bool depth_volume = guest_texture_depth_volume(input.input.plan);
+	for (const auto& slice : input.slices)
+	{
+		auto& work = prepared.slices.emplace_back(prepare_assembly_source(slice));
+		if (depth_volume)
+			work.depth = prepare_depth_volume_plane(work.image, work.source);
+		else if (slice.normalizer)
+		{
+			auto descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:prepared.texture.pixelFormat
+				width:slice.plane.view.width height:slice.plane.view.height mipmapped:NO];
+			descriptor.storageMode = MTLStorageModePrivate;
+			descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+			work.normalized = m_budget ? m_budget->texture(descriptor) : make_texture(m_context, descriptor);
+			const assembly_normalize_parameters params{slice.output_map,
+				{static_cast<std::uint32_t>(work.source.origin.x), static_cast<std::uint32_t>(work.source.origin.y)},
+				{!slice.pixel_map.empty(), static_cast<std::uint32_t>(slice.plane.view.width)}};
+			work.normalize_uniforms = make_upload(m_context, std::as_bytes(std::span{&params, 1}));
+			if (!slice.pixel_map.empty())
+				work.pixel_map = make_upload(m_context, std::as_bytes(std::span{slice.pixel_map}));
+		}
+	}
+	return prepared;
+}
+
+void guest_texture_resolver::encode_texture_assembly(const texture_assembly_input& input, id<MTLTexture> texture,
+	const prepared_texture_assembly* prepared)
+{
+	const auto& plan = input.input.plan;
+	const auto atlas = uses_stored_border_mip_atlas(plan) ? std::optional{plan_stored_border_mip_atlas(plan)} : std::nullopt;
+	std::size_t index = 0;
 	for(const auto& slice:input.slices)
 	{
-		id<MTLTexture> image=nil;texture_region source;
-		if(slice.bytes)
+		const auto* work = prepared ? &prepared->slices.at(index++) : nullptr;
+		id<MTLTexture> image = nil;
+		texture_region source;
+		if (work)
+		{
+			if (work->encode_source) work->encode_source();
+			image = work->image;
+			source = work->source;
+		}
+		else if(slice.bytes)
 		{
 			image=allocate(slice.plane.view);encode_display_assembly(*slice.bytes,image);source.size=MTLSizeMake(image.width,image.height,1);
 		}
@@ -103,28 +162,64 @@ void guest_texture_resolver::encode_texture_assembly(const texture_assembly_inpu
 		{
 			texture_region from,to;from.origin=MTLOriginMake(patch.source.x,patch.source.y,0);to.origin=MTLOriginMake(patch.target.x,patch.target.y,0);from.size=to.size=MTLSizeMake(patch.source.width,patch.source.height,1);copy_texture(m_context,patch.texture,from,image,to);
 		}
-		if(guest_texture_depth_volume(input.input.plan)){encode_depth_volume_plane(image,source,texture,slice.plane.level,slice.plane.z);continue;}
+		texture_region destination;
+		destination.level = slice.plane.level;
+		destination.slice = slice.plane.face;
+		destination.origin = MTLOriginMake(0, 0, slice.plane.z);
+		destination.size = source.size;
+		if (atlas)
+		{
+			const auto& origin = atlas->origins.at(slice.plane.level);
+			destination.level = 0;
+			destination.origin = MTLOriginMake(origin[0], origin[1], slice.plane.z);
+		}
+		if (guest_texture_depth_volume(plan))
+		{
+			encode_depth_volume_plane(image, source, texture, destination, work ? &*work->depth : nullptr);
+			continue;
+		}
 		if(slice.normalizer)
 		{
-			auto descriptor=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:texture.pixelFormat width:slice.plane.view.width height:slice.plane.view.height mipmapped:NO];
-			descriptor.storageMode=MTLStorageModePrivate;descriptor.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;const auto normalized=make_texture(m_context,descriptor);
-			struct parameters{std::array<std::uint32_t,4> map;std::array<std::uint32_t,2> origin,padding;};
-			const parameters params{slice.output_map,{static_cast<std::uint32_t>(source.origin.x),static_cast<std::uint32_t>(source.origin.y)},{!slice.pixel_map.empty(),static_cast<std::uint32_t>(slice.plane.view.width)}};static_assert(sizeof(params)==32);
-			const auto upload=m_context.upload(std::as_bytes(std::span{&params,1}),256);bindings vertex,fragment;fragment.set_texture(0,image);fragment.set_buffer(0,upload.buffer,upload.offset);
-			if(slice.pixel_map.empty())fragment.set_buffer(1,upload.buffer,upload.offset);
-			else {const auto map=m_context.upload(std::as_bytes(std::span{slice.pixel_map}),256);fragment.set_buffer(1,map.buffer,map.offset);}
+			id<MTLTexture> normalized = work ? work->normalized : nil;
+			if (!normalized)
+			{
+				auto descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:texture.pixelFormat
+					width:slice.plane.view.width height:slice.plane.view.height mipmapped:NO];
+				descriptor.storageMode = MTLStorageModePrivate;
+				descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+				normalized = make_texture(m_context, descriptor);
+			}
+			const assembly_normalize_parameters params{slice.output_map,
+				{static_cast<std::uint32_t>(source.origin.x), static_cast<std::uint32_t>(source.origin.y)},
+				{!slice.pixel_map.empty(), static_cast<std::uint32_t>(slice.plane.view.width)}};
+			const auto upload = work ? upload_slice{work->normalize_uniforms, 0, sizeof(params)} :
+				m_context.upload(std::as_bytes(std::span{&params, 1}), 256);
+			bindings fragment;
+			fragment.set_texture(0, image);
+			fragment.set_buffer(0, upload.buffer, upload.offset);
+			if (slice.pixel_map.empty()) fragment.set_buffer(1, upload.buffer, upload.offset);
+			else if (work) fragment.set_buffer(1, work->pixel_map);
+			else
+			{
+				const auto map = m_context.upload(std::as_bytes(std::span{slice.pixel_map}), 256);
+				fragment.set_buffer(1, map.buffer, map.offset);
+			}
 			auto pass=[MTL4RenderPassDescriptor new];pass.colorAttachments[0].texture=normalized;pass.colorAttachments[0].loadAction=MTLLoadActionDontCare;pass.colorAttachments[0].storeAction=MTLStoreActionStore;
-			raster_state raster;raster.viewport={0,0,double(normalized.width),double(normalized.height),0,1};raster.scissor={0,0,normalized.width,normalized.height};render_commands commands(m_context,pass);commands.configure(slice.normalizer,nil,raster,vertex,fragment);commands.draw(MTLPrimitiveTypeTriangle,0,3);commands.end();
+			raster_state raster;
+			raster.viewport = {0, 0, double(normalized.width), double(normalized.height), 0, 1};
+			raster.scissor = {0, 0, normalized.width, normalized.height};
+			render_commands::draw_fragment_triangle(m_context, pass, slice.normalizer, nil, raster, fragment);
 			image=normalized;source.origin=MTLOriginMake(0,0,0);source.size=MTLSizeMake(image.width,image.height,1);
 		}
-		texture_region destination;destination.level=slice.plane.level;destination.slice=slice.plane.face;destination.origin=MTLOriginMake(0,0,slice.plane.z);destination.size=source.size;
+		destination.size = source.size;
 		copy_texture(m_context,image,source,texture,destination);
 	}
 }
 std::optional<resolved_fragment_texture> guest_texture_cache::resolve_assembly(const fragment_texture_registers& words,
 	const guest_texture_resolver::source& input,surface_cache& surfaces,std::shared_ptr<const surface_texture_revision>* receipt,
-	pending_textures* pending,std::optional<pending_image>* pending_index)
+	pending_textures* pending,std::optional<pending_image>* pending_index,const draw_publication& permit)
 {
+	const bool revision_tracked = pending && receipt;
 	const auto epoch=surfaces.texture_source_epoch();
 	const auto current=[&](const auto& assembly)
 	{
@@ -134,7 +229,7 @@ std::optional<resolved_fragment_texture> guest_texture_cache::resolve_assembly(c
 		// dirty owner in a former VM hole must still invalidate that image.
 		if(valid&&assembly.native_epoch!=epoch)
 		{
-			const auto sources=surfaces.texture_sources(assembly.input.coverage);
+			const auto sources=surfaces.texture_sources(assembly.input.coverage, revision_tracked);
 			valid=std::all_of(sources.begin(),sources.end(),[&](const auto& source)
 				{return std::any_of(assembly.native.begin(),assembly.native.end(),[&](const auto& p){return p->matches_source(source,false);});});
 		}
@@ -150,13 +245,18 @@ std::optional<resolved_fragment_texture> guest_texture_cache::resolve_assembly(c
 	{
 		if(receipt)*receipt=assembly->receipt;*pending_index=pending_image{i,true};++m_stats.assemblies_reused;return resolved_fragment_texture{nil,metadata(assembly->metadata)};
 	}
-	if(surfaces.texture_sources(input.coverage).empty())return {};
+	const bool linear_border = input.plan.stored_border && !input.plan.swizzled &&
+		(input.plan.dimension == vertex_texture_dimension::one || input.plan.dimension == vertex_texture_dimension::two);
+	auto border_coverage=linear_border?stored_border_texture_coverage(input.plan,input.segments):std::vector<guest_surface_layout>{};
+	const auto coverage=linear_border?std::span<const guest_surface_layout>{border_coverage}:std::span<const guest_surface_layout>{input.coverage};
+	if (surfaces.texture_sources(coverage, revision_tracked).empty()) return {};
 	auto planes=plan_texture_assembly_planes(input.plan,input.segments);std::vector<guest_surface_layout> all_coverage;for(const auto& plane:planes)for(auto span:plane.spans)all_coverage.push_back(guest_byte_coverage({span.address,span.size}));
 	// Discover before VM capture. An unresolved partial native owner must never
 	// be silently replaced by old RAM or flushed by the legacy fallback route.
-	const auto initial_sources=surfaces.texture_sources(all_coverage);if(initial_sources.empty())return {};
+	const auto initial_sources=surfaces.texture_sources(all_coverage, revision_tracked);if(initial_sources.empty())return {};
 	if(m_resolver.m_context.buffer_ledger()!=m_resolver.m_budget)throw std::invalid_argument("Native RTT assembly requires one shared buffer/texture ledger for guest EA "+std::to_string(input.segments.front().address));
 	auto assembly=std::make_shared<guest_texture_resolver::texture_assembly_input>();assembly->input=input;
+	if(linear_border)assembly->input.coverage=std::move(border_coverage);
 	m_resolver.cpu_capture([&]{m_resolver.watch(assembly->input);for(const auto& coverage:assembly->input.coverage)assembly->revisions.push_back(m_resolver.m_memory->surface_revision(coverage));});
 	const auto retain_native=[&](std::shared_ptr<prepared_surface_snapshot> value)
 	{
@@ -169,7 +269,7 @@ std::optional<resolved_fragment_texture> guest_texture_cache::resolve_assembly(c
 	{
 		std::vector<std::shared_ptr<prepared_surface_snapshot>> previous=assembly->native;if(pending)for(const auto& source:pending->native)if(std::find(previous.begin(),previous.end(),source)==previous.end())previous.push_back(source);
 		const auto full=[](const cached_surface_description& description)->std::optional<surface_texture_region>{const auto layout=source_layout(description);return surface_texture_region{{0,0,layout.geometry.width,layout.geometry.height},0};};
-		const auto snapshot=surfaces.prepare_texture_mapping(all_coverage,full,m_resolver.m_budget,false,previous,previous.size()<guest_texture_resolver::maximum_upload_images,false,ref);
+		const auto snapshot=surfaces.prepare_texture_mapping(all_coverage,full,m_resolver.m_budget,false,previous,previous.size()<guest_texture_resolver::maximum_upload_images,false,ref,permit,revision_tracked);
 		if(!snapshot)throw texture_revision_conflict();(void)retain_native(snapshot);
 	}
 	const auto planned_epoch=surfaces.texture_source_epoch();
@@ -183,7 +283,7 @@ std::optional<resolved_fragment_texture> guest_texture_cache::resolve_assembly(c
 		};
 		std::vector<std::shared_ptr<prepared_surface_snapshot>> previous;for(const auto& native:assembly->native)if(native->needs_copy())previous.push_back(native);
 		if(pending)for(const auto& native:pending->native)if(std::find(previous.begin(),previous.end(),native)==previous.end())previous.push_back(native);
-		auto native=surfaces.prepare_texture_mapping(coverage,mapping,m_resolver.m_budget,false,previous,previous.size()<guest_texture_resolver::maximum_upload_images,true);
+		auto native=surfaces.prepare_texture_mapping(coverage,mapping,m_resolver.m_budget,false,previous,previous.size()<guest_texture_resolver::maximum_upload_images,true,{},permit,revision_tracked);
 		if(native)native=retain_native(std::move(native));
 		guest_texture_resolver::texture_assembly_slice slice; slice.plane=std::move(plane);slice.native=native;
 		if(native)
@@ -198,7 +298,7 @@ std::optional<resolved_fragment_texture> guest_texture_cache::resolve_assembly(c
 		else
 		{
 			slice.channels=slice.plane.view.codec.base_argb;
-			auto refs=surfaces.texture_sources(coverage);const auto initial=refs;
+			auto refs=surfaces.texture_sources(coverage, revision_tracked);const auto initial=refs;
 			if(!refs.empty())
 			{
 				bool deferred=false;std::vector<display_storage_source> layouts;std::vector<std::optional<std::uint32_t>> origins;std::vector<std::shared_ptr<prepared_surface_snapshot>> snapshots;
@@ -229,7 +329,7 @@ std::optional<resolved_fragment_texture> guest_texture_cache::resolve_assembly(c
 				for(std::size_t i=0;i<refs.size();++i)
 				{
 					const auto full=[](const cached_surface_description& description)->std::optional<surface_texture_region>{const auto layout=source_layout(description);return surface_texture_region{{0,0,layout.geometry.width,layout.geometry.height},0};};
-					auto snapshot=surfaces.prepare_texture_mapping(coverage,full,m_resolver.m_budget,false,previous,previous.size()<guest_texture_resolver::maximum_upload_images,false,refs[i]);
+					auto snapshot=surfaces.prepare_texture_mapping(coverage,full,m_resolver.m_budget,false,previous,previous.size()<guest_texture_resolver::maximum_upload_images,false,refs[i],permit,revision_tracked);
 					if(!snapshot)throw texture_revision_conflict();snapshot=retain_native(std::move(snapshot));snapshots.push_back(snapshot);
 					if(snapshot->needs_copy()&&std::find(previous.begin(),previous.end(),snapshot)==previous.end())previous.push_back(snapshot);
 					const auto status=surfaces.status(refs[i]);layouts[i].dirty=status.dirty||status.deferred_copies;layouts[i].epoch=status.native_write_epoch;
@@ -245,7 +345,7 @@ std::optional<resolved_fragment_texture> guest_texture_cache::resolve_assembly(c
 						for(auto& copy:planned.bytes.copies)copy.input=indices[copy.input];slice.partial_plan=std::move(planned.bytes);
 					}
 				}
-				for(const auto& ref:surfaces.texture_sources(coverage))if(std::find(initial.begin(),initial.end(),ref)==initial.end()){const auto status=surfaces.status(ref);if(status.dirty||status.deferred_copies)throw texture_revision_conflict();}
+				for(const auto& ref:surfaces.texture_sources(coverage, revision_tracked))if(std::find(initial.begin(),initial.end(),ref)==initial.end()){const auto status=surfaces.status(ref);if(status.dirty||status.deferred_copies)throw texture_revision_conflict();}
 				// X-channel semantics belong to a complete compatible source pixel.
 				// Byte mixtures/casts and VM pixels retain the target upload policy.
 				const bool color_map=input.plan.format==0x82||input.plan.format==0x9d||input.plan.format==0x85||input.plan.format==0x9e||input.plan.format==0x8b||input.plan.format==0x98;
@@ -321,6 +421,8 @@ std::optional<resolved_fragment_texture> guest_texture_cache::resolve_assembly(c
 	for(auto& slice:assembly->slices)if(slice.bytes)
 		*slice.bytes=m_resolver.prepare_display_assembly(slice.plane.view,slice.partial_native,slice.partial_layouts,slice.partial_plan,std::move(slice.bytes->vm_bytes));
 	assembly->metadata.actual_mips=input.plan.mips;assembly->metadata.depth=bool(input.plan.codec.depth);assembly->metadata.source_depth_format=input.plan.codec.depth?static_cast<unsigned>(*input.plan.codec.depth):0;
+	assembly->metadata.stored_border_extent=guest_texture_stored_border_extent(input.plan);
+	assembly->metadata.stored_border_depth=guest_texture_stored_border_depth(input.plan);
 	assembly->metadata.depth_float=input.plan.codec.depth&&(*input.plan.codec.depth==surface_depth::z16_float||*input.plan.codec.depth==surface_depth::z24s8_float);assembly->metadata=metadata(assembly->metadata);
 	for(const auto& slice:assembly->slices){assembly->source_bytes=checked_texture_sum(assembly->source_bytes,checked_texture_product(slice.pixel_map.size(),4));if(slice.vm)assembly->source_bytes=checked_texture_sum(assembly->source_bytes,slice.vm->storage_bytes());if(slice.cast)assembly->source_bytes=checked_texture_sum(assembly->source_bytes,slice.cast->packed.storage_bytes);if(slice.bytes)assembly->source_bytes=checked_texture_sum(assembly->source_bytes,checked_texture_sum(checked_texture_sum(slice.bytes->plan.storage_bytes,slice.bytes->raw_bytes),checked_texture_sum(slice.bytes->linear_bytes,slice.bytes->vm_bytes.size())));}
 	if(assembly->source_bytes>m_resolver.m_limit)throw std::length_error("RTT assembly source bytes exceed budget");
@@ -340,7 +442,11 @@ std::optional<resolved_fragment_texture> guest_texture_cache::resolve_assembly(c
 }
 void guest_texture_cache::publish_assembly(const std::shared_ptr<guest_texture_resolver::texture_assembly_input>& assembly,const resolved_fragment_texture& image)
 {
-	if(assembly->native.empty()||!assembly->native.front()->cache_native_epoch(assembly->native_epoch)||!std::all_of(assembly->native.begin(),assembly->native.end(),[](const auto& p){return p->source_current();}))return;
+	if (assembly->native.empty() ||
+		!std::ranges::all_of(assembly->native, [](const auto& source) { return source->source_current(); }) ||
+		!assembly->native.front()->cache_texture_sources(assembly->native_epoch, assembly->topology_epoch,
+			assembly->input.coverage, assembly->native))
+		return;
 	auto compact=std::make_shared<guest_texture_resolver::texture_assembly_input>();compact->input=assembly->input;compact->revisions=assembly->revisions;compact->receipt=assembly->receipt;compact->metadata=assembly->metadata;compact->native_epoch=assembly->native_epoch;compact->topology_epoch=assembly->topology_epoch;
 	std::size_t bytes=image.texture.heap.size;for(const auto& native:assembly->native){compact->native.push_back(native->needs_copy()?native->settled():native);bytes=checked_texture_sum(bytes,native->texture().heap.size);}if(bytes>m_resolver.m_limit)return;
 	std::vector<std::shared_ptr<const physical_surface>> physical;physical.reserve(assembly->input.coverage.size());bool complete=true;

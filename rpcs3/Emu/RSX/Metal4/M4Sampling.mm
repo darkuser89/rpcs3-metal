@@ -78,7 +78,8 @@ bool float_sampled_texture_format(MTLPixelFormat format)
 }
 
 void validate_sampled_texture(context& ctx, id<MTLTexture> texture, id<MTLSamplerState> sampler,
-							  vertex_texture_dimension dimension, const sampler_parameters& parameters, bool shadow, bool depth)
+							  vertex_texture_dimension dimension, const sampler_parameters& parameters, bool shadow, bool depth,
+							  bool cube_atlas, unsigned samples)
 {
 	validate_sampler_parameters(parameters);
 	MTLTextureType expected;
@@ -92,13 +93,21 @@ void validate_sampled_texture(context& ctx, id<MTLTexture> texture, id<MTLSample
 		expected = MTLTextureType3D;
 		break;
 	case vertex_texture_dimension::cube:
-		expected = MTLTextureTypeCube;
+		expected = cube_atlas ? MTLTextureType2DArray : MTLTextureTypeCube;
 		break;
 	default:
 		throw std::invalid_argument("Unknown Metal 4 sampled texture dimension");
 	}
+	if (samples != sampled_texture_samples(parameters) || (samples > 1 && dimension != vertex_texture_dimension::two))
+		throw std::invalid_argument("Native multisample texture does not match its shader sampler state");
+	if (sampled_texture_is_raster(parameters) &&
+		(dimension != vertex_texture_dimension::two || cube_atlas || texture.mipmapLevelCount != 1))
+		throw std::invalid_argument("MSAA sample raster requires a single-level 2D texture");
+	if (samples > 1)
+		expected = MTLTextureType2DMultisample;
 	if (!texture || !sampler || texture.device != ctx.device() || sampler.device != ctx.device() ||
-		texture.textureType != expected || texture.sampleCount != 1 || texture.framebufferOnly ||
+		texture.textureType != expected || (cube_atlas && (dimension != vertex_texture_dimension::cube || texture.arrayLength != 6)) ||
+		texture.sampleCount != samples || texture.framebufferOnly ||
 		texture.storageMode == MTLStorageModeMemoryless || !(texture.usage & MTLTextureUsageShaderRead) ||
 		!(depth && dimension==vertex_texture_dimension::three ? texture.pixelFormat==MTLPixelFormatRG32Float : (shadow || depth) ? texture.pixelFormat == MTLPixelFormatDepth16Unorm || texture.pixelFormat == MTLPixelFormatDepth32Float || texture.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 : float_sample_format(texture.pixelFormat)) || (dimension == vertex_texture_dimension::one && texture.height != 1))
 	{

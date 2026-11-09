@@ -68,6 +68,7 @@ void color_cases(metal4::context& ctx)
 	surface_color_transfer bytes(ctx);
 	sample_transfer samples(ctx);
 	std::size_t cases = 0;
+	std::size_t partial_barriers = 0, load_barriers = 0;
 	for (const unsigned count : {1u, 2u, 4u})
 		for (const unsigned raw : {1u, 2u, 3u, 4u, 5u, 8u, 9u, 10u, 11u, 12u, 13u, 14u, 15u, 16u})
 		{
@@ -117,7 +118,21 @@ void color_cases(metal4::context& ctx)
 					request.mask = mask << 4;
 					request.color_value = 0x7b3dc5e9;
 					request.rectangle = full ? clear_rectangle{0, 0, width, height} : clear_rectangle{2, 1, 3, 3};
+					const auto before_clear = ctx.encoding_statistics();
 					const auto changed = clear.run(ctx, request);
+					const auto after_clear = ctx.encoding_statistics();
+					if (!full && changed.color_targets)
+					{
+						require(after_clear.fragment_render_barriers == before_clear.fragment_render_barriers + 1 &&
+							after_clear.full_render_barriers == before_clear.full_render_barriers, "Scissored clear requires only a fragment/tile barrier");
+						++partial_barriers;
+					}
+					if (full && raw == 8 && mask == 15)
+					{
+						require(after_clear.full_render_barriers == before_clear.full_render_barriers + 1 &&
+							after_clear.fragment_render_barriers == before_clear.fragment_render_barriers, "Load-only clear must keep the full barrier");
+						++load_barriers;
+					}
 					if (count > 1)
 						samples.expand(ctx, target, resolved);
 					bytes.download(ctx, format, resolved, region, output, {});
@@ -148,6 +163,7 @@ void color_cases(metal4::context& ctx)
 				}
 		}
 	std::cout << cases << " native full/masked/scissored color clears across 14 formats and 1/2/4 samples passed\n";
+	std::cout << partial_barriers << " scissored clear fragment/tile barriers and " << load_barriers << " load-only clear full barriers passed\n";
 }
 
 void depth_cases(metal4::context& ctx)

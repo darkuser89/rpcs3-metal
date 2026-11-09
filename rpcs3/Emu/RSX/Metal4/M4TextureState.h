@@ -33,6 +33,9 @@ struct texture_cache_state
 	bool hardware_renormalization = false;
 	// Post-view RGBA conversions already performed by a native SNORM/sRGB view.
 	std::uint32_t host_sign_mask = 0, host_gamma_mask = 0;
+	// Interior extent of a native image with a stored one-texel ring.
+	std::array<std::uint32_t, 2> stored_border_extent{};
+	std::uint32_t stored_border_depth = 0;
 };
 struct texture_state_overrides
 {
@@ -41,9 +44,19 @@ struct texture_state_overrides
 	// mode before passing its override here.
 	std::uint32_t anisotropy = 0;
 };
+[[nodiscard]] inline bool supports_direct_msaa_sampling(const fragment_texture_registers& regs, bool packed_depth)
+{
+	// Packed depth/stencil uses point addressing for all valid wrap modes.
+	if (packed_depth)
+		return true;
+	const auto min = (regs.filter >> 16) & 7u;
+	const auto mag = (regs.filter >> 24) & 7u;
+	return min && (mag == 1 || mag == 2 || mag == 4);
+}
 struct decoded_texture_state
 {
 	bool enabled = false, depth = false, shadow = false, redirected = false;
+	bool redirected_float = false;
 	bool border_emulation = false;
 	std::array<float, 4> view_border_color{};
 	std::uint32_t format = 0, samples = 1;
@@ -58,6 +71,12 @@ struct decoded_texture_state
 };
 namespace texture_state_detail
 {
+inline bool stored_border_wrap(unsigned wrap)
+{
+	return wrap >= static_cast<unsigned>(sampler_wrap::repeat) + 1 &&
+		wrap <= static_cast<unsigned>(sampler_wrap::mirror_once_clamp) + 1;
+}
+
 inline std::uint32_t features(std::uint32_t format)
 {
 	switch (format)
@@ -218,6 +237,7 @@ inline std::uint32_t shuffle_mask(std::uint32_t mask, const decoded_texture_stat
 	const bool depth_format = state.format >= 0x90 && state.format <= 0x93;
 	state.shadow = state.depth && depth_format && !(regs.control0 & 4) && compare > 0 && compare < 7;
 	state.redirected = state.depth && (state.format == 0x85 || state.format == 0x9e);
+	state.redirected_float = state.redirected && cache.depth_float;
 	if (state.depth && !depth_format && !state.redirected && state.format != 0x94)
 		throw std::invalid_argument("RSX depth cache bound through an unsupported texture format");
 	if (depth_format && !state.depth)
@@ -242,6 +262,8 @@ inline std::uint32_t shuffle_mask(std::uint32_t mask, const decoded_texture_stat
 	state.sampler.anisotropy = overrides.anisotropy ? overrides.anisotropy : anisotropy[(regs.control0 >> 4) & 7];
 	if (std::find(anisotropy.begin(), anisotropy.end(), state.sampler.anisotropy) == anisotropy.end())
 		throw std::invalid_argument("Invalid native anisotropy configuration override");
+	if (!cache.linear_filtering || state.redirected)
+		state.sampler.anisotropy = 1;
 	const unsigned min = (regs.filter >> 16) & 7, mag = (regs.filter >> 24) & 7;
 	if (!min || (mag != 1 && mag != 2 && mag != 4))
 		throw std::invalid_argument("Invalid RSX min/mag filter register");
@@ -255,9 +277,99 @@ inline std::uint32_t shuffle_mask(std::uint32_t mask, const decoded_texture_stat
 			throw std::invalid_argument("Invalid RSX texture wrap register");
 		state.sampler.wrap[i] = static_cast<sampler_wrap>(wrap - 1);
 	}
+	const bool one_dimensional = state.policy.dimension == vertex_texture_dimension::one;
+	const bool volume = state.policy.dimension == vertex_texture_dimension::three;
+	const bool cube_atlas = state.policy.dimension == vertex_texture_dimension::cube;
+	const bool stored_border = cache.stored_border_extent != std::array<std::uint32_t, 2>{};
+	if (bool(cache.stored_border_depth) != (stored_border && volume))
+		throw std::invalid_argument("Stored-border depth disagrees with the guest texture dimension");
+	if (stored_border && (cache.actual_mips > 1 || one_dimensional || volume || cube_atlas || state.sampler.anisotropy > 1))
+	{
+		const auto [logical_width, logical_height] = cache.stored_border_extent;
+		if ((cube_atlas && logical_width != logical_height) || state.redirected || cache.samples != 1 ||
+			(volume && (state.shadow || cache.stored_border_depth > (regs.control3 >> 20))) ||
+			(regs.format & 8) || !logical_width || !logical_height ||
+			logical_width > width || logical_height > height)
+			throw std::invalid_argument("Unsupported dimension or sampling mode for the stored texture border atlas");
+		const bool pixels = !cube_atlas && (format_bits & 0x40);
+		auto modes = static_cast<unsigned>(state.sampler.wrap[0]) | (static_cast<unsigned>(state.sampler.wrap[1]) << 3);
+		if (one_dimensional) modes |= border_atlas_one_dimensional;
+		if (cube_atlas) modes |= border_atlas_cube;
+		if (state.sampler.anisotropy > 1)
+			modes |= state.sampler.anisotropy << border_atlas_anisotropy_shift;
+		if (volume) modes |= static_cast<unsigned>(state.sampler.wrap[2]) << border_atlas_wrap_z_shift;
+		if (pixels)
+		{
+			modes |= border_atlas_pixels;
+			if (min == 1 || mag == 1) modes |= border_atlas_point_bias;
+		}
+		state.coordinates.flags = texture_coordinate_border_atlas;
+		state.coordinates.border_atlas = {logical_width, logical_height, cache.actual_mips, modes};
+		state.coordinates.border_atlas_depth = cache.stored_border_depth;
+		state.sampler.wrap.fill(sampler_wrap::edge);
+	}
+	else if (stored_border)
+	{
+		const bool min_linear = min == 2 || min == 4 || min == 6 || min == 7;
+		if (state.policy.dimension != vertex_texture_dimension::two || state.redirected || cache.samples != 1 ||
+			(regs.format & 8))
+			throw std::invalid_argument("Stored texture borders require a supported 2D image");
+		const bool mixed = state.policy.linear_filtering && min_linear != (mag != 1);
+		const bool linear = state.policy.linear_filtering && (min_linear || mixed);
+		if (mixed)
+		{
+			state.coordinates.flags |= texture_coordinate_mixed_filter;
+			if (min_linear) state.coordinates.flags |= texture_coordinate_mixed_min_linear;
+			if (format_bits & 0x40) state.coordinates.flags |= texture_coordinate_mixed_pixels;
+			state.sampler.min_filter = sampler_min_filter::linear;
+			state.sampler.mag_filter = sampler_mag_filter::linear;
+		}
+		const std::array declared{width, height};
+		for (unsigned i = 0; i < declared.size(); ++i)
+		{
+			const auto logical = cache.stored_border_extent[i];
+			if (!logical || logical > declared[i])
+				throw std::invalid_argument("Stored texture border extent exceeds the guest texture");
+			const float extent = float(logical);
+			const float padded = extent + 2.f;
+			const auto wrap = state.sampler.wrap[i];
+			if (mixed && (wrap == sampler_wrap::repeat || wrap == sampler_wrap::clamp || wrap == sampler_wrap::mirror_once_clamp))
+				state.coordinates.flags |= texture_coordinate_mixed_point_edge_x << i;
+			if (wrap == sampler_wrap::repeat || wrap == sampler_wrap::mirror)
+			{
+				const auto axis_flag = wrap == sampler_wrap::repeat ? texture_coordinate_repeat_x : texture_coordinate_mirror_repeat_x;
+				state.coordinates.flags |= axis_flag << i;
+				if (wrap == sampler_wrap::repeat && linear)
+					state.coordinates.flags |= texture_coordinate_repeat_linear;
+				if (!mixed && (format_bits & 0x40) && (min == 1 || mag == 1))
+					state.coordinates.flags |= texture_coordinate_periodic_pixel_bias;
+				state.coordinates.minimum[i] = (format_bits & 0x40) ? extent : 1.f;
+				state.coordinates.maximum[i] = .5f / padded;
+				continue;
+			}
+			const bool mirror = wrap == sampler_wrap::mirror_once_edge ||
+				wrap == sampler_wrap::mirror_once_border || wrap == sampler_wrap::mirror_once_clamp;
+			if (mirror)
+				state.coordinates.flags |= i ? texture_coordinate_mirror_y : texture_coordinate_mirror_x;
+			// Values are in padded texel units. Clamp to a texel center for
+			// nearest, or to the edge/ring midpoint for linear GL-style clamp.
+			const float first = wrap == sampler_wrap::border ? .5f : wrap == sampler_wrap::clamp && linear ? 1.f : 1.5f;
+			const bool border = wrap == sampler_wrap::border || wrap == sampler_wrap::mirror_once_border;
+			const bool clamp = wrap == sampler_wrap::clamp || wrap == sampler_wrap::mirror_once_clamp;
+			const float last_inset = border ? .5f : clamp && linear ? 1.f : 1.5f;
+			state.coordinates.scale[i] = ((format_bits & 0x40) ? 1.f : extent) / padded;
+			state.coordinates.bias[i] = 1.f / padded;
+			state.coordinates.minimum[i] = first / padded;
+			state.coordinates.maximum[i] = (padded - last_inset) / padded;
+		}
+		state.coordinates.flags |= texture_coordinate_clamp;
+		// The ring is part of the sampled image. Clamp the native sampler to
+		// the image edge after selecting the guest edge or border coordinates.
+		state.sampler.wrap.fill(sampler_wrap::edge);
+	}
 	// Fragment samplers stay normalized. Cache coordinates already include the
 	// logical guest/native layout scale; UN adds VK's point-filter subpixel bias.
-	if ((format_bits & 0x40) && (min == 1 || mag == 1))
+	if (!(state.coordinates.flags & (texture_coordinate_mixed_filter | texture_coordinate_border_atlas)) && (format_bits & 0x40) && (min == 1 || mag == 1))
 		for (unsigned i = 0; i < 3; ++i)
 			state.coordinates.bias[i] += .01f * state.coordinates.scale[i];
 	// Border compensation precedes shader sign-extension, as in RSXTexture.
@@ -282,7 +394,10 @@ inline std::uint32_t shuffle_mask(std::uint32_t mask, const decoded_texture_stat
 																						   : depth_sample_channel::depth;
 	}
 	state.view_border_color = state.sampler.border_color;
-	if (std::find(state.sampler.wrap.begin(), state.sampler.wrap.end(), sampler_wrap::border) != state.sampler.wrap.end())
+	if (cache.stored_border_depth && state.depth)
+		state.view_border_color.fill(border_argb[1]); // 3D depth is stored in native R.
+	if (!state.redirected && state.samples == 1 && !(state.coordinates.flags & texture_coordinate_sample_raster) &&
+		std::find(state.sampler.wrap.begin(), state.sampler.wrap.end(), sampler_wrap::border) != state.sampler.wrap.end())
 	{
 		// Metal applies the texture-view swizzle to native border values too.
 		// Find a canonical descriptor colour that yields the requested final

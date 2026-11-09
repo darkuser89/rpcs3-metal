@@ -58,6 +58,11 @@ class geometry_index_plan final
 	[[nodiscard]] std::uint32_t count() const noexcept { return m_count; }
 	[[nodiscard]] std::uint32_t index_width() const noexcept { return m_index_width; }
 	[[nodiscard]] std::size_t index_offset() const noexcept { return m_references.vertices.size() * sizeof(vertex_reference); }
+	[[nodiscard]] std::size_t storage_bytes() const noexcept
+	{
+		return m_bytes.capacity() + m_references.vertices.capacity() * sizeof(vertex_reference);
+	}
+	[[nodiscard]] bool matches(const converted_geometry& geometry, bool flat_colors) const noexcept;
 };
 [[nodiscard]] geometry_index_plan plan_indexed_references(const converted_geometry& geometry, bool flat_colors = true);
 // Only IDs that require colors from a different vertex; independent of the

@@ -82,6 +82,63 @@ struct display_upload_job::state
 	display_storage_assembly assembly;
 	std::uint64_t assembly_epoch=0;
 };
+struct display_resolver::upload_batch
+{
+	struct upload
+	{
+		std::shared_ptr<display_upload_job::state> image;
+		std::function<void()> encode;
+	};
+	context& ctx;
+	display_cache_statistics& stats;
+	std::span<const display_upload_dependency> dependencies;
+	std::array<upload, 2> staged;
+	std::size_t count = 0;
+
+	void add(const std::shared_ptr<display_upload_job::state>& image, std::function<void()> encode = {})
+	{
+		staged.at(count) = {image, std::move(encode)};
+		++count;
+	}
+
+	void submit()
+	{
+		if (!count) return;
+		ctx.begin();
+		try
+		{
+			for (const auto& dep : dependencies) ctx.wait_event(dep.event, dep.value);
+			const auto images = std::span{staged}.first(count);
+			for (const auto& item : images)
+				if (item.encode) item.encode();
+			const auto work = ctx.submit();
+			bool native = false;
+			for (const auto& item : images)
+			{
+				item.image->work = work;
+				if (!item.encode) continue; // An alias of an image staged in this batch.
+				const auto& image = *item.image;
+				if (image.vm) ++stats.uploads;
+				else
+				{
+					native = true;
+					if (!image.assembly_sources.empty()) ++stats.assembly_casts;
+					else if (image.converted)
+					{
+						++stats.native_casts;
+						if (image.mixed_vm) ++stats.mixed_casts;
+					}
+				}
+			}
+			stats.native_submissions += native;
+		}
+		catch (...)
+		{
+			try { ctx.cancel(); } catch (...) {}
+			throw;
+		}
+	}
+};
 struct display_frame_job::state
 {
 	std::array<std::optional<display_upload_job>, 2> eyes;
@@ -117,6 +174,20 @@ bool display_frame_job::current() const
 	if (!m_state) throw std::logic_error("Moved-from display frame job");
 	m_state->check();
 	return m_state->eyes[0]->current() && (!m_state->eyes[1] || m_state->eyes[1]->current());
+}
+present_image display_frame_job::image_for_encoding() const
+{
+	if (!current()) throw surface_mapping_conflict();
+	const auto& left = *m_state->eyes[0];
+	auto result = display_upload_job::owned_image(*left.m_state, left.m_format);
+	result.uploads[0] = left.m_state->work;
+	if (const auto& right = m_state->eyes[1])
+	{
+		const auto image = display_upload_job::owned_image(*right->m_state, right->m_format);
+		result.right_eye = present_eye{image.texture, image.region};
+		result.uploads[1] = right->m_state->work;
+	}
+	return result;
 }
 present_image display_frame_job::finish(std::chrono::milliseconds timeout) const
 {
@@ -189,6 +260,11 @@ bool display_upload_job::current() const
 	if (!m_state || std::this_thread::get_id() != m_state->owner) throw std::logic_error("Display receipt requires its preparing thread");
 	return m_state->version->current();
 }
+present_image display_upload_job::owned_image(const state& state, display_format format)
+{
+	const auto& image = state.version->image;
+	return {state.views.at(static_cast<unsigned>(format)), {0,0,MTLOriginMake(0,0,0),MTLSizeMake(image.width,image.height,1)}, {0,0,image.width,image.height}};
+}
 present_image display_upload_job::finish(std::chrono::milliseconds timeout) const
 {
 	const auto state = m_state;
@@ -220,8 +296,7 @@ present_image display_upload_job::finish(std::chrono::milliseconds timeout) cons
 			if (const auto cache = state->version->cache.lock()) cache->publish(state);
 		state->published = true;
 	}
-	const auto& image = state->version->image;
-	return {state->views.at(static_cast<unsigned>(format)), {0,0,MTLOriginMake(0,0,0),MTLSizeMake(image.width,image.height,1)}, {0,0,image.width,image.height}};
+	return owned_image(*state, format);
 }
 display_resolver::display_resolver(context& ctx,std::shared_ptr<guest_surface_memory> memory,
 	std::function<std::uint32_t(std::uint32_t,unsigned,std::size_t)> translate,std::shared_ptr<heap_budget> budget,std::size_t snapshot_limit,
@@ -235,13 +310,13 @@ display_resolver::display_resolver(context& ctx,std::shared_ptr<guest_surface_me
 	m_cache->limits = limits; m_cache->pending.reserve(64);
 }
 std::shared_ptr<display_upload_job::state> display_resolver::prepare_impl(const display_snapshot& image,surface_cache& surfaces,
-	std::span<const display_upload_dependency> dependencies,bool require_ledger)
+	upload_batch& batch,bool require_ledger)
 {
 	m_cache->outside(); m_context.validate_begin();
 	if ((require_ledger || m_context.buffer_ledger()) && m_context.buffer_ledger() != m_budget)
 		throw std::invalid_argument("Display upload job requires the installed shared buffer/texture ledger");
-	if (dependencies.size() > 64) throw std::length_error("Display dependency bound exceeded");
-	for (const auto& dep : dependencies)
+	if (batch.dependencies.size() > 64) throw std::length_error("Display dependency bound exceeded");
+	for (const auto& dep : batch.dependencies)
 		if (!dep.event || (dep.event.device && dep.event.device != m_context.device())) throw std::invalid_argument("Foreign/nil display dependency");
 	surfaces.validate_texture_adapter(m_context,*m_memory);
 	if (image.right_offset) throw std::invalid_argument("Single-eye display preparation requires explicit eye selection");
@@ -405,6 +480,7 @@ std::shared_ptr<display_upload_job::state> display_resolver::prepare_impl(const 
 		{
 			result->base = shared_work->base; result->bytes = shared_work->bytes; result->views = shared_work->views;
 			result->work = shared_work->work; ++m_cache->stats.pending_hits;
+			if (!result->work && !shared_work->published) batch.add(result);
 			if (result->converted) ++m_cache->stats.native_cast_hits;
 		}
 		else if (result->converted)
@@ -446,25 +522,17 @@ std::shared_ptr<display_upload_job::state> display_resolver::prepare_impl(const 
 		}
 		if (direct) result->views[static_cast<unsigned>(image.format)] = native->opaque_view(pixel_format);
 		if (!shared_work && (native->needs_copy() || cast))
-		{
-			bool recording = false;
-			try
+			batch.add(result, [this, native, cast = std::move(cast), base = result->base]
 			{
-				m_context.begin(); recording = true;
-				for (const auto& dep : dependencies) m_context.wait_event(dep.event,dep.value);
 				native->encode(m_context);
-				if (cast) { m_upload.encode_cast(*cast,result->base); ++m_cache->stats.native_casts; if (result->mixed_vm) ++m_cache->stats.mixed_casts; }
-				result->work.emplace(m_context.submit()); recording = false;
-				++m_cache->stats.native_submissions;
-			}
-			catch (...) { if (recording) { try { m_context.cancel(); } catch (...) {} } throw; }
-		}
+				if (cast) m_upload.encode_cast(*cast, base);
+			});
 		if (native->needs_copy() || cast || (shared_work && !shared_work->published)) m_cache->pending.push_back(result);
 		++m_cache->stats.native_snapshots;
 		return result;
 	}
 	native_candidates.clear(); pending_native.clear(); pending_owners.clear();
-	if(const auto assembly=prepare_assembly(version,surfaces,plan,dependencies))return assembly;
+	if(const auto assembly=prepare_assembly(version,surfaces,plan,batch))return assembly;
 	std::vector<std::shared_ptr<display_upload_job::state>> candidates(m_cache->ready.begin(),m_cache->ready.end());
 	for (const auto& weak : m_cache->pending) if (const auto value = weak.lock()) candidates.push_back(value);
 	std::shared_ptr<display_upload_job::state> selected;
@@ -506,23 +574,15 @@ std::shared_ptr<display_upload_job::state> display_resolver::prepare_impl(const 
 		result->views[0] = surfaces.opaque_snapshot_view(result->base,MTLPixelFormatBGRA8Unorm);
 		result->views[1] = surfaces.opaque_snapshot_view(result->base,MTLPixelFormatRGBA8Unorm);
 	}
-	bool recording = false;
-	try
+	batch.add(result, [this, plan = std::move(plan), bytes = std::move(snapshot.bytes), base = result->base]
 	{
-		m_context.begin(); recording = true;
-		for (const auto& dep : dependencies) m_context.wait_event(dep.event,dep.value);
-		const auto input = make_upload(m_context,snapshot.bytes);
-		// Reuse the fused native endian/odd-pitch gather,without another VM
-		// capture or an immediate upload wait. The plan owns no guest pointers.
-		m_upload.encode_upload(plan,input,result->base);
-		result->work.emplace(m_context.submit()); recording = false;
-	}
-	catch (...) { if (recording) { try { m_context.cancel(); } catch (...) {} } throw; }
-	++m_cache->stats.uploads; m_cache->pending.push_back(result);
+		m_upload.encode_upload(plan, make_upload(m_context, bytes), base);
+	});
+	m_cache->pending.push_back(result);
 	return result;
 }
 std::shared_ptr<display_upload_job::state> display_resolver::prepare_assembly(const std::shared_ptr<display_source_version>& version,
-	surface_cache& surfaces,const guest_texture_layout& plan,std::span<const display_upload_dependency> dependencies)
+	surface_cache& surfaces,const guest_texture_layout& plan,upload_batch& batch)
 {
 	const auto& image=version->image;const auto coverage=version->coverage;
 	auto refs=surfaces.texture_sources(std::span{&coverage,1});
@@ -633,34 +693,50 @@ std::shared_ptr<display_upload_job::state> display_resolver::prepare_assembly(co
 		if(!version->current())throw surface_conflict_error(coverage.range);
 	});
 	m_cache->stats.captured_vm_bytes+=vm_bytes.size();m_cache->stats.captured_vm_ranges+=assembly.vm.size();
-	const auto upload=m_upload.prepare_display_assembly(plan,native,layouts,assembly,std::move(vm_bytes));
+	auto upload=m_upload.prepare_display_assembly(plan,native,layouts,assembly,std::move(vm_bytes));
 	auto result=std::make_shared<display_upload_job::state>();result->version=version;result->converted=true;result->mixed_vm=!assembly.vm.empty();
 	result->cache_epoch=m_cache->epoch;result->assembly_sources=std::move(native);result->assembly=std::move(assembly);result->assembly_epoch=surfaces.texture_source_epoch();
 	result->base=m_upload.allocate(plan);result->bytes=result->base.heap.size;
 	for(const auto& source:result->assembly_sources)result->bytes=checked_texture_sum(result->bytes,source->texture().heap.size);
 	if(image.format==display_format::rgbx16f)result->views[2]=surfaces.opaque_snapshot_view(result->base,MTLPixelFormatRGBA16Float);
 	else{result->views[0]=surfaces.opaque_snapshot_view(result->base,MTLPixelFormatBGRA8Unorm);result->views[1]=surfaces.opaque_snapshot_view(result->base,MTLPixelFormatRGBA8Unorm);}
-	bool recording=false;
-	try
+	batch.add(result, [this, result, upload = std::move(upload)]
 	{
-		m_context.begin();recording=true;for(const auto& dep:dependencies)m_context.wait_event(dep.event,dep.value);
-		for(const auto& source:result->assembly_sources)source->encode(m_context);m_upload.encode_display_assembly(upload,result->base);
-		result->work.emplace(m_context.submit());recording=false;
-	}
-	catch(...){if(recording){try{m_context.cancel();}catch(...){}}throw;}
-	++m_cache->stats.assembly_casts;++m_cache->stats.native_submissions;m_cache->pending.push_back(result);return result;
+		for (const auto& source : result->assembly_sources) source->encode(m_context);
+		m_upload.encode_display_assembly(upload, result->base);
+	});
+	m_cache->pending.push_back(result);
+	return result;
 }
 display_upload_job display_resolver::prepare(const display_snapshot& image,surface_cache& surfaces,std::span<const display_upload_dependency> dependencies)
 {
 	std::shared_ptr<display_upload_job::state> result; std::exception_ptr failure;
-	@autoreleasepool { try { result = prepare_impl(image,surfaces,dependencies,true); } catch (...) { failure = std::current_exception(); } }
+	@autoreleasepool
+	{
+		try
+		{
+			upload_batch batch{m_context, m_cache->stats, dependencies};
+			result = prepare_impl(image, surfaces, batch, true);
+			batch.submit();
+		}
+		catch (...) { failure = std::current_exception(); }
+	}
 	if (failure) std::rethrow_exception(failure);
 	return display_upload_job(std::move(result),image.format);
 }
 present_image display_resolver::resolve(const display_snapshot& image,surface_cache& surfaces)
 {
 	std::shared_ptr<display_upload_job::state> result; std::exception_ptr failure;
-	@autoreleasepool { try { result = prepare_impl(image,surfaces,{},false); } catch (...) { failure = std::current_exception(); } }
+	@autoreleasepool
+	{
+		try
+		{
+			upload_batch batch{m_context, m_cache->stats, {}};
+			result = prepare_impl(image, surfaces, batch, false);
+			batch.submit();
+		}
+		catch (...) { failure = std::current_exception(); }
+	}
 	if (failure) std::rethrow_exception(failure);
 	return display_upload_job(std::move(result),image.format).finish();
 }
@@ -681,7 +757,20 @@ display_frame_job display_resolver::prepare_frame(const display_snapshot& image,
 	}
 	auto state = std::make_shared<display_frame_job::state>();
 	state->capture = m_capture;
-	for (unsigned eye = 0; eye < 2; ++eye) if (eyes[eye]) state->eyes[eye].emplace(prepare(*eyes[eye], surfaces, dependencies));
+	std::exception_ptr failure;
+	@autoreleasepool
+	{
+		try
+		{
+			upload_batch batch{m_context, m_cache->stats, dependencies};
+			for (unsigned eye = 0; eye < eyes.size(); ++eye)
+				if (eyes[eye])
+					state->eyes[eye] = display_upload_job(prepare_impl(*eyes[eye], surfaces, batch, true), eyes[eye]->format);
+			batch.submit();
+		}
+		catch (...) { failure = std::current_exception(); }
+	}
+	if (failure) std::rethrow_exception(failure);
 	return display_frame_job(std::move(state));
 }
 display_cache_statistics display_resolver::statistics() const { m_cache->outside(); return m_cache->stats; }

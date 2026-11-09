@@ -19,6 +19,35 @@ std::vector<std::uint32_t> plan_flat_color_sources(std::span<const vertex_refere
 	return ids;
 }
 
+bool geometry_index_plan::matches(const converted_geometry& geometry, bool flat_colors) const noexcept
+{
+	if (geometry.topology != m_references.topology || geometry.vertices.size() != m_count)
+		return false;
+	const auto same_reference = [flat_colors](vertex_reference planned, vertex_reference current)
+	{
+		if (!flat_colors) current.flat_vertex = current.vertex;
+		return planned == current;
+	};
+	if (!m_index_width)
+		return std::equal(m_references.vertices.begin(), m_references.vertices.end(), geometry.vertices.begin(), same_reference);
+
+	// The plan owns a validated index stream. Compare its original order
+	// without building a second reference vector or a hash table.
+	const auto matches_indices = [&]<typename Index>()
+	{
+		const auto* bytes = m_bytes.data() + index_offset();
+		for (const auto current : geometry.vertices)
+		{
+			Index index;
+			std::memcpy(&index, bytes, sizeof(index));
+			if (!same_reference(m_references.vertices[index], current)) return false;
+			bytes += sizeof(index);
+		}
+		return true;
+	};
+	return m_index_width == 2 ? matches_indices.operator()<std::uint16_t>() : matches_indices.operator()<std::uint32_t>();
+}
+
 geometry_index_plan plan_indexed_references(const converted_geometry& geometry, bool flat_colors)
 {
 	unsigned corners;

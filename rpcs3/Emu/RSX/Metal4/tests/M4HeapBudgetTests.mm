@@ -75,10 +75,19 @@ void pressure(context& ctx)
 		rejected = error.requested == cost * count && error.reserved == actual && error.budget == cost * count;
 	}
 	require(rejected, "Actual native buffer owners escaped strict budget rejection");
+	unsigned reclaim_calls = 0;
+	const auto reclaimer = budget.register_reclaimer([&](memory_pressure_request) { ++reclaim_calls; });
+	require(!budget.try_shared_buffer(cost * count) && !reclaim_calls &&
+		budget.statistics().reserved_bytes == actual, "Optional shared allocation ran recovery or altered live charges");
 	retained = nil;
 	large = nil;
+	{
+		const auto optional = budget.try_shared_buffer(4096);
+		require(optional && budget.statistics().reserved_bytes == cost && !reclaim_calls,
+			"Optional shared allocation did not recover capacity after release");
+	}
 	require(budget.statistics().reserved_bytes == 0, "Pressure recovery leaked a reservation");
-	std::cout << "Full pressure reconciliation, rounded budget rejection and release passed\n";
+	std::cout << "Full pressure reconciliation, rounded budget rejection, optional allocation without reclamation and release passed\n";
 }
 
 void heap_views(context& ctx)

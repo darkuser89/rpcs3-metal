@@ -43,6 +43,7 @@ class host_access_fixture final : public exclusive_guest_memory, public exclusiv
 	std::byte* bytes = nullptr;
 	unsigned captures = 0, reservations = 0;
 	bool segments_supported = true;
+	bool provide_storage_identity = false;
 	unsigned physical_queries = 0, fail_physical_query = 0;
 	bool fail_reservation_planning = false;
 	std::array<guest_surface_range, 1024> reservation_ranges{};
@@ -141,6 +142,26 @@ class host_access_fixture final : public exclusive_guest_memory, public exclusiv
 			cursor += count;
 		}
 		return std::make_shared<physical_backing>(range, std::move(parts));
+	}
+	std::optional<std::vector<storage_identity_span>> storage_identity(guest_surface_range range) override
+	{
+		if (!provide_storage_identity) return {};
+		const auto mapped = logical(range);
+		std::vector<storage_identity_span> spans;
+		for (std::uint64_t cursor = 0; cursor < range.size;)
+		{
+			const auto offset = mapped.address + cursor;
+			const auto bank = offset / 65536;
+			const auto count = std::min(range.size - cursor, 65536 - offset % 65536);
+			std::shared_ptr<void> identity = m_sources[bank];
+			if (!bank && m_first_alias &&
+				(range.address >= 0x40000 || m_pool.matches(identity, m_first_alias)))
+				identity = m_first_alias;
+			if (!identity) return {};
+			spans.push_back({identity, offset % 65536, {static_cast<std::uint32_t>(range.address + cursor), count}});
+			cursor += count;
+		}
+		return spans;
 	}
 	std::shared_ptr<void> retain_backing(std::span<const guest_surface_range> ranges) override
 	{
